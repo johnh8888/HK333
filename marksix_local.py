@@ -47,7 +47,7 @@ def special_attributes(num: int) -> Dict[str, str]:
             "合大小": total_big_small, "尾大小": tail_big_small, "色波": color, "五行": element}
 
 # ---------- 波色预测 ----------
-def predict_color(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
+def predict_color(specials: List[int], window: int = 3) -> Tuple[str, str, float, float]:
     """根据最近 window 期特码，返回主强颜色、次强颜色及各自频率"""
     if not specials: return "蓝", "绿", 0.0, 0.0
     recent = specials[-window:]
@@ -59,7 +59,7 @@ def predict_color(specials: List[int], window: int = 10) -> Tuple[str, str, floa
     second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
     return main_color, second_color, main_freq, second_freq
 
-def backtest_colors(conn, recent_limit: int = 10, window: int = 10) -> Tuple[int, int, int, int]:
+def backtest_colors(conn, recent_limit: int = 10, window: int = 3) -> Tuple[int, int, int, int]:
     """
     回测最近 recent_limit 期波色，使用真实历史数据。
     返回 (总期数, 主强命中, 次强命中, 二中一命中)
@@ -462,7 +462,7 @@ def auto_tune_mined_config(conn, recent_runs=20):
     return cfg
 
 # ---------- 展示 ----------
-def print_dashboard(conn, color_window=10):
+def print_dashboard(conn, color_window=3):
     backfill_missing_special_picks(conn)
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if latest:
@@ -535,7 +535,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--official-url", default=OFFICIAL_URL_DEFAULT)
-    p.add_argument("--color-window", type=int, default=10, help="波色预测窗口大小（最近 N 期）")
+    p.add_argument("--color-window", type=int, default=3, help="波色预测窗口大小（最近 N 期，默认 3）")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("sync")
     sp.add_argument("--with-backtest", action="store_true")
