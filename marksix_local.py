@@ -8,7 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -48,6 +48,7 @@ def special_attributes(num: int) -> Dict[str, str]:
 
 # ---------- 波色预测 ----------
 def predict_color(specials: List[int], window: int = 50) -> Tuple[str, str, float, float]:
+    """根据最近 window 期特码，返回主强颜色、次强颜色及各自频率"""
     if not specials: return "蓝", "绿", 0.0, 0.0
     recent = specials[-window:]
     counter = Counter(get_color(n) for n in recent)
@@ -58,18 +59,29 @@ def predict_color(specials: List[int], window: int = 50) -> Tuple[str, str, floa
     second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
     return main_color, second_color, main_freq, second_freq
 
-def backtest_colors(conn) -> Tuple[int, int, int, int]:
+def backtest_colors(conn, recent_limit: int = 10) -> Tuple[int, int, int, int]:
+    """
+    回测最近 recent_limit 期波色，使用真实历史数据，绝不偷看未来。
+    返回 (总期数, 主强命中, 次强命中, 二中一命中)
+    """
     rows = conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()
     specials = [r["special_number"] for r in rows]
-    if len(specials) < 10: return 0, 0, 0, 0
+    # 至少需要 recent_limit + 10 期历史才能有效预测（保证训练数据充足）
+    if len(specials) < recent_limit + 10:
+        return 0, 0, 0, 0
+
     total = main_hit = second_hit = any_hit = 0
-    for i in range(10, len(specials)):
-        train = specials[:i]
+    start_idx = len(specials) - recent_limit   # 只统计最近 recent_limit 期
+    for i in range(start_idx, len(specials)):
+        train = specials[:i]  # 仅使用 i 之前的数据，不包含当期
         actual = get_color(specials[i])
         main_color, second_color, _, _ = predict_color(train, window=50)
-        if main_color == actual: main_hit += 1
-        if second_color == actual: second_hit += 1
-        if main_color == actual or second_color == actual: any_hit += 1
+        if main_color == actual:
+            main_hit += 1
+        if second_color == actual:
+            second_hit += 1
+        if main_color == actual or second_color == actual:
+            any_hit += 1
         total += 1
     return total, main_hit, second_hit, any_hit
 
@@ -480,16 +492,18 @@ def print_dashboard(conn):
             print(f"  {label:　<8s}: 期数={s['cnt']}, 平均命中={s['avg_hit']}个, 命中率={s['hit_rate_pct']}%, 特别号命中率={s['special_rate_pct']}%")
     else:
         print("\n暂无复盘数据。")
-    # 波色预测
+    # 波色预测（基于最近50期特码，回测最近10期）
     all_specials = [r["special_number"] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()]
     if len(all_specials) >= 10:
         main_color, second_color, main_freq, second_freq = predict_color(all_specials, window=50)
         print(f"\n🎨 特码波色预测（下一期）：")
         print(f"   主强: {main_color} (频率 {main_freq:.1%})   次强: {second_color} (频率 {second_freq:.1%})")
-        total, main_hit, second_hit, any_hit = backtest_colors(conn)
+        total, main_hit, second_hit, any_hit = backtest_colors(conn, recent_limit=10)
         if total > 0:
-            print(f"\n📊 历史回测（共 {total} 期）：")
-            print(f"   主强命中率: {main_hit/total*100:.1f}%   次强命中率: {second_hit/total*100:.1f}%   任一命中率: {any_hit/total*100:.1f}%")
+            print(f"\n📊 历史回测（最近 {total} 期）：")
+            print(f"   主强命中率: {main_hit/total*100:.1f}%   次强命中率: {second_hit/total*100:.1f}%   二中一命中率: {any_hit/total*100:.1f}%")
+        else:
+            print("\n波色回测数据不足。")
     else:
         print("\n特码数据不足，无法预测波色。")
 
