@@ -213,7 +213,6 @@ def upsert_draw(conn: sqlite3.Connection, record: DrawRecord) -> str:
 def sync_online(conn: sqlite3.Connection) -> Tuple[int, int, int]:
     records = fetch_official_records()
     if not records:
-        # 没有新数据，检查数据库是否有历史数据
         existing = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
         if existing == 0:
             raise RuntimeError("无网络且本地无数据，请检查网络或手动导入数据")
@@ -338,7 +337,6 @@ def ensure_mined_pattern_config(conn):
 
 
 def next_issue_number(current_issue: str) -> str:
-    """从当期期号推算下一期，兼容 2026054 或 24/032 格式"""
     digits = ''.join(ch for ch in current_issue if ch.isdigit())
     if not digits:
         return f"{current_issue}-NEXT"
@@ -350,7 +348,6 @@ def next_issue_number(current_issue: str) -> str:
 
 
 def generate_and_store_predictions(conn: sqlite3.Connection) -> str:
-    """生成下一期所有策略的预测，并持久化到数据库"""
     latest = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
     if not latest:
         raise RuntimeError("No draw data yet")
@@ -361,7 +358,6 @@ def generate_and_store_predictions(conn: sqlite3.Connection) -> str:
     now = utc_now()
 
     for strategy in STRATEGY_IDS:
-        # 跳过已存在的预测
         exist = conn.execute(
             "SELECT id FROM prediction_runs WHERE issue_no=? AND strategy=?",
             (target_issue, strategy)
@@ -371,27 +367,23 @@ def generate_and_store_predictions(conn: sqlite3.Connection) -> str:
 
         picks, special, special_score, _ = generate_strategy(draws, strategy, mined_cfg)
 
-        # 插入 prediction_run
         cur = conn.execute(
             "INSERT INTO prediction_runs (issue_no, strategy, status, created_at) VALUES (?, ?, 'PENDING', ?)",
             (target_issue, strategy, now)
         )
         run_id = cur.lastrowid
 
-        # 插入主号 (rank 1-6)
         for num, rank, score, reason in picks:
             conn.execute(
                 "INSERT INTO prediction_picks (run_id, pick_type, number, rank, score, reason) VALUES (?, 'MAIN', ?, ?, ?, ?)",
                 (run_id, num, rank, score, reason)
             )
 
-        # 插入特别号 (rank 7)
         conn.execute(
             "INSERT INTO prediction_picks (run_id, pick_type, number, rank, score, reason) VALUES (?, 'SPECIAL', ?, 7, ?, ?)",
             (run_id, special, special_score, f"{STRATEGY_LABELS.get(strategy, strategy)} 特别号")
         )
 
-        # 插入预测池（主号6个）
         main_numbers = sorted([n for n, _, _, _ in picks])
         conn.execute(
             "INSERT INTO prediction_pools (run_id, pool_size, numbers_json, created_at) VALUES (?, 6, ?, ?)",
@@ -402,8 +394,122 @@ def generate_and_store_predictions(conn: sqlite3.Connection) -> str:
     return target_issue
 
 
+# ====================== 复盘与调优 ======================
+def review_predictions(conn: sqlite3.Connection):
+    """复盘所有待验证的预测"""
+    pending_runs = conn.execute(
+        "SELECT id, issue_no, strategy FROM prediction_runs WHERE status='PENDING'"
+    ).fetchall()
+
+    if not pending_runs:
+        print("暂无待复盘的预测")
+        return
+
+    now = utc_now()
+    reviewed_count = 0
+    for run in pending_runs:
+        # 检查该期是否已开奖
+        draw = conn.execute(
+            "SELECT numbers_json, special_number FROM draws WHERE issue_no=?",
+            (run["issue_no"],)
+        ).fetchone()
+        if not draw:
+            continue
+
+        draw_numbers = set(json.loads(draw["numbers_json"]))
+        draw_special = draw["special_number"]
+
+        # 读取预测的主号和特号
+        main_picks = conn.execute(
+            "SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='MAIN' ORDER BY rank",
+            (run["id"],)
+        ).fetchall()
+        special_pick = conn.execute(
+            "SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='SPECIAL'",
+            (run["id"],)
+        ).fetchone()
+
+        predicted_numbers = [p["number"] for p in main_picks]
+        hit_set = [n for n in predicted_numbers if n in draw_numbers]
+        hit_count = len(hit_set)
+        hit_rate = hit_count / 6.0
+
+        special_hit = 1 if special_pick and special_pick["number"] == draw_special else 0
+
+        conn.execute(
+            """UPDATE prediction_runs
+               SET status='REVIEWED',
+                   hit_count=?, hit_rate=?,
+                   special_hit=?,
+                   reviewed_at=?
+               WHERE id=?""",
+            (hit_count, hit_rate, special_hit, now, run["id"])
+        )
+        reviewed_count += 1
+        print(f"✔ {run['issue_no']} [{STRATEGY_LABELS.get(run['strategy'], run['strategy'])}] "
+              f"命中 {hit_count}/6 (特码{'✓' if special_hit else '✗'})")
+
+    conn.commit()
+    if reviewed_count == 0:
+        print("当前没有已开奖的待复盘预测")
+    else:
+        print(f"共复盘 {reviewed_count} 条预测")
+
+
+def auto_tune_mined_config(conn: sqlite3.Connection, recent_runs: int = 20):
+    """根据近期‘规律挖掘’策略的表现微调权重"""
+    cfg = ensure_mined_pattern_config(conn)
+    # 获取最近N期已复盘的 pattern_mined_v1 表现
+    rows = conn.execute(
+        """SELECT hit_count FROM prediction_runs
+           WHERE strategy='pattern_mined_v1' AND status='REVIEWED'
+           ORDER BY id DESC LIMIT ?""",
+        (recent_runs,)
+    ).fetchall()
+
+    if len(rows) < 5:
+        print("复盘数据不足（<5期），暂不调整权重")
+        return
+
+    avg_hits = sum(r["hit_count"] for r in rows) / len(rows)
+    print(f"近期 {len(rows)} 期规律挖掘平均命中数: {avg_hits:.2f}")
+
+    # 简单调优逻辑：低于1.5则增加动量权重，高于2.5则回调
+    w_freq = cfg.get("w_freq", 0.4)
+    w_mom = cfg.get("w_mom", 0.2)
+    delta = 0.03
+
+    if avg_hits < 1.5:
+        # 趋势不稳定，增加近期动量权重
+        w_freq = max(0.2, w_freq - delta)
+        w_mom = min(0.5, w_mom + delta)
+    elif avg_hits > 2.5:
+        # 表现很好，减少动量，回归均衡
+        w_freq = min(0.5, w_freq + delta)
+        w_mom = max(0.1, w_mom - delta)
+    else:
+        print("当前表现处于合理区间，不调整")
+        return
+
+    # 重新归一化主要三个权重（w_freq, w_omit, w_mom）
+    w_omit = 1.0 - w_freq - w_mom
+    if w_omit < 0:
+        w_omit = 0.0
+        # 按比例压缩
+        total = w_freq + w_mom
+        w_freq /= total
+        w_mom /= total
+
+    cfg["w_freq"] = round(w_freq, 4)
+    cfg["w_omit"] = round(w_omit, 4)
+    cfg["w_mom"] = round(w_mom, 4)
+
+    set_model_state(conn, MINED_CONFIG_KEY, cfg)
+    print(f"⚙ 已更新规律挖掘权重: freq={cfg['w_freq']}, omit={cfg['w_omit']}, mom={cfg['w_mom']}")
+
+
+# ====================== 显示函数 ======================
 def print_latest_result(conn: sqlite3.Connection):
-    """打印最新开奖信息"""
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
@@ -413,7 +519,6 @@ def print_latest_result(conn: sqlite3.Connection):
 
 
 def print_predictions(conn: sqlite3.Connection):
-    """打印下一期的所有预测"""
     latest_issue = conn.execute(
         "SELECT issue_no FROM prediction_runs ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -449,7 +554,7 @@ def cmd_sync(args):
         print_latest_result(conn)
 
         print("\n正在生成新一期预测...")
-        target = generate_and_store_predictions(conn)
+        generate_and_store_predictions(conn)
         print_predictions(conn)
     except Exception as e:
         print(f"❌ 运行出错: {e}")
@@ -466,6 +571,24 @@ def cmd_show(args):
         conn.close()
 
 
+def cmd_review(args):
+    conn = connect_db(args.db)
+    try:
+        print("🔍 开始复盘预测...")
+        review_predictions(conn)
+    finally:
+        conn.close()
+
+
+def cmd_tune(args):
+    conn = connect_db(args.db)
+    try:
+        print("🎯 自动调整策略权重...")
+        auto_tune_mined_config(conn)
+    finally:
+        conn.close()
+
+
 def main():
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument("--db", default=DB_PATH_DEFAULT, help="数据库路径")
@@ -475,6 +598,8 @@ def main():
 
     sub.add_parser("sync", parents=[parent_parser], help="同步最新开奖数据并预测").set_defaults(func=cmd_sync)
     sub.add_parser("show", parents=[parent_parser], help="显示最新开奖和已有预测").set_defaults(func=cmd_show)
+    sub.add_parser("review", parents=[parent_parser], help="复盘已开奖的预测").set_defaults(func=cmd_review)
+    sub.add_parser("tune", parents=[parent_parser], help="根据近期表现自动调整策略权重").set_defaults(func=cmd_tune)
 
     args = p.parse_args()
     args.func(args)
