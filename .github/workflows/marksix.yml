@@ -1,4 +1,4 @@
-name: 六合彩智能预测与复盘
+name: 六合彩自动预测
 
 on:
   schedule:
@@ -17,26 +17,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 同步数据、回测、预测
-        run: |
-          python marksix_local.py sync \
-            --source auto \
-            --official-url "https://bet.hkjc.com/contentserver/jcbw/cmc/last30draw.json" \
-            --third-party-url "https://marksix6.net/index.php?api=1" \
-            --third-party-max-pages 5 \
-            --no-require-continuity \
-            --with-backtest
+      - name: 同步数据并生成预测
+        run: python marksix_local.py sync
 
-      - name: 提交更新
+      - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add marksix_local.db
           git commit -m "🤖 自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
           git push
-
-      - name: 保存 Artifact（备查）
-        uses: actions/upload-artifact@v4
-        with:
-          name: marksix-db-backup
-          path: marksix_local.db
