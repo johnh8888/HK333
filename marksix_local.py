@@ -4,15 +4,18 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "marksix_local.db")
+
+# 数据源优先级：marksix6.net → 香港赛马会官网
+HK_API_URL = "https://marksix6.net/index.php?api=1"
 OFFICIAL_URL = "https://bet.hkjc.com/contentserver/jcbw/cmc/last30draw.json"
 
 STRATEGY_LABELS = {
@@ -31,7 +34,7 @@ MINED_CONFIG_KEY = "mined_strategy_config_v1"
 @dataclass
 class DrawRecord:
     issue_no: str
-    draw_date: str
+    draw_date: str      # 日期字符串 YYYY-MM-DD
     numbers: List[int]
     special_number: int
 
@@ -97,16 +100,52 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# ====================== 线上数据获取 ======================
-def fetch_official_records() -> List[DrawRecord]:
-    print(f"正在从官方获取最新数据: {OFFICIAL_URL}")
-    req = Request(
-        OFFICIAL_URL,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; marksix-local/1.0)"}
-    )
-    with urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8-sig"))
+# ====================== 数据获取（多源适配） ======================
+def _parse_marksix6_response(payload: dict) -> List[DrawRecord]:
+    """解析 marksix6.net 的返回数据"""
+    records = []
+    hk_data = None
+    for lottery in payload.get("lottery_data", []):
+        if lottery.get("name") == "香港彩":
+            hk_data = lottery
+            break
+    if not hk_data:
+        return records
 
+    # 获取最新开奖时间，用于倒推历史日期
+    latest_open_time_str = hk_data.get("openTime", "")
+    try:
+        latest_open_time = datetime.strptime(latest_open_time_str, "%Y-%m-%d %H:%M:%S")
+    except:
+        latest_open_time = datetime.now()
+
+    history = hk_data.get("history", [])
+    # 历史记录倒序（最新在前）
+    for idx, item in enumerate(history):
+        try:
+            # 格式: "2026054 期：07,13,15,05,31,27,16"
+            parts = item.split("期：")
+            if len(parts) != 2:
+                continue
+            issue_no = parts[0].strip()
+            all_numbers = [int(n.strip()) for n in parts[1].split(",")]
+            if len(all_numbers) != 7:
+                continue
+            numbers = all_numbers[:6]
+            special = all_numbers[6]
+
+            # 日期推算：最新一期使用 openTime，历史期按 2 天间隔递减
+            # 六合彩每周二、四、六开奖，平均间隔 2 天
+            draw_date = (latest_open_time - timedelta(days=idx * 2)).strftime("%Y-%m-%d")
+
+            records.append(DrawRecord(issue_no, draw_date, numbers, special))
+        except:
+            continue
+    return records
+
+
+def _parse_official_response(payload: list) -> List[DrawRecord]:
+    """解析香港赛马会官网的返回数据（旧版）"""
     records = []
     for item in payload:
         try:
@@ -119,8 +158,39 @@ def fetch_official_records() -> List[DrawRecord]:
                 records.append(DrawRecord(issue_no, draw_date, numbers, special))
         except:
             continue
+    return records
 
-    return sorted(records, key=lambda x: x.issue_no)
+
+def fetch_official_records() -> List[DrawRecord]:
+    """尝试从多个数据源获取六合彩记录"""
+    # 1. 尝试 marksix6.net
+    print(f"正在从 marksix6.net 获取数据...")
+    try:
+        req = Request(HK_API_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; marksix-local/2.0)"})
+        with urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            records = _parse_marksix6_response(payload)
+            if records:
+                print(f"✅ marksix6 获取成功，共 {len(records)} 期")
+                return sorted(records, key=lambda x: x.issue_no, reverse=True)
+    except Exception as e:
+        print(f"⚠️ marksix6 获取失败: {e}")
+
+    # 2. 回退到赛马会官网
+    print(f"正在从香港赛马会官网获取数据...")
+    try:
+        req = Request(OFFICIAL_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; marksix-local/1.0)"})
+        with urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8-sig"))
+            records = _parse_official_response(payload)
+            if records:
+                print(f"✅ 官网获取成功，共 {len(records)} 期")
+                return sorted(records, key=lambda x: x.issue_no)
+    except Exception as e:
+        print(f"❌ 官网获取失败: {e}")
+
+    print("❌ 所有数据源均无法获取数据")
+    return []
 
 
 # ====================== 数据库操作 ======================
@@ -142,9 +212,18 @@ def upsert_draw(conn: sqlite3.Connection, record: DrawRecord) -> str:
 
 def sync_online(conn: sqlite3.Connection) -> Tuple[int, int, int]:
     records = fetch_official_records()
+    if not records:
+        # 没有新数据，检查数据库是否有历史数据
+        existing = conn.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+        if existing == 0:
+            raise RuntimeError("无网络且本地无数据，请检查网络或手动导入数据")
+        print("⚠️ 未获取到新数据，使用本地历史数据继续。")
+        return 0, 0, 0
+
     inserted = updated = 0
     for r in records:
-        if upsert_draw(conn, r) == "inserted":
+        res = upsert_draw(conn, r)
+        if res == "inserted":
             inserted += 1
         else:
             updated += 1
@@ -152,7 +231,7 @@ def sync_online(conn: sqlite3.Connection) -> Tuple[int, int, int]:
     return len(records), inserted, updated
 
 
-# ====================== 核心预测逻辑 ======================
+# ====================== 核心预测逻辑（保持不变） ======================
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     values = list(score_map.values())
     mn, mx = min(values), max(values)
@@ -230,7 +309,7 @@ def generate_strategy(draws: List[List[int]], strategy: str, mined_config=None):
     if strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
         return _apply_weight_config(draws, cfg, "规律挖掘")
-    # 默认 balanced_v1 和 ensemble_v2 都用平衡配置
+    # 默认 balanced_v1 / ensemble_v2
     return _apply_weight_config(draws, {"window": 80, "w_freq": 0.4, "w_omit": 0.3, "w_mom": 0.2}, "平衡")
 
 
@@ -259,7 +338,7 @@ def ensure_mined_pattern_config(conn):
 
 
 def next_issue_number(current_issue: str) -> str:
-    """从当期期号推算下一期，兼容 24/032 或 2024032 格式"""
+    """从当期期号推算下一期，兼容 2026054 或 24/032 格式"""
     digits = ''.join(ch for ch in current_issue if ch.isdigit())
     if not digits:
         return f"{current_issue}-NEXT"
@@ -365,12 +444,15 @@ def cmd_sync(args):
     try:
         init_db(conn)
         total, ins, upd = sync_online(conn)
-        print(f"\n✅ 同步完成！共 {total} 期 (新增{ins} / 更新{upd})")
+        if total > 0:
+            print(f"\n✅ 同步完成！共 {total} 期 (新增{ins} / 更新{upd})")
         print_latest_result(conn)
 
         print("\n正在生成新一期预测...")
         target = generate_and_store_predictions(conn)
         print_predictions(conn)
+    except Exception as e:
+        print(f"❌ 运行出错: {e}")
     finally:
         conn.close()
 
@@ -385,7 +467,6 @@ def cmd_show(args):
 
 
 def main():
-    # 父解析器，包含数据库路径参数，供子命令继承
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument("--db", default=DB_PATH_DEFAULT, help="数据库路径")
 
