@@ -1,35 +1,33 @@
-name: 六合彩自动预测与复盘
+name: 六合彩智能预测与复盘
 
 on:
   schedule:
-    # 香港六合彩周二、四、六 21:30 开奖，UTC+8 → UTC 13:30，14:00 确保数据已更新
     - cron: '0 14 * * 2,4,6'
-  workflow_dispatch:   # 允许手动触发
+  workflow_dispatch:
 
 permissions:
-  contents: write      # 允许自动 commit 数据库文件
+  contents: write
 
 jobs:
   predict:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 同步数据并生成预测
-        run: python marksix_local.py --db marksix_local.db sync
+      - name: 同步数据、回测、预测
+        run: |
+          python marksix_local.py sync \
+            --source auto \
+            --official-url "https://bet.hkjc.com/contentserver/jcbw/cmc/last30draw.json" \
+            --third-party-url "https://marksix6.net/index.php?api=1" \
+            --third-party-max-pages 5 \
+            --no-require-continuity \
+            --with-backtest
 
-      - name: 复盘已开奖的预测
-        run: python marksix_local.py --db marksix_local.db review
-
-      - name: 自动调整策略权重（隔期运行可注释掉）
-        run: python marksix_local.py --db marksix_local.db tune
-
-      - name: 提交数据库更新
+      - name: 提交更新
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
