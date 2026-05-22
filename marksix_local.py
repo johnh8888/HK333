@@ -47,7 +47,7 @@ def special_attributes(num: int) -> Dict[str, str]:
             "合大小": total_big_small, "尾大小": tail_big_small, "色波": color, "五行": element}
 
 # ---------- 波色预测 ----------
-def predict_color(specials: List[int], window: int = 50) -> Tuple[str, str, float, float]:
+def predict_color(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
     """根据最近 window 期特码，返回主强颜色、次强颜色及各自频率"""
     if not specials: return "蓝", "绿", 0.0, 0.0
     recent = specials[-window:]
@@ -59,23 +59,22 @@ def predict_color(specials: List[int], window: int = 50) -> Tuple[str, str, floa
     second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
     return main_color, second_color, main_freq, second_freq
 
-def backtest_colors(conn, recent_limit: int = 10) -> Tuple[int, int, int, int]:
+def backtest_colors(conn, recent_limit: int = 10, window: int = 10) -> Tuple[int, int, int, int]:
     """
-    回测最近 recent_limit 期波色，使用真实历史数据，绝不偷看未来。
+    回测最近 recent_limit 期波色，使用真实历史数据。
     返回 (总期数, 主强命中, 次强命中, 二中一命中)
     """
     rows = conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()
     specials = [r["special_number"] for r in rows]
-    # 至少需要 recent_limit + 10 期历史才能有效预测（保证训练数据充足）
-    if len(specials) < recent_limit + 10:
+    if len(specials) < recent_limit + max(10, window):  # 保证训练数据充足
         return 0, 0, 0, 0
 
     total = main_hit = second_hit = any_hit = 0
-    start_idx = len(specials) - recent_limit   # 只统计最近 recent_limit 期
+    start_idx = len(specials) - recent_limit
     for i in range(start_idx, len(specials)):
-        train = specials[:i]  # 仅使用 i 之前的数据，不包含当期
+        train = specials[:i]
         actual = get_color(specials[i])
-        main_color, second_color, _, _ = predict_color(train, window=50)
+        main_color, second_color, _, _ = predict_color(train, window=window)
         if main_color == actual:
             main_hit += 1
         if second_color == actual:
@@ -463,7 +462,7 @@ def auto_tune_mined_config(conn, recent_runs=20):
     return cfg
 
 # ---------- 展示 ----------
-def print_dashboard(conn):
+def print_dashboard(conn, color_window=10):
     backfill_missing_special_picks(conn)
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if latest:
@@ -492,15 +491,15 @@ def print_dashboard(conn):
             print(f"  {label:　<8s}: 期数={s['cnt']}, 平均命中={s['avg_hit']}个, 命中率={s['hit_rate_pct']}%, 特别号命中率={s['special_rate_pct']}%")
     else:
         print("\n暂无复盘数据。")
-    # 波色预测（基于最近50期特码，回测最近10期）
+    # 波色预测（基于最近 color_window 期特码，回测最近 10 期）
     all_specials = [r["special_number"] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()]
-    if len(all_specials) >= 10:
-        main_color, second_color, main_freq, second_freq = predict_color(all_specials, window=50)
-        print(f"\n🎨 特码波色预测（下一期）：")
+    if len(all_specials) >= max(color_window, 10):
+        main_color, second_color, main_freq, second_freq = predict_color(all_specials, window=color_window)
+        print(f"\n🎨 特码波色预测（基于最近 {color_window} 期）：")
         print(f"   主强: {main_color} (频率 {main_freq:.1%})   次强: {second_color} (频率 {second_freq:.1%})")
-        total, main_hit, second_hit, any_hit = backtest_colors(conn, recent_limit=10)
+        total, main_hit, second_hit, any_hit = backtest_colors(conn, recent_limit=10, window=color_window)
         if total > 0:
-            print(f"\n📊 历史回测（最近 {total} 期）：")
+            print(f"\n📊 历史回测（最近 10 期，窗口={color_window}）：")
             print(f"   主强命中率: {main_hit/total*100:.1f}%   次强命中率: {second_hit/total*100:.1f}%   二中一命中率: {any_hit/total*100:.1f}%")
         else:
             print("\n波色回测数据不足。")
@@ -523,19 +522,20 @@ def cmd_sync(args):
         if args.auto_tune: auto_tune_mined_config(conn)
         issue = generate_predictions(conn)
         print(f"已生成 {issue} 期预测。")
-        print_dashboard(conn)
+        print_dashboard(conn, color_window=args.color_window)
     except Exception as e: print(f"错误: {e}")
     finally: conn.close()
 
 def cmd_show(args):
     conn = connect_db(args.db)
-    try: print_dashboard(conn)
+    try: print_dashboard(conn, color_window=args.color_window)
     finally: conn.close()
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--official-url", default=OFFICIAL_URL_DEFAULT)
+    p.add_argument("--color-window", type=int, default=10, help="波色预测窗口大小（最近 N 期）")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("sync")
     sp.add_argument("--with-backtest", action="store_true")
