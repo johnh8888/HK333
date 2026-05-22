@@ -2,22 +2,27 @@ name: 六合彩自动预测
 
 on:
   schedule:
+    # 香港六合彩周二、四、六 21:30 开奖，UTC+8 → UTC 13:30，延迟到 14:00 确保官网已更新
     - cron: '0 14 * * 2,4,6'
-  workflow_dispatch:
+  workflow_dispatch:   # 允许手动触发
 
 permissions:
-  contents: write
+  contents: write      # 允许自动 commit 数据库
 
 jobs:
   predict:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: 运行预测
-        run: python marksix.py sync --db marksix_local.db
+
+      - name: 运行同步与预测
+        run: python marksix_local.py sync --db marksix_local.db
+
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
@@ -25,7 +30,8 @@ jobs:
           git add marksix_local.db
           git commit -m "🤖 自动预测 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d')" || echo "Nothing to commit"
           git push
-      - name: 保存 Artifact
+
+      - name: 保存 Artifact（备查）
         uses: actions/upload-artifact@v4
         with:
           name: marksix-db-backup
