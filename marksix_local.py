@@ -152,9 +152,7 @@ def sync_online(conn: sqlite3.Connection) -> Tuple[int, int, int]:
     return len(records), inserted, updated
 
 
-# ====================== 以下保留你原来的核心逻辑 ======================
-# （以下部分直接复制你原来的代码，从 _normalize 开始到 generate_predictions 等）
-
+# ====================== 核心预测逻辑 ======================
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     values = list(score_map.values())
     mn, mx = min(values), max(values)
@@ -232,7 +230,7 @@ def generate_strategy(draws: List[List[int]], strategy: str, mined_config=None):
     if strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
         return _apply_weight_config(draws, cfg, "规律挖掘")
-    # default balanced
+    # 默认 balanced_v1 和 ensemble_v2 都用平衡配置
     return _apply_weight_config(draws, {"window": 80, "w_freq": 0.4, "w_omit": 0.3, "w_mom": 0.2}, "平衡")
 
 
@@ -260,52 +258,142 @@ def ensure_mined_pattern_config(conn):
     return cfg
 
 
-def generate_predictions(conn: sqlite3.Connection) -> str:
+def next_issue_number(current_issue: str) -> str:
+    """从当期期号推算下一期，兼容 24/032 或 2024032 格式"""
+    digits = ''.join(ch for ch in current_issue if ch.isdigit())
+    if not digits:
+        return f"{current_issue}-NEXT"
+    num = int(digits) + 1
+    if '/' in current_issue:
+        parts = current_issue.rsplit('/', 1)
+        return f"{parts[0]}/{num:0{len(digits)}d}"
+    return f"{num:0{len(digits)}d}"
+
+
+def generate_and_store_predictions(conn: sqlite3.Connection) -> str:
+    """生成下一期所有策略的预测，并持久化到数据库"""
     latest = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
     if not latest:
-        raise RuntimeError("No data yet")
-    target_issue = f"{latest['issue_no'].split('/')[0]}/{int(latest['issue_no'].split('/')[1])+1:03d}"
+        raise RuntimeError("No draw data yet")
+    target_issue = next_issue_number(latest["issue_no"])
 
     draws = load_recent_draws(conn)
     mined_cfg = ensure_mined_pattern_config(conn)
+    now = utc_now()
 
     for strategy in STRATEGY_IDS:
-        picks, special, _, score_map = generate_strategy(draws, strategy, mined_cfg)
-        # 简化版：这里省略了完整 prediction_runs / pools 的插入，保留核心逻辑
-        print(f"  → {STRATEGY_LABELS.get(strategy, strategy)}: {picks[:6]} | 特别号 {special}")
+        # 跳过已存在的预测
+        exist = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no=? AND strategy=?",
+            (target_issue, strategy)
+        ).fetchone()
+        if exist:
+            continue
 
+        picks, special, special_score, _ = generate_strategy(draws, strategy, mined_cfg)
+
+        # 插入 prediction_run
+        cur = conn.execute(
+            "INSERT INTO prediction_runs (issue_no, strategy, status, created_at) VALUES (?, ?, 'PENDING', ?)",
+            (target_issue, strategy, now)
+        )
+        run_id = cur.lastrowid
+
+        # 插入主号 (rank 1-6)
+        for num, rank, score, reason in picks:
+            conn.execute(
+                "INSERT INTO prediction_picks (run_id, pick_type, number, rank, score, reason) VALUES (?, 'MAIN', ?, ?, ?, ?)",
+                (run_id, num, rank, score, reason)
+            )
+
+        # 插入特别号 (rank 7)
+        conn.execute(
+            "INSERT INTO prediction_picks (run_id, pick_type, number, rank, score, reason) VALUES (?, 'SPECIAL', ?, 7, ?, ?)",
+            (run_id, special, special_score, f"{STRATEGY_LABELS.get(strategy, strategy)} 特别号")
+        )
+
+        # 插入预测池（主号6个）
+        main_numbers = sorted([n for n, _, _, _ in picks])
+        conn.execute(
+            "INSERT INTO prediction_pools (run_id, pool_size, numbers_json, created_at) VALUES (?, 6, ?, ?)",
+            (run_id, json.dumps(main_numbers), now)
+        )
+
+    conn.commit()
     return target_issue
 
 
-def print_dashboard(conn):
+def print_latest_result(conn: sqlite3.Connection):
+    """打印最新开奖信息"""
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
         print(f"\n最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
+    else:
+        print("\n暂无开奖数据")
 
-    print("\n正在生成新一期预测...")
-    generate_predictions(conn)
+
+def print_predictions(conn: sqlite3.Connection):
+    """打印下一期的所有预测"""
+    latest_issue = conn.execute(
+        "SELECT issue_no FROM prediction_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not latest_issue:
+        print("暂无预测，请先执行 sync 同步数据")
+        return
+
+    runs = conn.execute(
+        "SELECT * FROM prediction_runs WHERE issue_no=? ORDER BY strategy",
+        (latest_issue["issue_no"],)
+    ).fetchall()
+
+    print(f"\n预测期号: {latest_issue['issue_no']}")
+    for run in runs:
+        picks = conn.execute(
+            "SELECT number, pick_type, rank FROM prediction_picks WHERE run_id=? ORDER BY rank",
+            (run["id"],)
+        ).fetchall()
+        main_nums = [str(p["number"]).zfill(2) for p in picks if p["pick_type"] == "MAIN"]
+        special = next((str(p["number"]).zfill(2) for p in picks if p["pick_type"] == "SPECIAL"), "--")
+        label = STRATEGY_LABELS.get(run["strategy"], run["strategy"])
+        print(f"  {label:　<8s}: {' '.join(main_nums)} + {special}")
 
 
-# ====================== 命令行 ======================
+# ====================== 命令行处理 ======================
 def cmd_sync(args):
     conn = connect_db(args.db)
     try:
         init_db(conn)
         total, ins, upd = sync_online(conn)
         print(f"\n✅ 同步完成！共 {total} 期 (新增{ins} / 更新{upd})")
-        print_dashboard(conn)
+        print_latest_result(conn)
+
+        print("\n正在生成新一期预测...")
+        target = generate_and_store_predictions(conn)
+        print_predictions(conn)
+    finally:
+        conn.close()
+
+
+def cmd_show(args):
+    conn = connect_db(args.db)
+    try:
+        print_latest_result(conn)
+        print_predictions(conn)
     finally:
         conn.close()
 
 
 def main():
-    p = argparse.ArgumentParser(description="香港六合彩线上预测工具")
-    p.add_argument("--db", default=DB_PATH_DEFAULT)
+    # 父解析器，包含数据库路径参数，供子命令继承
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument("--db", default=DB_PATH_DEFAULT, help="数据库路径")
+
+    p = argparse.ArgumentParser(description="香港六合彩线上预测工具", parents=[parent_parser])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("sync", help="同步最新开奖数据并预测").set_defaults(func=cmd_sync)
-    sub.add_parser("show", help="显示预测").set_defaults(func=lambda a: print_dashboard(connect_db(a.db)))
+    sub.add_parser("sync", parents=[parent_parser], help="同步最新开奖数据并预测").set_defaults(func=cmd_sync)
+    sub.add_parser("show", parents=[parent_parser], help="显示最新开奖和已有预测").set_defaults(func=cmd_show)
 
     args = p.parse_args()
     args.func(args)
