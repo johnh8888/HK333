@@ -1,8 +1,8 @@
-name: 六合彩自动预测
+name: 六合彩自动预测与复盘
 
 on:
   schedule:
-    - cron: '0 14 * * 2,4,6'
+    - cron: '0 14 * * 2,4,6'   # 香港时间每周二、四、六晚上10点
   workflow_dispatch:
 
 permissions:
@@ -17,8 +17,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 同步数据并生成预测
-        run: python marksix_local.py sync
+      - name: 运行同步、回测、调优与预测
+        run: python marksix_local.py sync --with-backtest --auto-tune
 
       - name: 提交数据库更新
         run: |
@@ -27,3 +27,9 @@ jobs:
           git add marksix_local.db
           git commit -m "🤖 自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
           git push
+
+      - name: 保存 Artifact（备查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: marksix-db-backup
+          path: marksix_local.db
