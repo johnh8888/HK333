@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import io
 import json
-import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -16,12 +13,11 @@ from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "marksix_local.db")
-CSV_PATH_DEFAULT = str(SCRIPT_DIR / "Mark_Six.csv")  # 保留但不再自动使用
 OFFICIAL_URL_DEFAULT = "https://bet.hkjc.com/contentserver/jcbw/cmc/last30draw.json"
-THIRD_PARTY_MAX_PAGES_DEFAULT = 5
 THIRD_PARTY_URLS_DEFAULT: List[str] = [
     "https://marksix6.net/index.php?api=1",
 ]
+THIRD_PARTY_MAX_PAGES_DEFAULT = 5
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 STRATEGY_LABELS = {
@@ -35,6 +31,50 @@ STRATEGY_LABELS = {
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
 
+# ---------- 特别号属性定义 ----------
+def special_attributes(num: int) -> Dict[str, str]:
+    """返回特别号的属性字典"""
+    odd_even = "单" if num % 2 == 1 else "双"
+    big_small = "大" if num >= 25 else "小"
+    # 合数 = 十位 + 个位
+    tens = num // 10
+    ones = num % 10
+    total = tens + ones
+    total_odd_even = "单" if total % 2 == 1 else "双"
+    total_big_small = "大" if total >= 7 else "小"
+    # 尾数大小：个位 >= 5 为大，否则小
+    last_digit = num % 10
+    tail_big_small = "大" if last_digit >= 5 else "小"
+    # 色波：根据传统划分（1-16红，17-32蓝，33-49绿）
+    if 1 <= num <= 16:
+        color = "红"
+    elif 17 <= num <= 32:
+        color = "蓝"
+    else:
+        color = "绿"
+    # 五行：简单按尾数/区间划分（仅供参考）
+    if last_digit in (1, 6):
+        element = "水"
+    elif last_digit in (2, 7):
+        element = "火"
+    elif last_digit in (3, 8):
+        element = "木"
+    elif last_digit in (4, 9):
+        element = "金"
+    else:
+        element = "土"
+    return {
+        "单双": odd_even,
+        "大小": big_small,
+        "合单双": total_odd_even,
+        "合大小": total_big_small,
+        "尾大小": tail_big_small,
+        "色波": color,
+        "五行": element,
+    }
+
+
+# ---------- 数据库与基础函数（同前） ----------
 @dataclass
 class DrawRecord:
     issue_no: str
@@ -54,8 +94,7 @@ def connect_db(db_path: str) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS draws (
             issue_no TEXT PRIMARY KEY,
             draw_date TEXT NOT NULL,
@@ -65,26 +104,19 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS prediction_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             issue_no TEXT NOT NULL,
             strategy TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'PENDING',
-            hit_count INTEGER,
-            hit_rate REAL,
-            hit_count_10 INTEGER,
-            hit_rate_10 REAL,
-            hit_count_14 INTEGER,
-            hit_rate_14 REAL,
-            hit_count_20 INTEGER,
-            hit_rate_20 REAL,
+            hit_count INTEGER, hit_rate REAL,
+            hit_count_10 INTEGER, hit_rate_10 REAL,
+            hit_count_14 INTEGER, hit_rate_14 REAL,
+            hit_count_20 INTEGER, hit_rate_20 REAL,
             special_hit INTEGER,
-            created_at TEXT NOT NULL,
-            reviewed_at TEXT,
+            created_at TEXT NOT NULL, reviewed_at TEXT,
             UNIQUE(issue_no, strategy)
         );
-
         CREATE TABLE IF NOT EXISTS prediction_picks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -96,7 +128,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE(run_id, number),
             FOREIGN KEY(run_id) REFERENCES prediction_runs(id) ON DELETE CASCADE
         );
-
         CREATE TABLE IF NOT EXISTS prediction_pools (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -106,14 +137,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE(run_id, pool_size),
             FOREIGN KEY(run_id) REFERENCES prediction_runs(id) ON DELETE CASCADE
         );
-
         CREATE TABLE IF NOT EXISTS model_state (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        """
-    )
+    """)
     _ensure_migrations(conn)
     conn.commit()
 
@@ -150,16 +179,12 @@ def get_model_state(conn: sqlite3.Connection, key: str) -> Optional[str]:
 def set_model_state(conn: sqlite3.Connection, key: str, value: str) -> None:
     now = utc_now()
     conn.execute(
-        """
-        INSERT INTO model_state(key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        """,
+        "INSERT INTO model_state(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         (key, value, now),
     )
 
 
-# ================== 多源数据获取 ==================
+# ---------- 数据获取 ----------
 def _parse_marksix6_response(payload: dict) -> List[DrawRecord]:
     records = []
     hk_data = None
@@ -169,13 +194,11 @@ def _parse_marksix6_response(payload: dict) -> List[DrawRecord]:
             break
     if not hk_data:
         return records
-
     latest_open_time_str = hk_data.get("openTime", "")
     try:
         latest_open_time = datetime.strptime(latest_open_time_str, "%Y-%m-%d %H:%M:%S")
     except:
         latest_open_time = datetime.now()
-
     for idx, item in enumerate(hk_data.get("history", [])):
         try:
             parts = item.split("期：")
@@ -209,13 +232,7 @@ def _parse_official_json(payload: list) -> List[DrawRecord]:
     return records
 
 
-def fetch_online_records_with_multi_fallback(
-    official_url: str,
-    third_party_urls: Sequence[str],
-    third_party_max_pages: int = THIRD_PARTY_MAX_PAGES_DEFAULT,
-) -> Tuple[List[DrawRecord], str, str]:
-    """按优先级尝试在线数据源，返回记录列表、来源标签、实际使用的URL"""
-    # 1. 官方
+def fetch_online_records_with_multi_fallback(official_url: str, third_party_urls: Sequence[str]) -> Tuple[List[DrawRecord], str, str]:
     if official_url.strip():
         try:
             req = Request(official_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -226,8 +243,6 @@ def fetch_online_records_with_multi_fallback(
                 return records, "official_api", official_url
         except Exception as e:
             print(f"官方源失败: {e}")
-
-    # 2. 第三方（优先 marksix6）
     for url in third_party_urls:
         try:
             if "marksix6.net" in url:
@@ -246,8 +261,7 @@ def fetch_online_records_with_multi_fallback(
                     return records, f"third_party", url
         except Exception as e:
             print(f"第三方源 {url} 失败: {e}")
-
-    raise RuntimeError("所有在线数据源均无法获取数据，请检查网络或配置。")
+    raise RuntimeError("所有在线数据源均无法获取数据。")
 
 
 def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> str:
@@ -290,7 +304,7 @@ def next_issue(issue_no: str) -> str:
     return f"{num:0{len(digits)}d}"
 
 
-# ================== 核心预测逻辑 ==================
+# ---------- 核心预测逻辑 ----------
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     values = list(score_map.values())
     mn, mx = min(values), max(values)
@@ -390,13 +404,11 @@ def _apply_weight_config(draws, config, reason):
     momentum = _normalize(_momentum_map(window))
     pair = _normalize(_pair_affinity_map(window, window=min(200, len(window))))
     zone = _normalize(_zone_heat_map(window, window=min(80, len(window))))
-
     w_freq = float(config.get("w_freq", 0.45))
     w_omit = float(config.get("w_omit", 0.35))
     w_mom = float(config.get("w_mom", 0.20))
     w_pair = float(config.get("w_pair", 0.00))
     w_zone = float(config.get("w_zone", 0.00))
-
     scores = {}
     for n in ALL_NUMBERS:
         scores[n] = (freq[n] * w_freq + omission[n] * w_omit + momentum[n] * w_mom + pair[n] * w_pair + zone[n] * w_zone)
@@ -477,7 +489,9 @@ def generate_predictions(conn, issue_no=None):
     ).fetchall()]
     if len(draws) < 20:
         raise RuntimeError("Need at least 20 draws.")
-    mined_cfg = _default_mined_config()
+    # 使用已保存的 mined config，否则默认
+    config_json = get_model_state(conn, MINED_CONFIG_KEY)
+    mined_cfg = json.loads(config_json) if config_json else _default_mined_config()
     for strategy in STRATEGY_IDS:
         now = utc_now()
         cur = conn.execute(
@@ -547,7 +561,9 @@ def backfill_missing_special_picks(conn):
         draws = [json.loads(r["numbers_json"]) for r in conn.execute(
             "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 200"
         ).fetchall()]
-        _, special_number, special_score, _ = generate_strategy(draws, run["strategy"])
+        config_json = get_model_state(conn, MINED_CONFIG_KEY)
+        mined_cfg = json.loads(config_json) if config_json else _default_mined_config()
+        _, special_number, special_score, _ = generate_strategy(draws, run["strategy"], mined_cfg)
         if special_number in mains:
             for n in ALL_NUMBERS:
                 if n not in mains:
@@ -563,13 +579,56 @@ def backfill_missing_special_picks(conn):
     return patched
 
 
+# ---------- 自动调优 ----------
+def auto_tune_mined_config(conn, recent_runs=20):
+    """根据近期规律挖掘策略的复盘表现调整权重"""
+    config_json = get_model_state(conn, MINED_CONFIG_KEY)
+    cfg = json.loads(config_json) if config_json else _default_mined_config()
+    rows = conn.execute(
+        "SELECT hit_count FROM prediction_runs WHERE strategy='pattern_mined_v1' AND status='REVIEWED' ORDER BY id DESC LIMIT ?",
+        (recent_runs,)
+    ).fetchall()
+    if len(rows) < 5:
+        print("复盘数据不足，跳过调优。")
+        return cfg
+    avg_hits = sum(r["hit_count"] for r in rows) / len(rows)
+    print(f"近期规律挖掘平均命中: {avg_hits:.2f}")
+    w_freq = cfg.get("w_freq", 0.40)
+    w_mom = cfg.get("w_mom", 0.20)
+    delta = 0.03
+    if avg_hits < 1.8:
+        w_freq = max(0.2, w_freq - delta)
+        w_mom = min(0.5, w_mom + delta)
+    elif avg_hits > 2.5:
+        w_freq = min(0.5, w_freq + delta)
+        w_mom = max(0.1, w_mom - delta)
+    else:
+        print("当前表现合理，不调整。")
+        return cfg
+    w_omit = 1.0 - w_freq - w_mom
+    if w_omit < 0:
+        w_omit = 0.0
+        total = w_freq + w_mom
+        w_freq /= total
+        w_mom /= total
+    cfg["w_freq"] = round(w_freq, 4)
+    cfg["w_omit"] = round(w_omit, 4)
+    cfg["w_mom"] = round(w_mom, 4)
+    set_model_state(conn, MINED_CONFIG_KEY, json.dumps(cfg, ensure_ascii=False))
+    print(f"已更新规律挖掘权重: freq={w_freq:.3f}, omit={w_omit:.3f}, mom={w_mom:.3f}")
+    return cfg
+
+
+# ---------- 显示增强 ----------
 def print_dashboard(conn):
     backfill_missing_special_picks(conn)
+    # 最新开奖
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
         print(f"最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
 
+    # 待开奖预测
     pending = conn.execute("SELECT id, issue_no, strategy FROM prediction_runs WHERE status='PENDING' ORDER BY strategy").fetchall()
     if pending:
         print(f"\n预测期号: {pending[0]['issue_no']}")
@@ -577,37 +636,51 @@ def print_dashboard(conn):
             mains = [str(x["number"]).zfill(2) for x in conn.execute(
                 "SELECT number FROM prediction_picks WHERE run_id = ? AND pick_type = 'MAIN' ORDER BY rank", (r["id"],)
             ).fetchall()]
-            special = next((str(x["number"]).zfill(2) for x in conn.execute(
-                "SELECT number FROM prediction_picks WHERE run_id = ? AND pick_type = 'SPECIAL'", (r["id"],)
-            ).fetchall()), "--")
+            special_row = conn.execute("SELECT number FROM prediction_picks WHERE run_id = ? AND pick_type = 'SPECIAL'", (r["id"],)).fetchone()
+            special = str(special_row["number"]).zfill(2) if special_row else "--"
             label = STRATEGY_LABELS.get(r["strategy"], r["strategy"])
             print(f"  {label:　<8s}: {' '.join(mains)} + {special}")
+            if special_row:
+                attrs = special_attributes(special_row["number"])
+                print(f"         特码属性: {attrs['单双']}/{attrs['大小']} 合{attrs['合单双']}/{attrs['合大小']} 尾{attrs['尾大小']} {attrs['色波']} {attrs['五行']}")
+
+    # 策略表现统计
+    stats = conn.execute("""
+        SELECT strategy,
+               COUNT(*) AS cnt,
+               ROUND(AVG(hit_count), 2) AS avg_hit,
+               ROUND(AVG(hit_rate)*100, 1) AS hit_rate_pct,
+               ROUND(AVG(COALESCE(special_hit, 0))*100, 1) AS special_rate_pct
+        FROM prediction_runs
+        WHERE status='REVIEWED'
+        GROUP BY strategy
+        ORDER BY avg_hit DESC
+    """).fetchall()
+    if stats:
+        print("\n历史命中统计:")
+        for s in stats:
+            label = STRATEGY_LABELS.get(s["strategy"], s["strategy"])
+            print(f"  {label:　<8s}: 期数={s['cnt']}, 平均命中={s['avg_hit']}个, 命中率={s['hit_rate_pct']}%, 特别号命中率={s['special_rate_pct']}%")
+    else:
+        print("\n暂无复盘数据，运行 sync --with-backtest 可生成。")
 
 
-# ================== 命令行 ==================
+# ---------- 命令行 ----------
 def cmd_sync(args):
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        # 完全在线获取，不回退到 CSV
-        records, source_label, used_url = fetch_online_records_with_multi_fallback(
-            args.official_url, THIRD_PARTY_URLS_DEFAULT
-        )
+        records, source_label, used_url = fetch_online_records_with_multi_fallback(args.official_url, THIRD_PARTY_URLS_DEFAULT)
         total, ins, upd = sync_from_records(conn, records, source_label)
         print(f"数据同步完成: total={total}, new={ins}, updated={upd}, source={source_label} ({used_url})")
-        # 复盘最新一期
         latest_issue = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 1").fetchone()["issue_no"]
         review_issue(conn, latest_issue)
-        # 回测（如果启用）
         if args.with_backtest:
-            from datetime import timedelta
-            # 简单增量回测最近30期
-            recent_issues = [r["issue_no"] for r in conn.execute(
-                "SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 30"
-            ).fetchall()]
-            for issue in recent_issues:
+            recent = [r["issue_no"] for r in conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 30").fetchall()]
+            for issue in recent:
                 review_issue(conn, issue)
-        # 生成预测
+        if args.auto_tune:
+            auto_tune_mined_config(conn)
         issue = generate_predictions(conn)
         print(f"已生成 {issue} 期预测。")
         print_dashboard(conn)
@@ -632,6 +705,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("sync")
     sp.add_argument("--with-backtest", action="store_true")
+    sp.add_argument("--auto-tune", action="store_true")
     sp.set_defaults(func=cmd_sync)
     sub.add_parser("show").set_defaults(func=cmd_show)
     args = p.parse_args()
