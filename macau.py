@@ -164,7 +164,7 @@ def set_model_state(conn, key, value):
 
 # ---------- 数据获取 ----------
 def _parse_new_macau_response(payload):
-    """解析 marksix6 中 澳门彩 的数据"""
+    """解析 marksix6 中 老澳门彩 的数据"""
     records = []
     target = next((l for l in payload.get("lottery_data", []) if l.get("name") == "新澳门彩"), None)
     if not target: return records
