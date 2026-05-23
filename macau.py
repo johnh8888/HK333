@@ -163,10 +163,10 @@ def set_model_state(conn, key, value):
     conn.execute("INSERT INTO model_state(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
 # ---------- 数据获取 ----------
-def _parse_new_macau_response(payload):
+def _parse_old_macau_response(payload):
     """解析 marksix6 中 老澳门彩 的数据"""
     records = []
-    target = next((l for l in payload.get("lottery_data", []) if l.get("name") == "新澳门彩"), None)
+    target = next((l for l in payload.get("lottery_data", []) if l.get("name") == "老澳门彩"), None)
     if not target: return records
     try: latest_open_time = datetime.strptime(target.get("openTime", ""), "%Y-%m-%d %H:%M:%S")
     except: latest_open_time = datetime.now()
@@ -177,7 +177,7 @@ def _parse_new_macau_response(payload):
             issue_no = parts[0].strip()
             nums = [int(n.strip()) for n in parts[1].split(",")]
             if len(nums) != 7: continue
-            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")  # 澳门彩每天开
+            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")
             records.append(DrawRecord(issue_no, draw_date, nums[:6], nums[6]))
         except: continue
     return records
@@ -208,7 +208,7 @@ def fetch_online_records_with_multi_fallback(official_url, third_party_urls):
             if "marksix6.net" in url:
                 req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with urlopen(req, timeout=20) as resp: payload = json.loads(resp.read().decode("utf-8"))
-                records = _parse_new_macau_response(payload)
+                records = _parse_old_macau_response(payload)
                 if records: return records, "marksix6", url
         except Exception as e: print(f"第三方源 {url} 失败: {e}")
     raise RuntimeError("所有在线数据源均无法获取数据。")
@@ -547,7 +547,7 @@ def cmd_show(args):
     finally: conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具")
+    p = argparse.ArgumentParser(description="老澳门六合彩预测工具")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--official-url", default=OFFICIAL_URL_DEFAULT)
     p.add_argument("--color-window", type=int, default=10, help="波色预测窗口大小（最近 N 期，默认10）")
