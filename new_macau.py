@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "marksix_local.db")
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "new_macau.db")
 OFFICIAL_URL_DEFAULT = "https://bet.hkjc.com/contentserver/jcbw/cmc/last30draw.json"
 THIRD_PARTY_URLS_DEFAULT: List[str] = ["https://marksix6.net/index.php?api=1"]
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
@@ -162,10 +162,10 @@ def set_model_state(conn, key, value):
     now = utc_now()
     conn.execute("INSERT INTO model_state(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
-# ---------- 数据获取 ----------
+# ---------- 数据获取 (新澳门彩) ----------
 def _parse_marksix6_response(payload):
     records = []
-    hk_data = next((l for l in payload.get("lottery_data", []) if l.get("name") == "香港彩"), None)
+    hk_data = next((l for l in payload.get("lottery_data", []) if l.get("name") == "新澳门彩"), None)
     if not hk_data: return records
     try: latest_open_time = datetime.strptime(hk_data.get("openTime", ""), "%Y-%m-%d %H:%M:%S")
     except: latest_open_time = datetime.now()
@@ -176,7 +176,7 @@ def _parse_marksix6_response(payload):
             issue_no = parts[0].strip()
             nums = [int(n.strip()) for n in parts[1].split(",")]
             if len(nums) != 7: continue
-            draw_date = (latest_open_time - timedelta(days=idx * 2)).strftime("%Y-%m-%d")
+            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")  # 每天开奖
             records.append(DrawRecord(issue_no, draw_date, nums[:6], nums[6]))
         except: continue
     return records
@@ -416,7 +416,6 @@ def review_issue(conn, issue_no):
     runs = conn.execute("SELECT id FROM prediction_runs WHERE issue_no=? AND status='PENDING'", (issue_no,)).fetchall()
     count = 0
 
-    # 辅助函数：从 numbers_json 读取池子号码
     def get_pool(conn, run_id, size):
         row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id=? AND pool_size=?", (run_id, size)).fetchone()
         return json.loads(row["numbers_json"]) if row else []
@@ -561,7 +560,7 @@ def cmd_show(args):
     finally: conn.close()
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--official-url", default=OFFICIAL_URL_DEFAULT)
     p.add_argument("--color-window", type=int, default=10, help="波色预测窗口大小（最近 N 期，默认10）")
