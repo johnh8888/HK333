@@ -162,22 +162,21 @@ def set_model_state(conn, key, value):
     now = utc_now()
     conn.execute("INSERT INTO model_state(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
-# ---------- 数据获取 ----------
-def _parse_old_macau_response(payload):
-    """解析 marksix6 中 老澳门彩 的数据"""
+# ---------- 数据获取 (老澳门彩) ----------
+def _parse_marksix6_response(payload):
     records = []
-    target = next((l for l in payload.get("lottery_data", []) if l.get("name") == "老澳门彩"), None)
-    if not target: return records
-    try: latest_open_time = datetime.strptime(target.get("openTime", ""), "%Y-%m-%d %H:%M:%S")
+    hk_data = next((l for l in payload.get("lottery_data", []) if l.get("name") == "老澳门彩"), None)
+    if not hk_data: return records
+    try: latest_open_time = datetime.strptime(hk_data.get("openTime", ""), "%Y-%m-%d %H:%M:%S")
     except: latest_open_time = datetime.now()
-    for idx, item in enumerate(target.get("history", [])):
+    for idx, item in enumerate(hk_data.get("history", [])):
         try:
             parts = item.split("期：")
             if len(parts) != 2: continue
             issue_no = parts[0].strip()
             nums = [int(n.strip()) for n in parts[1].split(",")]
             if len(nums) != 7: continue
-            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")
+            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")  # 每天开奖
             records.append(DrawRecord(issue_no, draw_date, nums[:6], nums[6]))
         except: continue
     return records
@@ -208,8 +207,13 @@ def fetch_online_records_with_multi_fallback(official_url, third_party_urls):
             if "marksix6.net" in url:
                 req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with urlopen(req, timeout=20) as resp: payload = json.loads(resp.read().decode("utf-8"))
-                records = _parse_old_macau_response(payload)
+                records = _parse_marksix6_response(payload)
                 if records: return records, "marksix6", url
+            else:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=20) as resp: payload = json.loads(resp.read().decode("utf-8-sig"))
+                records = _parse_official_json(payload)
+                if records: return records, "third_party", url
         except Exception as e: print(f"第三方源 {url} 失败: {e}")
     raise RuntimeError("所有在线数据源均无法获取数据。")
 
@@ -241,7 +245,7 @@ def next_issue(issue_no):
         return f"{parts[0]}/{num:0{len(digits)}d}"
     return f"{num:0{len(digits)}d}"
 
-# ---------- 核心预测逻辑（与香港脚本完全一致） ----------
+# ---------- 核心预测逻辑 ----------
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     vals = list(score_map.values())
     mn, mx = min(vals), max(vals)
@@ -411,25 +415,34 @@ def review_issue(conn, issue_no):
     winning_special = int(draw["special_number"])
     runs = conn.execute("SELECT id FROM prediction_runs WHERE issue_no=? AND status='PENDING'", (issue_no,)).fetchall()
     count = 0
+
+    def get_pool(conn, run_id, size):
+        row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id=? AND pool_size=?", (run_id, size)).fetchone()
+        return json.loads(row["numbers_json"]) if row else []
+
     for run in runs:
         run_id = run["id"]
         mains = [r["number"] for r in conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='MAIN' ORDER BY rank", (run_id,)).fetchall()]
         special = next((r["number"] for r in conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='SPECIAL'", (run_id,)).fetchall()), None)
-        pool10 = [r[0] for r in conn.execute("SELECT number FROM prediction_pools WHERE run_id=? AND pool_size=10", (run_id,)).fetchall()] or mains
-        pool14 = [r[0] for r in conn.execute("SELECT number FROM prediction_pools WHERE run_id=? AND pool_size=14", (run_id,)).fetchall()] or mains
-        pool20 = [r[0] for r in conn.execute("SELECT number FROM prediction_pools WHERE run_id=? AND pool_size=20", (run_id,)).fetchall()] or mains
+
+        pool10 = get_pool(conn, run_id, 10) or mains
+        pool14 = get_pool(conn, run_id, 14) or mains
+        pool20 = get_pool(conn, run_id, 20) or mains
+
         hit_count = _pool_hit_count(mains, winning)
         hit_count_10 = _pool_hit_count(pool10, winning)
         hit_count_14 = _pool_hit_count(pool14, winning)
         hit_count_20 = _pool_hit_count(pool20, winning)
         special_hit = 1 if special == winning_special else 0
+
         conn.execute("""UPDATE prediction_runs SET status='REVIEWED', hit_count=?, hit_rate=?,
             hit_count_10=?, hit_rate_10=?, hit_count_14=?, hit_rate_14=?, hit_count_20=?, hit_rate_20=?,
             special_hit=?, reviewed_at=? WHERE id=?""",
             (hit_count, hit_count/6.0, hit_count_10, hit_count_10/6.0, hit_count_14, hit_count_14/6.0, hit_count_20, hit_count_20/6.0,
              special_hit, utc_now(), run_id))
         count += 1
-    conn.commit(); return count
+    conn.commit()
+    return count
 
 def backfill_missing_special_picks(conn):
     runs = conn.execute("SELECT id, strategy FROM prediction_runs WHERE status='PENDING'").fetchall()
