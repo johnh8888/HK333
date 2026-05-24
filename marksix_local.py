@@ -415,25 +415,35 @@ def review_issue(conn, issue_no):
     winning_special = int(draw["special_number"])
     runs = conn.execute("SELECT id FROM prediction_runs WHERE issue_no=? AND status='PENDING'", (issue_no,)).fetchall()
     count = 0
+
+    # 辅助函数：从 numbers_json 读取池子号码
+    def get_pool(conn, run_id, size):
+        row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id=? AND pool_size=?", (run_id, size)).fetchone()
+        return json.loads(row["numbers_json"]) if row else []
+
     for run in runs:
         run_id = run["id"]
         mains = [r["number"] for r in conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='MAIN' ORDER BY rank", (run_id,)).fetchall()]
         special = next((r["number"] for r in conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='SPECIAL'", (run_id,)).fetchall()), None)
-        pool10 = [r[0] for r in conn.execute("SELECT number FROM prediction_pools WHERE run_id=? AND pool_size=10", (run_id,)).fetchall()] or mains
-        pool14 = [r[0] for r in conn.execute("SELECT number FROM prediction_pools WHERE run_id=? AND pool_size=14", (run_id,)).fetchall()] or mains
-        pool20 = [r[0] for r in conn.execute("SELECT number FROM prediction_pools WHERE run_id=? AND pool_size=20", (run_id,)).fetchall()] or mains
+
+        pool10 = get_pool(conn, run_id, 10) or mains
+        pool14 = get_pool(conn, run_id, 14) or mains
+        pool20 = get_pool(conn, run_id, 20) or mains
+
         hit_count = _pool_hit_count(mains, winning)
         hit_count_10 = _pool_hit_count(pool10, winning)
         hit_count_14 = _pool_hit_count(pool14, winning)
         hit_count_20 = _pool_hit_count(pool20, winning)
         special_hit = 1 if special == winning_special else 0
+
         conn.execute("""UPDATE prediction_runs SET status='REVIEWED', hit_count=?, hit_rate=?,
             hit_count_10=?, hit_rate_10=?, hit_count_14=?, hit_rate_14=?, hit_count_20=?, hit_rate_20=?,
             special_hit=?, reviewed_at=? WHERE id=?""",
             (hit_count, hit_count/6.0, hit_count_10, hit_count_10/6.0, hit_count_14, hit_count_14/6.0, hit_count_20, hit_count_20/6.0,
              special_hit, utc_now(), run_id))
         count += 1
-    conn.commit(); return count
+    conn.commit()
+    return count
 
 def backfill_missing_special_picks(conn):
     runs = conn.execute("SELECT id, strategy FROM prediction_runs WHERE status='PENDING'").fetchall()
