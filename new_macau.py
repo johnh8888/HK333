@@ -140,11 +140,11 @@ def init_db(conn):
 
 
 # =========================================================
-# 真实数据获取（新澳门彩）-- 增强错误处理
+# 真实数据获取（兼容新 API 格式）
 # =========================================================
 
 def fetch_real_data():
-    """拉取真实开奖数据，增加详细错误日志"""
+    """拉取真实开奖数据，兼容数组和单对象两种格式"""
     req = Request(
         DATA_URL,
         headers={"User-Agent": "Mozilla/5.0"}
@@ -173,32 +173,58 @@ def fetch_real_data():
         print(f"原始响应前200字符: {raw[:200]}")
         return []
 
-    data = payload.get("data", [])
-    if not data:
-        print("⚠️ API返回的data为空，完整响应:", json.dumps(payload, ensure_ascii=False)[:500])
-        return []
-
+    # ---- 新增：兼容两种格式 ----
     records = []
-    for item in data:
-        try:
-            issue = str(item.get("expect", "")).strip()
-            opencode = item.get("opencode", "")
-            nums = [int(x) for x in opencode.split(",")]
-            if len(nums) != 7:
-                continue
-            draw_date = str(item.get("opentime", ""))[:10]
-            records.append(
-                DrawRecord(
-                    issue_no=issue,
-                    draw_date=draw_date,
-                    numbers=nums[:6],
-                    special_number=nums[6]
+
+    # 格式1：旧版，包含 "data" 数组
+    data_list = payload.get("data")
+    if isinstance(data_list, list) and data_list:
+        print("📦 检测到数组格式数据，记录数:", len(data_list))
+        for item in data_list:
+            try:
+                issue = str(item.get("expect", "")).strip()
+                opencode = item.get("opencode", "")
+                nums = [int(x) for x in opencode.split(",")]
+                if len(nums) != 7:
+                    continue
+                draw_date = str(item.get("opentime", ""))[:10]
+                records.append(
+                    DrawRecord(
+                        issue_no=issue,
+                        draw_date=draw_date,
+                        numbers=nums[:6],
+                        special_number=nums[6]
+                    )
                 )
-            )
-        except Exception:
-            print(f"⚠️ 解析单条数据失败: {item}")
-            traceback.print_exc()
-            continue
+            except Exception:
+                print(f"⚠️ 解析单条数据失败: {item}")
+                traceback.print_exc()
+                continue
+    else:
+        # 格式2：新版，整个对象直接就是最新一期开奖
+        if "openCode" in payload and "expect" in payload:
+            print("📦 检测到单对象格式数据")
+            try:
+                issue = str(payload.get("expect", "")).strip()
+                opencode = payload.get("openCode", "")
+                nums = [int(x) for x in opencode.split(",")]
+                if len(nums) == 7:
+                    draw_date = str(payload.get("openTime", ""))[:10]
+                    records.append(
+                        DrawRecord(
+                            issue_no=issue,
+                            draw_date=draw_date,
+                            numbers=nums[:6],
+                            special_number=nums[6]
+                        )
+                    )
+                else:
+                    print(f"⚠️ 号码数量异常: {opencode}")
+            except Exception:
+                print("⚠️ 解析单对象失败")
+                traceback.print_exc()
+        else:
+            print("⚠️ 无法识别API返回格式，完整响应:", json.dumps(payload, ensure_ascii=False)[:500])
 
     return records
 
