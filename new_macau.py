@@ -11,7 +11,6 @@ DB_FILE = "new_macau.db"
 # =========================
 # 波色 & 五行
 # =========================
-
 RED = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
 BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
 GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
@@ -41,9 +40,9 @@ def init_db():
     conn.close()
 
 # =========================
-# 网络请求
+# 网络请求（返回原始文本）
 # =========================
-def request_api(url):
+def fetch_raw(url):
     headers = {"User-Agent": "Mozilla/5.0"}
     req = Request(url, headers=headers)
     try:
@@ -60,43 +59,65 @@ def request_api(url):
     if resp.status != 200:
         print(f"⚠️ 状态码: {resp.status}")
         return None
-    raw = resp.read().decode("utf-8", errors="ignore")
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        print(f"❌ JSON解析失败: {e}")
-        print(f"原始响应前200字符: {raw[:200]}")
-        return None
-
-def parse_record(item):
-    issue = str(item.get("expect", "")).strip()
-    opencode = item.get("openCode") or item.get("opencode", "")
-    if not issue or not opencode:
-        return None
-    nums = [int(x) for x in opencode.split(",") if x.strip().isdigit()]
-    if len(nums) != 7:
-        return None
-    return (issue, nums)
-
-def fetch_latest():
-    """获取最新一期开奖 (issue, [n1..n7])"""
-    url = "https://api3.marksix6.net/lottery_api.php?type=newMacau"
-    payload = request_api(url)
-    if not payload:
-        return None
-    # 兼容单对象和数据列表
-    data_list = payload.get("data")
-    if isinstance(data_list, list) and data_list:
-        for item in data_list:
-            r = parse_record(item)
-            if r:
-                return r
-    else:
-        return parse_record(payload)
-    return None
+    return resp.read().decode("utf-8", errors="ignore")
 
 # =========================
-# 存储
+# 解析 marksix6.net 接口（字符串数组格式）
+# =========================
+def parse_string_array(raw_text):
+    """
+    接口返回格式：["期号,号码1,号码2,...,号码7", ...]
+    返回列表 [ (issue, [n1..n7]), ... ] 按期号升序排列
+    """
+    try:
+        data = json.loads(raw_text)
+    except Exception as e:
+        print(f"❌ JSON解析失败: {e}")
+        return []
+
+    if not isinstance(data, list):
+        print(f"⚠️ 数据不是列表，类型为: {type(data)}")
+        return []
+
+    records = []
+    for item in data:
+        if not isinstance(item, str):
+            continue
+        parts = item.split(",")
+        if len(parts) != 8:   # 期号 + 7个号码
+            continue
+        try:
+            issue = parts[0].strip()
+            nums = [int(x) for x in parts[1:8]]
+            records.append((issue, nums))
+        except ValueError:
+            continue
+
+    # 按期号升序排列
+    records.sort(key=lambda x: int(x[0]))
+    return records
+
+# =========================
+# 获取多期数据（主入口）
+# =========================
+def fetch_multi_data():
+    """
+    尝试从 marksix6.net 获取最近多期数据（通常返回约120期）
+    返回列表 [(issue, nums), ...]
+    """
+    url = "https://marksix6.net/index.php?api=1"
+    raw = fetch_raw(url)
+    if not raw:
+        return []
+    records = parse_string_array(raw)
+    if records:
+        print(f"✅ 在线获取到 {len(records)} 期数据（{records[0][0]} ~ {records[-1][0]}）")
+    else:
+        print("⚠️ 在线数据解析为空")
+    return records
+
+# =========================
+# 保存数据
 # =========================
 def save_records(records):
     conn = sqlite3.connect(DB_FILE)
@@ -242,13 +263,13 @@ def show_strategy(name, main, sp):
 # =========================
 def sync():
     init_db()
-    # 1. 拉取最新一期
-    latest_rec = fetch_latest()
-    if latest_rec:
-        new = save_records([latest_rec])
-        print(f"✅ 保存最新一期 {latest_rec[0]}，新增 {new} 条")
+    # 1. 在线拉取多期数据
+    records = fetch_multi_data()
+    if records:
+        new = save_records(records)
+        print(f"📦 本次新增 {new} 条记录")
     else:
-        print("⚠️ 未获取到最新数据，继续使用本地数据库")
+        print("⚠️ 在线数据获取失败，将使用本地数据库进行分析")
 
     hist = get_history()
     total = len(hist)
@@ -281,7 +302,7 @@ def sync():
     if top:
         print(f"   主强: {top[0][0]} (得分{top[0][1]})   次强: {top[1][0]} (得分{top[1][1]})")
     else:
-        print("   数据不足，请等待定时任务积累数据")
+        print("   数据不足")
 
     dx, ds = dsdx_predict(hist)
     print(f"\n📊 大小单双预测: 大小 {dx} / 单双 {ds}")
