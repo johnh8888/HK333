@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -54,61 +54,88 @@ def special_attributes(num: int) -> Dict[str, str]:
     return {"单双": odd_even, "大小": big_small, "合单双": total_odd_even,
             "合大小": total_big_small, "尾大小": tail_big_small, "色波": color, "五行": element}
 
-# ---------- 波色预测 ----------
-def predict_color_simple(specials: List[int], window: int = 3) -> Tuple[str, str, float, float]:
-    if not specials: return "蓝", "绿", 0.0, 0.0
-    recent = specials[-window:]
-    counter = Counter(get_color(n) for n in recent)
-    sorted_colors = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
-    main_color = sorted_colors[0][0]
-    main_freq = sorted_colors[0][1] / len(recent)
-    second_color = sorted_colors[1][0] if len(sorted_colors) > 1 else "绿"
-    second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
-    return main_color, second_color, main_freq, second_freq
-
+# ---------- 优化后的波色预测 ----------
 def predict_color_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
-    if not specials: return "蓝", "绿", 0.0, 0.0
+    """改进版：指数衰减权重 + 连出奖励"""
+    if not specials:
+        return "绿", "红", 0.0, 0.0
+    
     recent = specials[-window:]
     scores = defaultdict(float)
-    total_weight = 0
+    total_weight = 0.0
+    
     for i, num in enumerate(reversed(recent)):
-        weight = window - i
-        scores[get_color(num)] += weight
+        weight = (window - i) ** 1.4
+        color = get_color(num)
+        scores[color] += weight
+        
+        # 连出奖励
+        if i > 0 and color == get_color(recent[-i - 1 + len(recent)]):
+            scores[color] += weight * 0.35
+        
         total_weight += weight
+    
     if total_weight == 0:
-        return "蓝", "绿", 0.0, 0.0
+        return "绿", "红", 0.0, 0.0
+    
     sorted_colors = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
     main_color = sorted_colors[0][0]
     main_score = sorted_colors[0][1] / total_weight
     second_color = sorted_colors[1][0] if len(sorted_colors) > 1 else "绿"
     second_score = sorted_colors[1][1] / total_weight if len(sorted_colors) > 1 else 0.0
+    
     return main_color, second_color, main_score, second_score
+
 
 def predict_color(specials: List[int], window: int = 10, method: str = "weighted") -> Tuple[str, str, float, float]:
     if method == "simple":
-        return predict_color_simple(specials, window)
+        if not specials: return "蓝", "绿", 0.0, 0.0
+        recent = specials[-window:]
+        counter = Counter(get_color(n) for n in recent)
+        sorted_colors = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
+        main_color = sorted_colors[0][0]
+        main_freq = sorted_colors[0][1] / len(recent)
+        second_color = sorted_colors[1][0] if len(sorted_colors) > 1 else "绿"
+        second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
+        return main_color, second_color, main_freq, second_freq
     return predict_color_weighted(specials, window)
 
-def backtest_colors(conn, recent_limit: int = 10, window: int = 10, method: str = "weighted") -> Tuple[int, int, int, int]:
+
+def backtest_colors(conn, recent_limit: int = 12, window: int = 10, method: str = "weighted") -> Tuple[int, int, int, int, int]:
+    """改进回测：返回 total, main_hit, second_hit, any_hit, max_miss"""
     rows = conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()
     specials = [r["special_number"] for r in rows]
-    if len(specials) < recent_limit + max(10, window):
-        return 0, 0, 0, 0
+    
+    if len(specials) < recent_limit + window:
+        return 0, 0, 0, 0, 0
+    
     total = main_hit = second_hit = any_hit = 0
+    max_miss = miss = 0
     start_idx = len(specials) - recent_limit
+    
     for i in range(start_idx, len(specials)):
-        train = specials[:i]
+        train = specials[:i]                    # 严格不偷看未来
         actual = get_color(specials[i])
+        
         main_color, second_color, _, _ = predict_color(train, window=window, method=method)
-        if main_color == actual: main_hit += 1
-        if second_color == actual: second_hit += 1
-        if main_color == actual or second_color == actual: any_hit += 1
+        
+        if main_color == actual:
+            main_hit += 1
+            miss = 0
+        else:
+            miss += 1
+            max_miss = max(max_miss, miss)
+            
+        if second_color == actual:
+            second_hit += 1
+        if main_color == actual or second_color == actual:
+            any_hit += 1
         total += 1
-    return total, main_hit, second_hit, any_hit
+    
+    return total, main_hit, second_hit, any_hit, max_miss
 
-# ---------- 以下所有代码保持完全不变 ----------
-# （数据库、预测逻辑、命令行等部分未做任何修改）
 
+# ---------- 数据库与核心逻辑（保持不变） ----------
 @dataclass
 class DrawRecord:
     issue_no: str; draw_date: str; numbers: List[int]; special_number: int
@@ -172,7 +199,6 @@ def set_model_state(conn, key, value):
     now = utc_now()
     conn.execute("INSERT INTO model_state(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 
-# ---------- 数据获取 (老澳门彩) ----------
 def _parse_marksix6_response(payload):
     records = []
     hk_data = next((l for l in payload.get("lottery_data", []) if l.get("name") == "老澳门彩"), None)
@@ -255,7 +281,7 @@ def next_issue(issue_no):
         return f"{parts[0]}/{num:0{len(digits)}d}"
     return f"{num:0{len(digits)}d}"
 
-# ---------- 核心预测逻辑（保持不变） ----------
+# 核心预测逻辑（保持不变）
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     vals = list(score_map.values())
     mn, mx = min(vals), max(vals)
@@ -505,6 +531,7 @@ def print_dashboard(conn, color_window=10, color_method="weighted"):
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
         print(f"最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
+    
     pending = conn.execute("SELECT id, issue_no, strategy FROM prediction_runs WHERE status='PENDING' ORDER BY strategy").fetchall()
     if pending:
         print(f"\n预测期号: {pending[0]['issue_no']}")
@@ -517,6 +544,26 @@ def print_dashboard(conn, color_window=10, color_method="weighted"):
             if special_row:
                 attrs = special_attributes(special_row["number"])
                 print(f"         特码属性: {attrs['单双']}/{attrs['大小']} 合{attrs['合单双']}/{attrs['合大小']} 尾{attrs['尾大小']} {attrs['色波']} {attrs['五行']}")
+
+    # 优化后的波色预测显示
+    all_specials = [r["special_number"] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()]
+    if len(all_specials) >= max(color_window, 10):
+        main_color, second_color, main_score, second_score = predict_color(all_specials, window=color_window, method=color_method)
+        method_name = "改进加权（指数衰减+连出奖励）" if color_method == "weighted" else "简单频率"
+        print(f"\n🎨 特码波色预测（{method_name}，基于最近 {color_window} 期）：")
+        print(f"   主强: {main_color} (得分 {main_score:.3f})   次强: {second_color} (得分 {second_score:.3f})")
+        
+        total, main_hit, second_hit, any_hit, max_miss = backtest_colors(conn, recent_limit=12, window=color_window, method=color_method)
+        if total > 0:
+            print(f"\n📊 历史回测（最近 {total} 期）：")
+            print(f"   主强命中率: {main_hit}/{total} ({main_hit/total*100:.1f}%)")
+            print(f"   二中一命中率: {any_hit}/{total} ({any_hit/total*100:.1f}%)")
+            print(f"   最大连错: {max_miss}期")
+        else:
+            print("\n波色回测数据不足。")
+    else:
+        print("\n特码数据不足，无法预测波色。")
+
     stats = conn.execute("""SELECT strategy, COUNT(*) AS cnt,
         ROUND(AVG(hit_count),2) AS avg_hit, ROUND(AVG(hit_rate)*100,1) AS hit_rate_pct,
         ROUND(AVG(COALESCE(special_hit,0))*100,1) AS special_rate_pct
@@ -528,21 +575,6 @@ def print_dashboard(conn, color_window=10, color_method="weighted"):
             print(f"  {label:　<8s}: 期数={s['cnt']}, 平均命中={s['avg_hit']}个, 命中率={s['hit_rate_pct']}%, 特别号命中率={s['special_rate_pct']}%")
     else:
         print("\n暂无复盘数据。")
-    # 波色预测
-    all_specials = [r["special_number"] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()]
-    if len(all_specials) >= max(color_window, 10):
-        main_color, second_color, main_score, second_score = predict_color(all_specials, window=color_window, method=color_method)
-        method_name = "加权频率" if color_method == "weighted" else "简单频率"
-        print(f"\n🎨 特码波色预测（{method_name}，基于最近 {color_window} 期）：")
-        print(f"   主强: {main_color} (得分 {main_score:.2f})   次强: {second_color} (得分 {second_score:.2f})")
-        total, main_hit, second_hit, any_hit = backtest_colors(conn, recent_limit=10, window=color_window, method=color_method)
-        if total > 0:
-            print(f"\n📊 历史回测（最近 10 期，方法={color_method}，窗口={color_window}）：")
-            print(f"   主强命中率: {main_hit/total*100:.1f}%   次强命中率: {second_hit/total*100:.1f}%   二中一命中率: {any_hit/total*100:.1f}%")
-        else:
-            print("\n波色回测数据不足。")
-    else:
-        print("\n特码数据不足，无法预测波色。")
 
 # ---------- 命令行 ----------
 def cmd_sync(args):
