@@ -30,7 +30,7 @@ jobs:
 
       - name: 运行AI预测系统
         run: |
-          python macau_predictor_pro_v4.py
+          python macau_v6.py
 
       - name: 上传数据库
         uses: actions/upload-artifact@v4
