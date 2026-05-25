@@ -5,49 +5,74 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import random
-from collections import Counter, defaultdict
+import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Dict, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DB_PATH = str(SCRIPT_DIR / "new_macau.db")
 
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "new_macau.db")
-
-# 主数据源（真实新澳门六合彩）
-API_URLS = [
-    "https://api3.marksix6.net/lottery_api.php?type=newMacau",
-    "https://marksix6.net/index.php?api=1",
-]
+# 只抓 新澳门彩
+API_URL = "https://api3.marksix6.net/lottery_api.php?type=newMacau"
 
 ALL_NUMBERS = list(range(1, 50))
 
 # =========================
-# 真正六合彩波色映射
+# 真实波色映射（六合彩标准）
 # =========================
-RED_WAVE = {
+
+RED = {
     1, 2, 7, 8, 12, 13, 18, 19,
     23, 24, 29, 30, 34, 35, 40, 45, 46
 }
 
-BLUE_WAVE = {
+BLUE = {
     3, 4, 9, 10, 14, 15, 20, 25,
     26, 31, 36, 37, 41, 42, 47, 48
 }
 
-GREEN_WAVE = {
+GREEN = {
     5, 6, 11, 16, 17, 21, 22, 27,
     28, 32, 33, 38, 39, 43, 44, 49
 }
 
 
-# =========================
-# 数据结构
-# =========================
+def get_color(num: int) -> str:
+    if num in RED:
+        return "红"
+    if num in BLUE:
+        return "蓝"
+    return "绿"
+
+
+def get_element(num: int) -> str:
+    tail = num % 10
+
+    if tail in [1, 6]:
+        return "水"
+    elif tail in [2, 7]:
+        return "火"
+    elif tail in [3, 8]:
+        return "木"
+    elif tail in [4, 9]:
+        return "金"
+    else:
+        return "土"
+
+
+def special_attrs(num: int) -> str:
+    ds = "单" if num % 2 else "双"
+    dx = "大" if num >= 25 else "小"
+    color = get_color(num)
+    wx = get_element(num)
+    return f"{ds}/{dx} {color} {wx}"
+
+
 @dataclass
 class DrawRecord:
     issue_no: str
@@ -57,380 +82,301 @@ class DrawRecord:
 
 
 # =========================
-# 工具
-# =========================
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def get_color(num: int) -> str:
-    if num in RED_WAVE:
-        return "红"
-    if num in BLUE_WAVE:
-        return "蓝"
-    return "绿"
-
-
-def special_attributes(num: int):
-
-    odd_even = "单" if num % 2 else "双"
-
-    big_small = "大" if num >= 25 else "小"
-
-    tail = num % 10
-
-    if tail in [1, 6]:
-        element = "水"
-    elif tail in [2, 7]:
-        element = "火"
-    elif tail in [3, 8]:
-        element = "木"
-    elif tail in [4, 9]:
-        element = "金"
-    else:
-        element = "土"
-
-    return {
-        "单双": odd_even,
-        "大小": big_small,
-        "色波": get_color(num),
-        "五行": element,
-    }
-
-
-# =========================
 # 数据库
 # =========================
-def connect_db(db_path):
 
-    conn = sqlite3.connect(db_path)
-
+def connect_db():
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
 def init_db(conn):
-
-    conn.executescript("""
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS draws(
         issue_no TEXT PRIMARY KEY,
         draw_date TEXT,
         numbers_json TEXT,
-        special_number INTEGER,
-        created_at TEXT
-    );
+        special_number INTEGER
+    )
     """)
-
     conn.commit()
 
 
 # =========================
-# 真实数据解析
+# API 获取真实数据
 # =========================
-def parse_api3(payload):
+
+def fetch_data() -> List[DrawRecord]:
+
+    req = Request(
+        API_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        }
+    )
+
+    with urlopen(req, timeout=20) as resp:
+        text = resp.read().decode("utf-8")
+
+    payload = json.loads(text)
 
     records = []
 
-    data = payload.get("data") or payload.get("result") or []
+    # 兼容不同结构
+    data_list = []
 
-    for item in data:
+    if isinstance(payload, list):
+        data_list = payload
+
+    elif isinstance(payload, dict):
+
+        if "data" in payload:
+            data_list = payload["data"]
+
+        elif "list" in payload:
+            data_list = payload["list"]
+
+        else:
+            data_list = [payload]
+
+    for item in data_list:
 
         try:
 
             issue = str(
                 item.get("expect")
                 or item.get("issue")
+                or item.get("issue_no")
                 or item.get("period")
-                or item.get("qishu")
-            )
-
-            opencode = (
-                item.get("opencode")
-                or item.get("openCode")
-                or item.get("number")
                 or ""
             )
 
-            if not opencode:
+            open_code = (
+                item.get("opencode")
+                or item.get("openCode")
+                or item.get("number")
+                or item.get("numbers")
+                or ""
+            )
+
+            open_time = (
+                item.get("opentime")
+                or item.get("openTime")
+                or item.get("time")
+                or ""
+            )
+
+            if not issue:
                 continue
 
             nums = []
 
-            for x in opencode.replace("+", ",").split(","):
-                x = x.strip()
-                if x.isdigit():
-                    nums.append(int(x))
+            if isinstance(open_code, str):
+
+                open_code = (
+                    open_code.replace("+", ",")
+                    .replace(" ", ",")
+                )
+
+                nums = [
+                    int(x)
+                    for x in open_code.split(",")
+                    if x.strip().isdigit()
+                ]
+
+            elif isinstance(open_code, list):
+                nums = [int(x) for x in open_code]
 
             if len(nums) != 7:
                 continue
 
-            draw_date = str(
-                item.get("opentime")
-                or item.get("openTime")
-                or item.get("date")
-                or datetime.now().strftime("%Y-%m-%d")
-            )[:10]
+            draw_date = str(open_time)[:10]
 
             records.append(
                 DrawRecord(
                     issue_no=issue,
                     draw_date=draw_date,
                     numbers=nums[:6],
-                    special_number=nums[6],
+                    special_number=nums[6]
                 )
             )
 
-        except:
-            pass
+        except Exception:
+            continue
 
-    return records
-
-
-def parse_marksix6(payload):
-
-    records = []
-
-    lottery_data = payload.get("lottery_data", [])
-
-    target = None
-
-    for x in lottery_data:
-
-        name = str(x.get("name", ""))
-
-        if "澳门" in name:
-            target = x
-            break
-
-    if not target:
-        return []
-
-    history = target.get("history", [])
-
-    for row in history:
-
-        try:
-
-            if "期：" not in row:
-                continue
-
-            issue, nums_str = row.split("期：")
-
-            nums = [int(x) for x in nums_str.split(",")]
-
-            if len(nums) != 7:
-                continue
-
-            records.append(
-                DrawRecord(
-                    issue_no=issue.strip(),
-                    draw_date=datetime.now().strftime("%Y-%m-%d"),
-                    numbers=nums[:6],
-                    special_number=nums[6],
-                )
-            )
-
-        except:
-            pass
+    if not records:
+        raise RuntimeError("未抓到真实新澳门彩数据")
 
     return records
 
 
 # =========================
-# 获取真实数据
+# 保存数据
 # =========================
-def fetch_real_records():
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+def save_records(conn, records):
 
-    for url in API_URLS:
+    inserted = 0
 
-        try:
+    for r in records:
 
-            req = Request(url, headers=headers)
+        exists = conn.execute(
+            "SELECT 1 FROM draws WHERE issue_no=?",
+            (r.issue_no,)
+        ).fetchone()
 
-            with urlopen(req, timeout=20) as resp:
+        if exists:
+            continue
 
-                text = resp.read().decode("utf-8", errors="ignore")
-
-            payload = json.loads(text)
-
-            if "api3.marksix6.net" in url:
-
-                records = parse_api3(payload)
-
-            else:
-
-                records = parse_marksix6(payload)
-
-            if records:
-
-                return records, url
-
-        except Exception as e:
-
-            print(f"数据源失败: {url}")
-            print(e)
-
-    return [], None
-
-
-# =========================
-# 入库
-# =========================
-def upsert_draw(conn, r: DrawRecord):
-
-    exists = conn.execute(
-        "SELECT 1 FROM draws WHERE issue_no=?",
-        (r.issue_no,)
-    ).fetchone()
-
-    if exists:
-
-        return
-
-    conn.execute(
-        """
-        INSERT INTO draws VALUES(?,?,?,?,?)
-        """,
-        (
-            r.issue_no,
-            r.draw_date,
-            json.dumps(r.numbers, ensure_ascii=False),
-            r.special_number,
-            utc_now(),
+        conn.execute(
+            """
+            INSERT INTO draws VALUES(?,?,?,?)
+            """,
+            (
+                r.issue_no,
+                r.draw_date,
+                json.dumps(r.numbers),
+                r.special_number
+            )
         )
-    )
+
+        inserted += 1
+
+    conn.commit()
+
+    return inserted
 
 
 # =========================
-# 预测
+# 最近开奖
 # =========================
-def get_draws(conn):
 
-    rows = conn.execute(
-        """
-        SELECT * FROM draws
-        ORDER BY issue_no DESC
-        LIMIT 200
-        """
-    ).fetchall()
+def latest_rows(conn, limit=200):
 
-    result = []
+    rows = conn.execute("""
+    SELECT *
+    FROM draws
+    ORDER BY issue_no DESC
+    LIMIT ?
+    """, (limit,)).fetchall()
 
-    for r in rows:
+    return rows
 
-        result.append({
-            "issue": r["issue_no"],
-            "nums": json.loads(r["numbers_json"]),
-            "special": r["special_number"],
-        })
 
-    return result
-
+# =========================
+# 热号
+# =========================
 
 def hot_strategy(rows):
 
-    freq = Counter()
+    counter = Counter()
 
-    for r in rows[:50]:
+    for r in rows[:30]:
 
-        for n in r["nums"]:
-            freq[n] += 1
+        nums = json.loads(r["numbers_json"])
 
-    hot = [n for n, _ in freq.most_common(6)]
+        for n in nums:
+            counter[n] += 1
 
-    if len(hot) < 6:
+        counter[r["special_number"]] += 1
 
-        remain = [n for n in ALL_NUMBERS if n not in hot]
+    hot = [n for n, _ in counter.most_common(12)]
 
-        hot.extend(remain[:6 - len(hot)])
+    if len(hot) < 7:
+        hot = ALL_NUMBERS.copy()
 
-    special_pool = [n for n in hot if n not in hot[:6]]
+    main = hot[:6]
 
-    if not special_pool:
-        special_pool = ALL_NUMBERS
+    remain = [x for x in hot if x not in main]
 
-    special = random.choice(special_pool)
+    if not remain:
+        remain = [x for x in ALL_NUMBERS if x not in main]
 
-    return hot[:6], special
+    special = random.choice(remain)
 
+    return sorted(main), special
+
+
+# =========================
+# 冷号
+# =========================
 
 def cold_strategy(rows):
 
-    freq = Counter()
+    counter = Counter()
 
-    for r in rows[:80]:
+    for r in rows[:50]:
 
-        for n in r["nums"]:
-            freq[n] += 1
+        nums = json.loads(r["numbers_json"])
 
-    cold = sorted(freq.items(), key=lambda x: x[1])
+        for n in nums:
+            counter[n] += 1
 
-    nums = [n for n, _ in cold[:6]]
+        counter[r["special_number"]] += 1
 
-    while len(nums) < 6:
+    ranked = sorted(ALL_NUMBERS, key=lambda x: counter[x])
 
-        for n in ALL_NUMBERS:
+    main = sorted(ranked[:6])
 
-            if n not in nums:
-                nums.append(n)
+    remain = [x for x in ranked if x not in main]
 
-            if len(nums) >= 6:
-                break
+    if not remain:
+        remain = [x for x in ALL_NUMBERS if x not in main]
 
-    special = nums[0]
+    special = random.choice(remain)
 
-    return nums, special
+    return main, special
 
+
+# =========================
+# 动量策略
+# =========================
 
 def momentum_strategy(rows):
 
-    score = defaultdict(float)
+    score = Counter()
 
-    for idx, r in enumerate(rows[:30]):
+    recent = rows[:10]
 
-        weight = 30 - idx
+    for idx, r in enumerate(recent):
 
-        for n in r["nums"]:
+        weight = 10 - idx
+
+        nums = json.loads(r["numbers_json"])
+
+        for n in nums:
             score[n] += weight
 
-    ranked = sorted(score.items(), key=lambda x: x[1], reverse=True)
+        score[r["special_number"]] += weight
 
-    nums = [n for n, _ in ranked[:6]]
+    ranked = [n for n, _ in score.most_common(15)]
 
-    while len(nums) < 6:
+    if len(ranked) < 7:
+        ranked = ALL_NUMBERS.copy()
 
-        for n in ALL_NUMBERS:
+    main = sorted(ranked[:6])
 
-            if n not in nums:
-                nums.append(n)
+    remain = [x for x in ranked if x not in main]
 
-            if len(nums) >= 6:
-                break
+    if not remain:
+        remain = [x for x in ALL_NUMBERS if x not in main]
 
-    special = nums[-1]
+    special = random.choice(remain)
 
-    return nums, special
+    return main, special
 
+
+# =========================
+# 平衡策略
+# =========================
 
 def balanced_strategy(rows):
 
     h, _ = hot_strategy(rows)
-
     c, _ = cold_strategy(rows)
 
-    m, _ = momentum_strategy(rows)
-
-    mix = []
-
-    for x in h[:2] + c[:2] + m[:2]:
-
-        if x not in mix:
-            mix.append(x)
+    mix = sorted(list(set(h[:3] + c[:3])))
 
     while len(mix) < 6:
 
@@ -439,144 +385,222 @@ def balanced_strategy(rows):
         if n not in mix:
             mix.append(n)
 
-    special = random.randint(1, 49)
+    mix = sorted(mix[:6])
 
-    return mix[:6], special
+    remain = [x for x in ALL_NUMBERS if x not in mix]
 
+    special = random.choice(remain)
+
+    return mix, special
+
+
+# =========================
+# 集成策略
+# =========================
 
 def ensemble_strategy(rows):
 
-    score = Counter()
+    vote = Counter()
 
-    for func in [
+    funcs = [
         hot_strategy,
         cold_strategy,
         momentum_strategy,
-        balanced_strategy,
-    ]:
+        balanced_strategy
+    ]
 
-        nums, _ = func(rows)
+    for f in funcs:
+
+        nums, sp = f(rows)
 
         for n in nums:
-            score[n] += 1
+            vote[n] += 1
 
-    ranked = [n for n, _ in score.most_common(6)]
+        vote[sp] += 0.5
 
-    while len(ranked) < 6:
+    ranked = [n for n, _ in vote.most_common(15)]
 
-        for n in ALL_NUMBERS:
+    if len(ranked) < 7:
+        ranked = ALL_NUMBERS.copy()
 
-            if n not in ranked:
-                ranked.append(n)
+    main = sorted(ranked[:6])
 
-            if len(ranked) >= 6:
-                break
+    remain = [x for x in ranked if x not in main]
 
-    special = ranked[-1]
+    if not remain:
+        remain = [x for x in ALL_NUMBERS if x not in main]
 
-    return ranked[:6], special
+    special = random.choice(remain)
+
+    return main, special
 
 
 # =========================
-# 波色预测
+# 真实最近10期波色预测
+# 不偷看未来
 # =========================
+
 def predict_color(rows):
 
-    specials = [r["special"] for r in rows[:20]]
+    specials = [
+        r["special_number"]
+        for r in rows[:10]
+    ]
 
     colors = [get_color(x) for x in specials]
 
-    freq = Counter(colors)
+    c = Counter(colors)
 
-    ranked = freq.most_common()
+    ranked = c.most_common()
 
     if not ranked:
         return "蓝", "绿"
 
     main = ranked[0][0]
 
-    second = ranked[1][0] if len(ranked) > 1 else "绿"
+    second = ranked[1][0] if len(ranked) >= 2 else ranked[0][0]
 
     return main, second
 
 
 # =========================
-# 最大连空
+# 最近10期大小单双
 # =========================
-def calc_max_miss(rows):
 
-    specials = [r["special"] for r in rows]
+def predict_dxds(rows):
+
+    specials = [
+        r["special_number"]
+        for r in rows[:10]
+    ]
+
+    big = sum(1 for x in specials if x >= 25)
+    small = len(specials) - big
+
+    odd = sum(1 for x in specials if x % 2 == 1)
+    even = len(specials) - odd
+
+    dx = "大" if big >= small else "小"
+    ds = "单" if odd >= even else "双"
+
+    return dx, ds
+
+
+# =========================
+# 真实最大连空（最近10期）
+# =========================
+
+def max_miss(rows):
+
+    specials = [
+        r["special_number"]
+        for r in rows[:10]
+    ]
+
+    colors = [get_color(x) for x in specials]
 
     result = {}
 
-    for color in ["红", "蓝", "绿"]:
+    for target in ["红", "蓝", "绿"]:
 
         miss = 0
-        max_miss = 0
+        max_m = 0
 
-        for n in specials:
+        for c in colors:
 
-            if get_color(n) == color:
-
+            if c == target:
                 miss = 0
-
             else:
-
                 miss += 1
+                max_m = max(max_m, miss)
 
-                max_miss = max(max_miss, miss)
-
-        result[color] = max_miss
+        result[target] = max_m
 
     return result
 
 
 # =========================
-# 最近10期回测
+# 最近10期真实回测
+# 不偷看未来
 # =========================
+
 def recent_hit(rows, strategy_func):
 
-    if len(rows) < 15:
+    if len(rows) < 20:
         return 0
 
-    hits = []
+    total_hit = 0
+
+    tests = 0
 
     for i in range(10):
 
-        past = rows[i + 1:]
+        future = rows[i]
 
-        current = rows[i]
+        history = rows[i + 1:]
 
-        nums, _ = strategy_func(past)
+        if len(history) < 10:
+            continue
 
-        hit = len(set(nums) & set(current["nums"]))
+        pred, _ = strategy_func(history)
 
-        hits.append(hit)
+        actual = json.loads(future["numbers_json"])
 
-    return round(sum(hits) / len(hits), 2)
+        hit = len(set(pred) & set(actual))
+
+        total_hit += hit
+
+        tests += 1
+
+    if tests == 0:
+        return 0
+
+    return round(total_hit / tests, 2)
+
+
+# =========================
+# 投注建议
+# =========================
+
+def betting_plan(color, dx, ds):
+
+    print("\n推荐投注方案:")
+
+    print(f"{color}: 300 元")
+    print(f"{dx}: 200 元")
+    print(f"{ds}: 200 元")
+
+    print("\n赔率参考:")
+    print("红波: 2.7")
+    print("蓝/绿波: 2.8")
+    print("大小单双: 1.95")
 
 
 # =========================
 # 展示
 # =========================
+
 def show_dashboard(conn):
 
-    rows = get_draws(conn)
+    rows = latest_rows(conn)
 
     if not rows:
-
-        print("数据库暂无真实数据")
-
+        print("数据库无数据")
         return
 
     latest = rows[0]
 
-    nums_str = " ".join(f"{x:02d}" for x in latest["nums"])
+    nums = json.loads(latest["numbers_json"])
 
     print("\n最新开奖:")
-    print(f"{latest['issue']} | {nums_str} + {latest['special']:02d}")
 
-    next_issue = str(int(latest["issue"]) + 1)
+    print(
+        f"{latest['issue_no']} | "
+        f"{' '.join(f'{x:02d}' for x in nums)} "
+        f"+ {latest['special_number']:02d}"
+    )
+
+    next_issue = str(int(latest["issue_no"]) + 1)
 
     print(f"\n预测期号: {next_issue}")
 
@@ -590,66 +614,43 @@ def show_dashboard(conn):
 
     for name, func in strategies:
 
-        nums, special = func(rows)
-
-        attrs = special_attributes(special)
-
-        print(f"{name:<12}: {' '.join(f'{x:02d}' for x in nums)} + {special:02d}")
+        main, sp = func(rows)
 
         print(
-            f"特码属性: "
-            f"{attrs['单双']}/"
-            f"{attrs['大小']} "
-            f"{attrs['色波']} "
-            f"{attrs['五行']}"
+            f"{name:<12}: "
+            f"{' '.join(f'{x:02d}' for x in main)} "
+            f"+ {sp:02d}"
+        )
+
+        print(
+            f"特码属性: {special_attrs(sp)}"
         )
 
     # 波色预测
     main_color, second_color = predict_color(rows)
 
-    print("\n特码波色预测:")
+    print("\n特码波色预测（最近10期真实数据）:")
     print(f"主强: {main_color} 次强: {second_color}")
 
     # 大小单双
-    last_special = latest["special"]
+    dx, ds = predict_dxds(rows)
 
-    print("\n大小单双预测:")
-    print(f"大小: {'大' if last_special >= 25 else '小'}")
-    print(f"单双: {'单' if last_special % 2 else '双'}")
+    print("\n大小单双预测（最近10期真实数据）:")
+    print(f"大小: {dx}")
+    print(f"单双: {ds}")
 
     # 最大连空
-    miss = calc_max_miss(rows)
+    miss = max_miss(rows)
 
-    print("\n真实最大连空:")
+    print("\n真实最大连空（最近10期）:")
+    print(f"红波: {miss['红']}期")
+    print(f"蓝波: {miss['蓝']}期")
+    print(f"绿波: {miss['绿']}期")
 
-    for k, v in miss.items():
-        print(f"{k}波: {v}期")
+    betting_plan(main_color, dx, ds)
 
-    # 投注建议
-    print("\n推荐投注方案:")
-
-    print(f"{main_color}: 300 元")
-
-    if last_special >= 25:
-        print("大: 200 元")
-    else:
-        print("小: 200 元")
-
-    if last_special % 2:
-        print("单: 200 元")
-    else:
-        print("双: 200 元")
-
-    # 赔率
-    print("\n赔率参考:")
-
-    print("红波: 2.7")
-    print("蓝/绿波: 2.8")
-    print("大小: 1.95")
-    print("单双: 1.95")
-
-    # 最近10期回测
-    print("\n最近10期历史命中统计:")
+    # 回测
+    print("\n最近10期真实历史命中统计:")
 
     for name, func in strategies:
 
@@ -659,34 +660,53 @@ def show_dashboard(conn):
 
 
 # =========================
-# 同步
+# sync
 # =========================
-def sync(conn):
 
-    records, source = fetch_real_records()
+def sync():
 
-    if not records:
+    conn = connect_db()
 
-        print("未抓到真实开奖数据")
+    init_db(conn)
 
-        return
+    try:
 
-    for r in records:
+        records = fetch_data()
 
-        upsert_draw(conn, r)
+        inserted = save_records(conn, records)
 
-    conn.commit()
+        print(f"同步完成: {inserted} 条")
 
-    print(f"同步完成: {len(records)} 条")
+        show_dashboard(conn)
 
-    print(f"真实数据源: {source}")
+    except Exception as e:
 
-    show_dashboard(conn)
+        print(f"错误: {e}")
+
+    finally:
+
+        conn.close()
+
+
+# =========================
+# show
+# =========================
+
+def show():
+
+    conn = connect_db()
+
+    try:
+        show_dashboard(conn)
+
+    finally:
+        conn.close()
 
 
 # =========================
 # main
 # =========================
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -698,19 +718,11 @@ def main():
 
     args = parser.parse_args()
 
-    conn = connect_db(DB_PATH_DEFAULT)
-
-    init_db(conn)
-
     if args.cmd == "sync":
+        sync()
 
-        sync(conn)
-
-    else:
-
-        show_dashboard(conn)
-
-    conn.close()
+    elif args.cmd == "show":
+        show()
 
 
 if __name__ == "__main__":
