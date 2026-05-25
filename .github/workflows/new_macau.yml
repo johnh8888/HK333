@@ -1,8 +1,8 @@
-name: 新澳门彩数据同步与预测（持久化）
+name: 新澳门彩数据同步与预测
 
 on:
   schedule:
-    - cron: "0 13,1 * * *"   # UTC 13:00/01:00 -> 北京时间 21:00/09:00
+    - cron: "0 13,1 * * *"
   workflow_dispatch:
 
 jobs:
@@ -17,21 +17,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ---- 下载上次保存的数据库 ----
-      - name: 下载历史数据库
+      - name: 下载历史数据库（可选）
         uses: actions/download-artifact@v4
         with:
           name: macau-db
           path: .
-        continue-on-error: true   # 首次运行没有文件，不报错
+        continue-on-error: true
 
-      - name: 运行数据同步与预测
+      - name: 运行预测脚本
         run: python new_macau.py
 
-      # ---- 上传更新后的数据库 ----
       - name: 上传数据库（供下次使用）
         uses: actions/upload-artifact@v4
         with:
           name: macau-db
           path: new_macau.db
-          retention-days: 7   # 保留7天，足够衔接
+          retention-days: 7
