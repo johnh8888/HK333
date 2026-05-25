@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from urllib.request import Request, urlopen
 
 # =========================================================
@@ -21,7 +21,9 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 
-DB_PATH = ROOT / "macau_pro.db"
+DB_PATH = ROOT / "new_macau.db"
+
+TARGET_LOTTERY_NAME = "新澳门彩"
 
 API_URLS = [
     "https://marksix6.net/index.php?api=1"
@@ -34,7 +36,7 @@ BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
 GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
 
 # =========================================================
-# DATA MODEL
+# MODEL
 # =========================================================
 
 @dataclass
@@ -45,7 +47,7 @@ class DrawRecord:
     special: int
 
 # =========================================================
-# UTILS
+# TIME
 # =========================================================
 
 def utc_now():
@@ -53,6 +55,10 @@ def utc_now():
 
 def today_str():
     return utc_now()[:10]
+
+# =========================================================
+# NORMALIZE
+# =========================================================
 
 def normalize(score_map: Dict[int, float]):
 
@@ -70,7 +76,7 @@ def normalize(score_map: Dict[int, float]):
     }
 
 # =========================================================
-# COLOR / ATTR
+# ATTR
 # =========================================================
 
 def get_wave(n: int):
@@ -134,6 +140,7 @@ def init_db(conn):
     CREATE TABLE IF NOT EXISTS draws (
 
         issue_no TEXT PRIMARY KEY,
+
         draw_date TEXT NOT NULL,
 
         n1 INTEGER NOT NULL,
@@ -147,6 +154,7 @@ def init_db(conn):
 
         source TEXT,
         created_at TEXT NOT NULL
+
     );
 
     CREATE TABLE IF NOT EXISTS analytics (
@@ -157,6 +165,7 @@ def init_db(conn):
         avg_hit REAL,
         special_rate REAL,
         montecarlo REAL
+
     );
 
     """)
@@ -164,12 +173,25 @@ def init_db(conn):
     conn.commit()
 
 # =========================================================
-# FETCH
+# API
 # =========================================================
 
-def parse_marksix6(payload):
+def parse_code_string(code_str):
 
-    result = []
+    nums = []
+
+    for x in code_str.replace("，", ",").split(","):
+
+        x = x.strip()
+
+        if x.isdigit():
+            nums.append(int(x))
+
+    return nums
+
+def parse_new_macau_records(payload):
+
+    records = []
 
     lottery_data = payload.get("lottery_data", [])
 
@@ -177,39 +199,76 @@ def parse_marksix6(payload):
 
     for item in lottery_data:
 
-        name = item.get("name", "")
-
-        if "澳门" in name:
+        if item.get("name") == TARGET_LOTTERY_NAME:
 
             target = item
             break
 
     if not target:
-        return result
+        return records
 
+    # 最新一期
+    latest_issue = str(
+        target.get("expect", "")
+    ).strip()
+
+    latest_code = str(
+        target.get("openCode", "")
+    ).strip()
+
+    latest_nums = parse_code_string(latest_code)
+
+    if latest_issue and len(latest_nums) >= 7:
+
+        records.append(
+            DrawRecord(
+                issue_no=latest_issue,
+                draw_date=str(
+                    target.get("openTime", "")
+                )[:10] or today_str(),
+                numbers=latest_nums[:6],
+                special=latest_nums[6]
+            )
+        )
+
+    # 历史记录
     histories = target.get("history", [])
 
     for row in histories:
 
+        if not isinstance(row, str):
+            continue
+
+        row = row.strip()
+
         try:
 
-            parts = row.split("期：")
+            parts = row.split("期", 1)
 
-            if len(parts) != 2:
-                continue
+            issue_no = parts[0].strip()
 
-            issue = parts[0].strip()
+            code_part = parts[1]
 
-            nums = [
-                int(x.strip())
-                for x in parts[1].split(",")
-            ]
+            if "：" in code_part:
+                code_part = code_part.split("：", 1)[1]
+
+            elif ":" in code_part:
+                code_part = code_part.split(":", 1)[1]
+
+            nums = []
+
+            for x in code_part.replace(",", " ").split():
+
+                x = x.strip()
+
+                if x.isdigit():
+                    nums.append(int(x))
 
             if len(nums) >= 7:
 
-                result.append(
+                records.append(
                     DrawRecord(
-                        issue_no=issue,
+                        issue_no=issue_no,
                         draw_date=today_str(),
                         numbers=nums[:6],
                         special=nums[6]
@@ -218,6 +277,14 @@ def parse_marksix6(payload):
 
         except:
             continue
+
+    # 去重
+    uniq = {}
+
+    for r in records:
+        uniq[r.issue_no] = r
+
+    result = list(uniq.values())
 
     result.sort(key=lambda x: x.issue_no)
 
@@ -232,7 +299,8 @@ def fetch_records():
             req = Request(
                 url,
                 headers={
-                    "User-Agent": "Mozilla/5.0"
+                    "User-Agent": "Mozilla/5.0",
+                    "Cache-Control": "no-cache"
                 }
             )
 
@@ -242,11 +310,16 @@ def fetch_records():
                     resp.read().decode("utf-8")
                 )
 
-            rows = parse_marksix6(payload)
+            rows = parse_new_macau_records(payload)
 
             if rows:
 
-                print(f"API获取成功: {url}")
+                print(
+                    f"API获取成功: "
+                    f"{url} "
+                    f"| "
+                    f"{TARGET_LOTTERY_NAME}"
+                )
 
                 return rows, url
 
@@ -339,7 +412,11 @@ def sync_data(conn):
 
     conn.commit()
 
-    print(f"同步完成: total={len(rows)}, new={new_count}")
+    print(
+        f"数据同步完成: "
+        f"total={len(rows)}, "
+        f"new={new_count}"
+    )
 
 def load_draws(conn):
 
@@ -438,23 +515,19 @@ def momentum_score(draws):
     older = draws[-60:-20]
 
     r = Counter()
-
     o = Counter()
 
     for draw in recent:
-
         for n in draw.numbers:
             r[n] += 1
 
     for draw in older:
-
         for n in draw.numbers:
             o[n] += 1
 
     result = {}
 
     for n in ALL_NUMBERS:
-
         result[n] = r[n] - (o[n] / 2)
 
     return normalize(result)
@@ -468,7 +541,6 @@ def pair_affinity_score(draws):
         nums = sorted(draw.numbers)
 
         for i in range(len(nums)):
-
             for j in range(i + 1, len(nums)):
 
                 pair_count[
@@ -488,12 +560,12 @@ def pair_affinity_score(draws):
     return normalize(social)
 
 # =========================================================
-# STRATEGY ENGINE
+# STRATEGY
 # =========================================================
 
 class EnsembleStrategy:
 
-    name = "ensemble_v5"
+    name = "ensemble_v6"
 
     def predict(self, draws):
 
@@ -608,7 +680,7 @@ def walk_forward_backtest(draws, strategy, train_size=30):
     return results
 
 # =========================================================
-# WAVE PREDICTION
+# WAVE
 # =========================================================
 
 def predict_wave(draws):
@@ -673,50 +745,10 @@ def predict_big_small(draws):
     return size_pred, odd_pred
 
 # =========================================================
-# ANALYTICS
-# =========================================================
-
-def save_analytics(
-    conn,
-    avg_hit,
-    special_rate,
-    montecarlo
-):
-
-    conn.execute("""
-
-    INSERT INTO analytics (
-
-        created_at,
-        avg_hit,
-        special_rate,
-        montecarlo
-
-    ) VALUES (
-
-        ?,
-        ?,
-        ?,
-        ?
-
-    )
-
-    """, (
-
-        utc_now(),
-        avg_hit,
-        special_rate,
-        montecarlo
-
-    ))
-
-    conn.commit()
-
-# =========================================================
 # DASHBOARD
 # =========================================================
 
-def print_dashboard(conn, draws):
+def print_dashboard(draws):
 
     if not draws:
 
@@ -763,7 +795,7 @@ def print_dashboard(conn, draws):
         for x in pred["numbers"]
     )
 
-    print("\n🎯 集成预测:")
+    print("\n🎯 集成预测")
 
     print(
         f"号码: "
@@ -777,7 +809,7 @@ def print_dashboard(conn, draws):
         f"{special_text(pred['special'])}"
     )
 
-    print("\n🎨 波色预测:")
+    print("\n🎨 波色预测")
 
     main_wave, second_wave = predict_wave(draws)
 
@@ -793,19 +825,14 @@ def print_dashboard(conn, draws):
         f"({second_wave[1]})"
     )
 
-    print("\n📊 大小单双:")
+    print("\n📊 大小单双")
 
     size_pred, odd_pred = predict_big_small(draws)
 
-    print(
-        f"大小预测: {size_pred}"
-    )
+    print(f"大小预测: {size_pred}")
+    print(f"单双预测: {odd_pred}")
 
-    print(
-        f"单双预测: {odd_pred}"
-    )
-
-    print("\n📈 WalkForward 回测:")
+    print("\n📈 WalkForward回测")
 
     results = walk_forward_backtest(
         draws,
@@ -835,26 +862,9 @@ def print_dashboard(conn, draws):
 
         montecarlo = montecarlo_baseline(draws)
 
-        print(
-            f"平均命中: {avg_hit}"
-        )
-
-        print(
-            f"特别号命中率: "
-            f"{special_rate}%"
-        )
-
-        print(
-            f"MonteCarlo基准: "
-            f"{montecarlo}"
-        )
-
-        save_analytics(
-            conn,
-            avg_hit,
-            special_rate,
-            montecarlo
-        )
+        print(f"平均命中: {avg_hit}")
+        print(f"特别号命中率: {special_rate}%")
+        print(f"MonteCarlo基准: {montecarlo}")
 
     print("=" * 70)
 
@@ -872,7 +882,7 @@ def cmd_sync():
 
     draws = load_draws(conn)
 
-    print_dashboard(conn, draws)
+    print_dashboard(draws)
 
     conn.close()
 
@@ -884,7 +894,7 @@ def cmd_show():
 
     draws = load_draws(conn)
 
-    print_dashboard(conn, draws)
+    print_dashboard(draws)
 
     conn.close()
 
