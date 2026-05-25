@@ -7,6 +7,7 @@ import json
 import sqlite3
 import urllib.request
 from collections import Counter
+from datetime import datetime, timezone
 
 DB_FILE = "new_macau.db"
 
@@ -49,9 +50,7 @@ ELEMENTS = {
 # =========================
 
 def init_db():
-
     conn = sqlite3.connect(DB_FILE)
-
     conn.execute("""
     CREATE TABLE IF NOT EXISTS lottery (
         issue TEXT PRIMARY KEY,
@@ -64,20 +63,20 @@ def init_db():
         special INTEGER
     )
     """)
-
     conn.commit()
     conn.close()
 
 # =========================
-# 获取数据
+# 获取数据（增强鲁棒性）
 # =========================
 
 def fetch_data():
-
+    """
+    从 marksix6.net 拉取最新开奖数据（通常返回最近120期）
+    失败时打印详细错误并返回空列表
+    """
     url = "https://marksix6.net/index.php?api=1"
-
     ctx = ssl._create_unverified_context()
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
@@ -89,114 +88,58 @@ def fetch_data():
     }
 
     try:
-
-        req = urllib.request.Request(
-            url,
-            headers=headers
-        )
-
-        response = urllib.request.urlopen(
-            req,
-            timeout=20,
-            context=ctx
-        )
-
-        text = response.read().decode(
-            "utf-8",
-            errors="ignore"
-        )
-
+        req = urllib.request.Request(url, headers=headers)
+        response = urllib.request.urlopen(req, timeout=20, context=ctx)
+        text = response.read().decode("utf-8", errors="ignore")
         data = json.loads(text)
 
         rows = []
-
         for item in data:
-
             issue = str(
-                item.get("expect")
-                or item.get("period")
-                or item.get("issue")
-                or ""
+                item.get("expect") or
+                item.get("period") or
+                item.get("issue") or ""
             )
-
             opencode = (
-                item.get("opencode")
-                or item.get("openCode")
-                or ""
+                item.get("opencode") or
+                item.get("openCode") or ""
             )
-
             nums = re.findall(r"\d+", opencode)
-
             if len(nums) < 7:
                 continue
-
             nums = list(map(int, nums[:7]))
-
-            rows.append({
-                "issue": issue,
-                "nums": nums
-            })
+            rows.append({"issue": issue, "nums": nums})
 
         rows.sort(key=lambda x: int(x["issue"]))
-
-        rows = rows[-120:]
+        rows = rows[-120:]  # 保留最近120期，足够策略分析
 
         if rows:
-
-            print(f"网页解析成功: {url}")
-
+            print(f"✅ 网页解析成功: {url}，获取到 {len(rows)} 条记录")
             return rows
 
     except Exception as e:
-
-        print(f"数据源失败: {url} -> {e}")
-
+        print(f"❌ 数据源失败: {url} -> {e}")
     return []
 
 # =========================
-# 保存数据
+# 保存数据（去重）
 # =========================
 
 def save_records(rows):
-
     conn = sqlite3.connect(DB_FILE)
-
     new_count = 0
-
     for row in rows:
-
         issue = row["issue"]
-
         nums = row["nums"]
-
-        exists = conn.execute(
-            "SELECT issue FROM lottery WHERE issue=?",
-            (issue,)
-        ).fetchone()
-
+        exists = conn.execute("SELECT issue FROM lottery WHERE issue=?", (issue,)).fetchone()
         if exists:
             continue
-
         conn.execute("""
-        INSERT INTO lottery VALUES(
-            ?,?,?,?,?,?,?,?
-        )
-        """, (
-            issue,
-            nums[0],
-            nums[1],
-            nums[2],
-            nums[3],
-            nums[4],
-            nums[5],
-            nums[6]
-        ))
-
+        INSERT INTO lottery VALUES(?,?,?,?,?,?,?,?)
+        """, (issue, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6]))
         new_count += 1
-
     conn.commit()
     conn.close()
-
     return new_count
 
 # =========================
@@ -204,155 +147,106 @@ def save_records(rows):
 # =========================
 
 def get_history(limit=120):
-
     conn = sqlite3.connect(DB_FILE)
-
     rows = conn.execute(f"""
     SELECT * FROM lottery
     ORDER BY issue ASC
     LIMIT {limit}
     """).fetchall()
-
     conn.close()
-
     return rows
 
 # =========================
-# 波色
+# 波色/五行/属性
 # =========================
 
 def get_color(n):
-
     if n in RED:
         return "红"
-
     if n in BLUE:
         return "蓝"
-
     return "绿"
 
-# =========================
-# 五行
-# =========================
-
 def get_element(n):
-
     for k, v in ELEMENTS.items():
-
         if n in v:
             return k
-
     return "?"
 
-# =========================
-# 属性
-# =========================
-
 def get_attrs(n):
-
     ds = "单" if n % 2 else "双"
-
     dx = "大" if n >= 25 else "小"
-
     hs = sum(map(int, str(n)))
-
     hds = "合单" if hs % 2 else "合双"
-
     hdx = "大" if hs >= 7 else "小"
-
     tail = n % 10
-
     tw = "尾大" if tail >= 5 else "尾小"
-
     color = get_color(n)
-
     element = get_element(n)
-
     return f"{ds}/{dx} {hds}/{hdx} {tw} {color} {element}"
 
 # =========================
-# 选号
+# 选号策略（增加空数据保护）
 # =========================
 
 def hot_strategy(hist):
-
+    if len(hist) < 7:
+        return None, None
     c = Counter()
-
     for r in hist[-20:]:
-
         nums = r[1:7]
-
         c.update(nums)
-
+    if not c:
+        return None, None
     main = [x for x, _ in c.most_common(6)]
-
     sp = c.most_common(1)[0][0]
-
     return main, sp
 
 def cold_strategy(hist):
-
+    if len(hist) < 7:
+        return None, None
     c = Counter()
-
     for r in hist[-30:]:
-
         nums = r[1:7]
-
         c.update(nums)
-
     all_nums = set(range(1, 50))
-
     miss = list(all_nums - set(c.keys()))
-
     miss.sort()
-
     main = miss[:6]
-
     while len(main) < 6:
         main.append(len(main) + 1)
-
     sp = main[0]
-
     return main, sp
 
 def momentum_strategy(hist):
-
+    if len(hist) < 7:
+        return None, None
     c = Counter()
-
     for r in hist[-10:]:
-
         nums = r[1:7]
-
         c.update(nums)
-
+    if not c:
+        return None, None
     main = [x for x, _ in c.most_common(6)]
-
     sp = main[0]
-
     return main, sp
 
 def vote_strategy(hist):
-
-    a, _ = hot_strategy(hist)
-
-    b, _ = momentum_strategy(hist)
-
+    a, _ = hot_strategy(hist) or (None, None)
+    b, _ = momentum_strategy(hist) or (None, None)
+    if not a or not b:
+        return None, None
     c = Counter(a + b)
-
     main = [x for x, _ in c.most_common(6)]
-
     sp = main[0]
-
     return main, sp
 
 def pattern_strategy(hist):
-
+    if len(hist) < 1:
+        return None, None
     latest = hist[-1][1:7]
-
     main = list(latest[:6])
-
     sp = latest[0]
-
     return main, sp
 
 # =========================
@@ -360,66 +254,39 @@ def pattern_strategy(hist):
 # =========================
 
 def color_predict(hist):
-
-    score = {
-        "红": 0,
-        "蓝": 0,
-        "绿": 0
-    }
-
+    score = {"红": 0, "蓝": 0, "绿": 0}
     recent = hist[-10:]
-
+    if len(recent) < 10:
+        return []
     weight = 10
-
     for r in recent:
-
         sp = r[7]
-
         color = get_color(sp)
-
         score[color] += weight
-
         weight -= 1
-
-    top = sorted(
-        score.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    return top
+    return sorted(score.items(), key=lambda x: x[1], reverse=True)
 
 # =========================
 # 大小单双
 # =========================
 
 def dsdx_predict(hist):
-
     recent = hist[-10:]
-
-    big = 0
-    small = 0
-    odd = 0
-    even = 0
-
+    if len(recent) < 10:
+        return "数据不足", "数据不足"
+    big = small = odd = even = 0
     for r in recent:
-
         sp = r[7]
-
         if sp >= 25:
             big += 1
         else:
             small += 1
-
         if sp % 2:
             odd += 1
         else:
             even += 1
-
     dx = "大" if big >= small else "小"
-
     ds = "单" if odd >= even else "双"
-
     return dx, ds
 
 # =========================
@@ -427,47 +294,26 @@ def dsdx_predict(hist):
 # =========================
 
 def backtest(hist):
-
     recent = hist[-11:]
-
-    hit = 0
-
-    total = 0
-
-    max_miss = 0
-
-    miss = 0
-
+    if len(recent) < 11:
+        return 0, 0, 0, 0
+    hit = total = max_miss = miss = 0
     for i in range(1, len(recent)):
-
         train = recent[:i]
-
         target = recent[i]
-
         top = color_predict(train)
-
-        a = top[0][0]
-
-        b = top[1][0]
-
+        if len(top) < 2:
+            continue
+        a, b = top[0][0], top[1][0]
         real = get_color(target[7])
-
         total += 1
-
         if real in [a, b]:
-
             hit += 1
-
             miss = 0
-
         else:
-
             miss += 1
-
             max_miss = max(max_miss, miss)
-
-    rate = round(hit / total * 100, 1)
-
+    rate = round(hit / total * 100, 1) if total else 0
     return hit, total, rate, max_miss
 
 # =========================
@@ -475,110 +321,86 @@ def backtest(hist):
 # =========================
 
 def show_strategy(name, main, sp):
-
-    print(f"{name:<16}: " +
-          " ".join(f"{x:02d}" for x in main) +
-          f" + {sp:02d}")
-
+    if main is None:
+        print(f"{name:<16}: 数据不足，无法生成推荐")
+        return
+    print(f"{name:<16}: " + " ".join(f"{x:02d}" for x in main) + f" + {sp:02d}")
     print(f"{'':16} 特码属性: {get_attrs(sp)}")
 
 # =========================
-# 同步
+# 主流程
 # =========================
 
 def sync():
-
     init_db()
 
+    # 1. 尝试在线拉取数据
     rows = fetch_data()
+    if rows:
+        new_count = save_records(rows)
+        print(f"📦 本次保存 {new_count} 条新记录")
+    else:
+        print("⚠️ 未获取到在线数据，将使用本地数据库进行分析")
 
-    if not rows:
+    # 2. 获取历史记录
+    hist = get_history()
+    total = len(hist)
+    print(f"📊 当前数据库共有 {total} 期数据")
 
-        print("未抓到真实开奖数据")
-
+    if total == 0:
+        print("❌ 数据库无任何开奖记录，无法生成预测")
         return
 
-    new_count = save_records(rows)
+    # 3. 自动补全建议（首次运行后通常已有足够数据）
+    if total < 10:
+        print("🔍 历史数据不足10期，预测准确性可能较低，请等待定时任务自动积累。")
 
-    hist = get_history()
-
+    # 4. 输出最新开奖及预测
     latest = hist[-1]
+    issue_next = int(latest[0]) + 1
 
-    issue = int(latest[0]) + 1
+    print("\n最新开奖:")
+    print(f"{latest[0]} | " +
+          " ".join(f"{x:02d}" for x in latest[1:7]) +
+          f" + {latest[7]:02d}")
+    print(f"\n预测期号: {issue_next}")
 
-    print(f"数据同步完成: total={len(hist)}, new={new_count}")
-
-    print()
-
-    print("最新开奖:")
-
-    print(
-        f"{latest[0]} | "
-        + " ".join(f"{x:02d}" for x in latest[1:7])
-        + f" + {latest[7]:02d}"
-    )
-
-    print()
-
-    print(f"预测期号: {issue}")
-
+    # 各策略推荐
     h_main, h_sp = hot_strategy(hist)
-
     c_main, c_sp = cold_strategy(hist)
-
     m_main, m_sp = momentum_strategy(hist)
-
     v_main, v_sp = vote_strategy(hist)
-
     p_main, p_sp = pattern_strategy(hist)
 
-    show_strategy("组合策略", v_main, v_sp)
-
+    show_strategy("组合策略 (投票)", v_main, v_sp)
     show_strategy("冷号回补", c_main, c_sp)
-
-    show_strategy("集成投票", v_main, v_sp)
-
     show_strategy("热号策略", h_main, h_sp)
-
     show_strategy("近期动量", m_main, m_sp)
-
     show_strategy("规律挖掘", p_main, p_sp)
 
-    print()
-
-    print("🎨 特码波色预测（加权频率，基于最近 10 期）：")
-
+    # 波色预测
+    print("\n🎨 特码波色预测（加权频率，基于最近10期）：")
     top = color_predict(hist)
+    if top:
+        print(f"   主强: {top[0][0]} (得分 {top[0][1]})   "
+              f"次强: {top[1][0]} (得分 {top[1][1]})")
+    else:
+        print("   数据不足，无法预测")
 
-    print(
-        f"   主强: {top[0][0]} (得分 {top[0][1]})   "
-        f"次强: {top[1][0]} (得分 {top[1][1]})"
-    )
-
-    print()
-
+    # 大小单双
     dx, ds = dsdx_predict(hist)
-
-    print("📊 大小单双预测（最近10期真实数据）：")
-
+    print("\n📊 大小单双预测（最近10期真实数据）：")
     print(f"   大小预测: {dx}   单双预测: {ds}")
 
-    print()
-
-    hit, total, rate, max_miss = backtest(hist)
-
-    print("📊 历史回测（最近 10 期）：")
-
-    print(f"   二中一命中率: {rate}%")
-
-    print(f"   最近10期命中: {hit}/{total}")
-
-    print(f"   最大连空: {max_miss}期")
-
-# =========================
-# 主程序
-# =========================
+    # 回测
+    hit, total_bt, rate, max_miss = backtest(hist)
+    if total_bt > 0:
+        print("\n📈 历史回测（最近10期）：")
+        print(f"   二中一命中率: {rate}%")
+        print(f"   最近10期命中: {hit}/{total_bt}")
+        print(f"   最大连空: {max_miss}期")
+    else:
+        print("\n📈 历史回测：数据不足，无法计算")
 
 if __name__ == "__main__":
-
     sync()
