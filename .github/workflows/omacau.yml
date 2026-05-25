@@ -1,22 +1,25 @@
-name: 新澳门自动预测
+name: 新澳门六合彩AI-V6
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    # 每30分钟运行一次
+    - cron: "*/30 * * * *"
+
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 检出代码
+
+      - name: 签出仓库
         uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: 安装Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -25,14 +28,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
 
-      - name: 运行主脚本
+      - name: 运行AI预测系统
         run: |
-          python macau_predictor_pro_v4.py sync
+          python macau_v6.py
 
-      - name: 提交数据库
+      - name: 上传数据库
+        uses: actions/upload-artifact@v4
+        with:
+          name: 新澳门数据库
+          path: |
+            macau_v6.db
+
+      - name: 上传HTML面板
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI预测HTML面板
+          path: |
+            dashboard.html
+
+      - name: 提交最新结果
         run: |
           git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-          git add new_macau.db
-          git diff --cached --quiet || git commit -m "自动更新新澳门数据"
+          git config --global user.email "github-actions@github.com"
+
+          git add .
+
+          git commit -m "AI自动更新 $(date '+%Y-%m-%d %H:%M:%S')" || echo "无变化"
+
           git push
