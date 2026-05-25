@@ -4,7 +4,7 @@ import json
 import sqlite3
 import urllib.request
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 
 DB_FILE = "new_macau.db"
 
@@ -12,10 +12,12 @@ RED = {
     1, 2, 7, 8, 12, 13, 18, 19, 23, 24,
     29, 30, 34, 35, 40, 45, 46
 }
+
 BLUE = {
     3, 4, 9, 10, 14, 15, 20, 25, 26,
     31, 36, 37, 41, 42, 47, 48
 }
+
 GREEN = {
     5, 6, 11, 16, 17, 21, 22, 27,
     28, 32, 33, 38, 39, 43, 44, 49
@@ -49,7 +51,7 @@ def init_db():
 
 
 def fetch_api_data():
-    """从 marksix6.net 获取新澳门彩数据，保留最近 30 期"""
+    """从 marksix6.net 获取新澳门彩数据，只保留最近 10 期"""
     url = "https://marksix6.net/index.php?api=1"
     try:
         req = urllib.request.Request(url, headers={
@@ -130,11 +132,11 @@ def fetch_api_data():
         result = list(uniq.values())
         result.sort(key=lambda x: x["issue"])
 
-        # 保留最近 30 期
-        if len(result) > 30:
-            result = result[-30:]
+        # 只保留最近 10 期
+        if len(result) > 10:
+            result = result[-10:]
 
-        print(f"抓取到历史数据: {len(result)} 条（保留最近30期）")
+        print(f"抓取到历史数据: {len(result)} 条（仅保留最近10期）")
         return result
 
     except Exception as e:
@@ -154,8 +156,15 @@ def save_records(records):
         cur = conn.execute("SELECT issue FROM lottery WHERE issue=?", (issue,)).fetchone()
         if not cur:
             new_count += 1
-        conn.execute("INSERT OR REPLACE INTO lottery VALUES (?,?,?,?,?,?,?,?)",
-                     (issue, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], special))
+        conn.execute("""
+        INSERT OR REPLACE INTO lottery
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            issue,
+            nums[0], nums[1], nums[2],
+            nums[3], nums[4], nums[5],
+            special
+        ))
     conn.commit()
     conn.close()
     return new_count
@@ -175,16 +184,17 @@ def load_records():
     return result
 
 
-# ----------------- 属性工具 -----------------
 def get_wave(n):
     if n in RED: return "红"
     if n in BLUE: return "蓝"
     return "绿"
 
+
 def get_element(n):
     for k, arr in ELEMENTS.items():
         if n in arr: return k
     return "?"
+
 
 def get_size(n): return "大" if n >= 25 else "小"
 def get_odd_even(n): return "单" if n % 2 else "双"
@@ -202,132 +212,59 @@ def special_text(n):
             f"{get_tail_size(n)} {get_wave(n)} {get_element(n)}")
 
 
-# ----------------- 基础策略生成器 -----------------
-def generate_strategy(records, strategy_name):
-    """返回 (正码列表, 特码)，若数据不足返回 (None, None)"""
-    if len(records) < 7:
-        return None, None
-
-    if strategy_name == "热号策略":
-        freq = Counter()
-        for r in records[-20:]:
-            freq.update(r["numbers"])
-        ranked = freq.most_common(7)
-        if len(ranked) < 7:
-            return None, None
-        return [n for n, _ in ranked[:6]], ranked[6][0]
-
-    elif strategy_name == "冷号回补":
-        freq = Counter()
-        for r in records[-30:]:
-            freq.update(r["numbers"])
-        missing = sorted([n for n in range(1, 50) if n not in freq])
-        if len(missing) < 7:
-            return None, None
-        return missing[:6], missing[6]
-
-    elif strategy_name == "近期动量":
-        scores = Counter()
-        for i, r in enumerate(records[-30:]):
-            w = 1.0 / (1 + i)
-            for n in r["numbers"]:
-                scores[n] += w
-        ranked = scores.most_common(7)
-        if len(ranked) < 7:
-            return None, None
-        return [n for n, _ in ranked[:6]], ranked[6][0]
-
-    elif strategy_name == "规律挖掘":
-        recent = records[-5:]
-        seen = []
-        for r in recent:
-            for n in r["numbers"]:
-                if n not in seen:
-                    seen.append(n)
-        if len(seen) < 6:
-            return None, None
-        return seen[:6], seen[0]
-
-    else:
-        return None, None
+def predict_numbers(records):
+    recent = records[-20:]
+    freq = Counter()
+    for r in recent:
+        for n in r["numbers"]:
+            freq[n] += 1
+    hot = [x[0] for x in freq.most_common(6)]
+    cold = [n for n in range(1, 50) if n not in hot][:6]
+    momentum = hot[::-1]
+    vote = hot[:]
+    pattern = []
+    for r in recent[-5:]:
+        pattern.extend(r["numbers"])
+    pattern = list(dict.fromkeys(pattern))[:6]
+    combo = list(set(hot[:3] + cold[:3]))[:6]
+    strategies = {
+        "组合策略": combo,
+        "冷号回补": cold,
+        "集成投票": vote,
+        "热号策略": hot,
+        "近期动量": momentum,
+        "规律挖掘": pattern
+    }
+    result = {}
+    for k, nums in strategies.items():
+        result[k] = {"nums": nums, "special": nums[0]}
+    return result
 
 
-# ----------------- 自动调优：基于最近 5 期滚动评估 -----------------
-def evaluate_strategies(records, window=5):
-    """
-    对每种策略在最近 window 期进行留一法滚动回测，
-    返回字典 {策略名: 平均命中数}
-    """
-    if len(records) < window + 10:
-        return {}
-
-    strategies = ["热号策略", "冷号回补", "近期动量", "规律挖掘"]
-    performance = {s: [] for s in strategies}
-
-    start_idx = len(records) - window - 1
-    for i in range(start_idx, len(records) - 1):
-        train = records[:i]
-        actual = set(records[i]["numbers"])
-        for s in strategies:
-            main, _ = generate_strategy(train, s)
-            if main is None:
-                continue
-            hit = sum(1 for n in main if n in actual)
-            performance[s].append(hit)
-
-    avg_perf = {}
-    for s, hits in performance.items():
-        if hits:
-            avg_perf[s] = sum(hits) / len(hits)
-    return avg_perf
+def calc_wave_prediction(records):
+    last10 = records[-10:]
+    score = {"红": 0, "蓝": 0, "绿": 0}
+    weight = min(10, len(last10))
+    for i, r in enumerate(reversed(last10)):
+        wave = get_wave(r["special"])
+        score[wave] += weight - i
+    sorted_wave = sorted(score.items(), key=lambda x: x[1], reverse=True)
+    return sorted_wave[0], sorted_wave[1]
 
 
-# ----------------- 集成投票（动态权重） -----------------
-def ensemble_with_weights(records, strategy_weights):
-    """
-    根据各策略的权重，对号码进行加权投票，返回 (正码列表, 特码)
-    """
-    if not strategy_weights or len(records) < 10:
-        return None, None
-
-    total_score = Counter()
-    for s, w in strategy_weights.items():
-        main, special = generate_strategy(records, s)
-        if main is None:
-            continue
-        for num in main:
-            total_score[num] += w
-
-    if len(total_score) < 6:
-        return None, None
-    ranked = total_score.most_common(6)
-    return [n for n, _ in ranked], ranked[0][0]
-
-
-# ----------------- 波色回测 -----------------
 def backtest_wave(records):
-    """最近10期波色二中一回测，返回 (命中次数, 总次数, 最大连空)"""
-    recent = records[-10:]
+    """波色回测，返回 (命中, 总次数, 最大连空)"""
+    if len(records) < 2:
+        return 0, 0, 0
+    recent = records[-10:]  # 最多取最近10期
     hit = total = 0
     max_miss = miss = 0
-    for i in range(2, len(recent)):
+    for i in range(2, len(recent)):   # 至少需要2期历史才能预测
         hist = recent[:i]
-        # 计算当前历史数据的波色预测
-        specials = [r["special"] for r in hist]
-        if len(specials) < 3:
-            continue
-        score = {"红": 0, "蓝": 0, "绿": 0}
-        w = len(specials)
-        for sp in reversed(specials):
-            score[get_wave(sp)] += w
-            w -= 1
-        sorted_wave = sorted(score.items(), key=lambda x: x[1], reverse=True)
-        main_color = sorted_wave[0][0]
-        second_color = sorted_wave[1][0] if len(sorted_wave) > 1 else main_color
-
-        actual = get_wave(recent[i]["special"])
+        main, second = calc_wave_prediction(hist)
+        real = get_wave(recent[i]["special"])
         total += 1
-        if actual in (main_color, second_color):
+        if real in [main[0], second[0]]:
             hit += 1
             miss = 0
         else:
@@ -336,9 +273,23 @@ def backtest_wave(records):
     return hit, total, max_miss
 
 
-# ----------------- 大小单双回测 -----------------
+def predict_big_small(records):
+    if len(records) < 1:
+        return "数据不足", "数据不足"
+    recent = records[-10:]
+    big = small = odd = even = 0
+    for r in recent:
+        s = r["special"]
+        if s >= 25: big += 1
+        else: small += 1
+        if s % 2: odd += 1
+        else: even += 1
+    return ("大" if big >= small else "小"), ("单" if odd >= even else "双")
+
+
 def backtest_size_odd(records):
-    """最近10期大小单双回测，返回 (大小命中, 单双命中, 总次数, 大小最大连空, 单双最大连空)"""
+    if len(records) < 2:
+        return 0, 0, 0, 0, 0
     recent = records[-10:]
     size_hit = odd_hit = 0
     size_miss = odd_miss = 0
@@ -346,40 +297,26 @@ def backtest_size_odd(records):
     total = 0
     for i in range(2, len(recent)):
         hist = recent[:i]
-        specials = [r["special"] for r in hist]
-        if len(specials) < 2:
-            continue
-        # 简单多数预测
-        big = sum(1 for sp in specials if sp >= 25)
-        small = len(specials) - big
-        size_pred = "大" if big >= small else "小"
-        odd = sum(1 for sp in specials if sp % 2)
-        even = len(specials) - odd
-        odd_pred = "单" if odd >= even else "双"
-
+        size_pred, odd_pred = predict_big_small(hist)
         real = recent[i]["special"]
         total += 1
         real_size = "大" if real >= 25 else "小"
         real_odd = "单" if real % 2 else "双"
-
         if size_pred == real_size:
             size_hit += 1
             size_miss = 0
         else:
             size_miss += 1
             size_max = max(size_max, size_miss)
-
         if odd_pred == real_odd:
             odd_hit += 1
             odd_miss = 0
         else:
             odd_miss += 1
             odd_max = max(odd_max, odd_miss)
-
     return size_hit, odd_hit, total, size_max, odd_max
 
 
-# ----------------- 主逻辑 -----------------
 def sync():
     init_db()
     records = fetch_api_data()
@@ -389,98 +326,68 @@ def sync():
 
     new_count = save_records(records)
     all_records = load_records()
+
     print(f"数据同步完成: total={len(all_records)}, new={new_count}")
 
     if len(all_records) < 10:
-        print("⚠️ 历史数据不足10期，无法进行预测")
+        print(f"⚠️ 历史数据不足10期，当前仅有 {len(all_records)} 期，部分预测可能不准")
+
+    if len(all_records) == 0:
+        print("无数据，退出")
         return
 
     latest = all_records[-1]
-    print(f"最新开奖: {latest['issue']} | "
-          f"{' '.join([str(x).zfill(2) for x in latest['numbers']])} "
-          f"+ {str(latest['special']).zfill(2)}")
+    print(
+        f"最新开奖: {latest['issue']} | "
+        f"{' '.join([str(x).zfill(2) for x in latest['numbers']])} "
+        f"+ {str(latest['special']).zfill(2)}"
+    )
+    print()
     next_issue = str(int(latest["issue"]) + 1)
-    print(f"\n预测期号: {next_issue}")
+    print(f"预测期号: {next_issue}")
 
-    # 1. 评估各策略最近5期表现
-    perf = evaluate_strategies(all_records, window=5)
-    print("\n📈 最近5期各策略平均命中数（用于自动调权）:")
-    strategy_weights = {}
-    if perf:
-        for s, avg in sorted(perf.items(), key=lambda x: x[1], reverse=True):
-            print(f"   {s}: {avg:.2f} 个/期")
-        max_hit = max(perf.values())
-        for s, avg in perf.items():
-            strategy_weights[s] = 0.1 + (avg / max_hit) * 0.9 if max_hit > 0 else 1.0
-    else:
-        print("   数据不足，使用默认等权重")
-        strategy_weights = {s: 1.0 for s in ["热号策略", "冷号回补", "近期动量", "规律挖掘"]}
+    # 策略预测
+    predicts = predict_numbers(all_records)
+    for k, v in predicts.items():
+        nums = " ".join([str(x).zfill(2) for x in v["nums"]])
+        sp = str(v["special"]).zfill(2)
+        print(f"  {k}　　　　: {nums} + {sp}")
+        print(f"         特码属性: {special_text(v['special'])}")
 
-    # 2. 固定策略展示
-    print("\n固定策略预测:")
-    strategies = ["热号策略", "冷号回补", "近期动量", "规律挖掘"]
-    for s in strategies:
-        main, special = generate_strategy(all_records, s)
-        if main is None:
-            print(f"  {s}: 数据不足")
-            continue
-        nums_str = " ".join([str(x).zfill(2) for x in main])
-        sp_str = str(special).zfill(2) if special else "--"
-        print(f"  {s}: {nums_str} + {sp_str}")
-        if special:
-            print(f"         特码属性: {special_text(special)}")
+    print()
 
-    # 3. 动态集成策略
-    print("\n🧠 动态集成策略（基于5期表现加权）:")
-    ens_main, ens_special = ensemble_with_weights(all_records, strategy_weights)
-    if ens_main is None:
-        print("   无法生成")
-    else:
-        ens_nums = " ".join([str(x).zfill(2) for x in ens_main])
-        print(f"  集成投票: {ens_nums} + {str(ens_special).zfill(2)}")
-        if ens_special:
-            print(f"         特码属性: {special_text(ens_special)}")
-
-    # 4. 波色预测与回测
-    if len(all_records) >= 10:
-        specials = [r["special"] for r in all_records[-10:]]
-        scores = defaultdict(int)
-        for i, sp in enumerate(reversed(specials)):
-            scores[get_wave(sp)] += 10 - i
-        sorted_wave = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        print("\n🎨 特码波色预测（加权，基于最近10期）:")
-        print(f"   主强: {sorted_wave[0][0]} (得分 {sorted_wave[0][1]})   "
-              f"次强: {sorted_wave[1][0]} (得分 {sorted_wave[1][1]})")
+    # 波色预测与回测（只要有2期就做）
+    if len(all_records) >= 2:
+        # 波色预测
+        main, second = calc_wave_prediction(all_records)
+        print("🎨 特码波色预测（加权）：")
+        print(f"   主强: {main[0]} (得分 {main[1]})   次强: {second[0]} (得分 {second[1]})")
 
         # 波色回测
         wave_hit, wave_total, wave_max_miss = backtest_wave(all_records)
         if wave_total > 0:
-            print(f"\n📊 最近10期波色回测（二中一）:")
-            print(f"   命中: {wave_hit}/{wave_total}")
-            print(f"   命中率: {round(wave_hit/wave_total*100, 1)}%")
+            print(f"\n📊 波色回测（最近{wave_total}期）：")
+            print(f"   二中一命中: {wave_hit}/{wave_total}")
+            print(f"   命中率: {round(wave_hit/wave_total*100,1)}%")
             print(f"   最大连空: {wave_max_miss}期")
+    else:
+        print("🎨 特码波色预测：数据不足")
 
-        # 大小单双预测
-        recent_specials = [r["special"] for r in all_records[-10:]]
-        big = small = odd = even = 0
-        for sp in recent_specials:
-            if sp >= 25: big += 1
-            else: small += 1
-            if sp % 2: odd += 1
-            else: even += 1
-        print("\n📊 大小单双预测（基于最近10期）:")
-        print(f"   大小: {'大' if big >= small else '小'}   单双: {'单' if odd >= even else '双'}")
+    # 大小单双预测与回测
+    if len(all_records) >= 2:
+        size_pred, odd_pred = predict_big_small(all_records)
+        print("\n📊 大小单双预测：")
+        print(f"   大小: {size_pred}   单双: {odd_pred}")
 
-        # 大小单双回测
-        size_hit, odd_hit, ds_total, size_max, odd_max = backtest_size_odd(all_records)
-        if ds_total > 0:
-            print(f"\n📊 最近10期大小单双回测:")
-            print(f"   大小命中: {size_hit}/{ds_total} (命中率 {round(size_hit/ds_total*100,1)}%)")
+        size_hit, odd_hit, total, size_max, odd_max = backtest_size_odd(all_records)
+        if total > 0:
+            print(f"\n📊 大小单双回测（最近{total}期）：")
+            print(f"   大小命中: {size_hit}/{total} ({round(size_hit/total*100,1)}%)")
             print(f"   大小最大连空: {size_max}期")
-            print(f"   单双命中: {odd_hit}/{ds_total} (命中率 {round(odd_hit/ds_total*100,1)}%)")
+            print(f"   单双命中: {odd_hit}/{total} ({round(odd_hit/total*100,1)}%)")
             print(f"   单双最大连空: {odd_max}期")
     else:
-        print("\n波色预测数据不足")
+        print("\n📊 大小单双预测：数据不足")
 
 
 if __name__ == "__main__":
