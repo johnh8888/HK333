@@ -2,9 +2,7 @@ name: 新澳门六合彩AI-V6
 
 on:
   schedule:
-    # 每30分钟运行一次
     - cron: "*/30 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -15,9 +13,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: 签出仓库
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 安装Python
         uses: actions/setup-python@v5
@@ -32,27 +31,10 @@ jobs:
         run: |
           python macau_v6.py
 
-      - name: 上传数据库
-        uses: actions/upload-artifact@v4
-        with:
-          name: 新澳门数据库
-          path: |
-            macau_v6.db
-
-      - name: 上传HTML面板
-        uses: actions/upload-artifact@v4
-        with:
-          name: AI预测HTML面板
-          path: |
-            dashboard.html
-
-      - name: 提交最新结果
+      - name: 提交数据库和面板
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
-
-          git add .
-
-          git commit -m "AI自动更新 $(date '+%Y-%m-%d %H:%M:%S')" || echo "无变化"
-
+          git add macau_v6.db dashboard.html
+          git diff --cached --quiet || git commit -m "AI自动更新"
           git push
