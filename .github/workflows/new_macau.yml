@@ -1,8 +1,8 @@
 name: 新澳门彩数据同步与预测
 
-on:
+于:
   schedule:
-    - cron: "0 13,1 * * *"
+    - cron: "0 13,1 * * *"   # 每天 UTC 13:00 和 01:00 运行
   workflow_dispatch:
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
         with:
           name: macau-db
           path: .
-        continue-on-error: true
+        continue-on-error: true   # 首次或过期时不会失败
 
       - name: 运行预测脚本
         run: python new_macau.py
@@ -32,4 +32,4 @@ jobs:
         with:
           name: macau-db
           path: new_macau.db
-          retention-days: 7
+          retention-days: 7   # 保持一周，确保下次运行能下载
