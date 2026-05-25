@@ -27,7 +27,7 @@ jobs:
 
       - name: 运行AI系统
         run: |
-          python macau_v11.py
+          python macau_v9.py
 
       - name: 自动提交数据库
         run: |
