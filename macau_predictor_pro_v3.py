@@ -7,11 +7,12 @@ import argparse
 import json
 import random
 import sqlite3
+import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from urllib.request import Request, urlopen
 
 # =========================================================
@@ -19,9 +20,10 @@ from urllib.request import Request, urlopen
 # =========================================================
 
 ROOT = Path(__file__).resolve().parent
+
 DB_PATH = ROOT / "macau_pro.db"
 
-THIRD_PARTY_URLS = [
+API_URLS = [
     "https://marksix6.net/index.php?api=1"
 ]
 
@@ -32,7 +34,7 @@ BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
 GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
 
 # =========================================================
-# MODEL
+# DATA MODEL
 # =========================================================
 
 @dataclass
@@ -49,6 +51,9 @@ class DrawRecord:
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
+def today_str():
+    return utc_now()[:10]
+
 def normalize(score_map: Dict[int, float]):
 
     vals = list(score_map.values())
@@ -63,6 +68,10 @@ def normalize(score_map: Dict[int, float]):
         k: (v - mn) / (mx - mn)
         for k, v in score_map.items()
     }
+
+# =========================================================
+# COLOR / ATTR
+# =========================================================
 
 def get_wave(n: int):
 
@@ -80,11 +89,29 @@ def get_size(n: int):
 def get_odd_even(n: int):
     return "单" if n % 2 else "双"
 
+def get_tail_size(n: int):
+    return "尾大" if n % 10 >= 5 else "尾小"
+
+def get_sum_size(n: int):
+
+    s = sum(map(int, str(n)))
+
+    return "合大" if s >= 7 else "合小"
+
+def get_sum_odd_even(n: int):
+
+    s = sum(map(int, str(n)))
+
+    return "合单" if s % 2 else "合双"
+
 def special_text(n: int):
 
     return (
         f"{get_odd_even(n)}/"
         f"{get_size(n)} "
+        f"{get_sum_odd_even(n)}/"
+        f"{get_sum_size(n)} "
+        f"{get_tail_size(n)} "
         f"{get_wave(n)}"
     )
 
@@ -95,6 +122,7 @@ def special_text(n: int):
 def connect_db():
 
     conn = sqlite3.connect(DB_PATH)
+
     conn.row_factory = sqlite3.Row
 
     return conn
@@ -121,6 +149,16 @@ def init_db(conn):
         created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS analytics (
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        created_at TEXT,
+        avg_hit REAL,
+        special_rate REAL,
+        montecarlo REAL
+    );
+
     """)
 
     conn.commit()
@@ -133,13 +171,16 @@ def parse_marksix6(payload):
 
     result = []
 
-    data = payload.get("lottery_data", [])
+    lottery_data = payload.get("lottery_data", [])
 
     target = None
 
-    for item in data:
+    for item in lottery_data:
 
-        if "澳门" in item.get("name", ""):
+        name = item.get("name", "")
+
+        if "澳门" in name:
+
             target = item
             break
 
@@ -154,6 +195,9 @@ def parse_marksix6(payload):
 
             parts = row.split("期：")
 
+            if len(parts) != 2:
+                continue
+
             issue = parts[0].strip()
 
             nums = [
@@ -166,20 +210,22 @@ def parse_marksix6(payload):
                 result.append(
                     DrawRecord(
                         issue_no=issue,
-                        draw_date=utc_now()[:10],
+                        draw_date=today_str(),
                         numbers=nums[:6],
                         special=nums[6]
                     )
                 )
 
         except:
-            pass
+            continue
+
+    result.sort(key=lambda x: x.issue_no)
 
     return result
 
 def fetch_records():
 
-    for url in THIRD_PARTY_URLS:
+    for url in API_URLS:
 
         try:
 
@@ -199,13 +245,16 @@ def fetch_records():
             rows = parse_marksix6(payload)
 
             if rows:
+
+                print(f"API获取成功: {url}")
+
                 return rows, url
 
         except Exception as e:
 
-            print("fetch failed:", e)
+            print("API失败:", e)
 
-    raise RuntimeError("all data sources failed")
+    raise RuntimeError("全部API失败")
 
 # =========================================================
 # STORAGE
@@ -215,8 +264,40 @@ def upsert_draw(conn, row, source):
 
     conn.execute("""
 
-    INSERT OR REPLACE INTO draws VALUES (
-        ?,?,?,?,?,?,?,?,?,?
+    INSERT OR REPLACE INTO draws (
+
+        issue_no,
+        draw_date,
+
+        n1,
+        n2,
+        n3,
+        n4,
+        n5,
+        n6,
+
+        special,
+
+        source,
+        created_at
+
+    ) VALUES (
+
+        ?,
+        ?,
+
+        ?,
+        ?,
+        ?,
+        ?,
+        ?,
+        ?,
+
+        ?,
+
+        ?,
+        ?
+
     )
 
     """, (
@@ -235,18 +316,30 @@ def upsert_draw(conn, row, source):
 
         source,
         utc_now()
+
     ))
 
 def sync_data(conn):
 
     rows, source = fetch_records()
 
+    new_count = 0
+
     for row in rows:
+
+        exists = conn.execute(
+            "SELECT 1 FROM draws WHERE issue_no=?",
+            (row.issue_no,)
+        ).fetchone()
+
+        if not exists:
+            new_count += 1
+
         upsert_draw(conn, row, source)
 
     conn.commit()
 
-    print(f"同步完成: {len(rows)} 条")
+    print(f"同步完成: total={len(rows)}, new={new_count}")
 
 def load_draws(conn):
 
@@ -281,14 +374,14 @@ def load_draws(conn):
     return result
 
 # =========================================================
-# ANALYTICS
+# SCORE ENGINE
 # =========================================================
 
 def frequency_score(draws, window=80):
 
-    freq = defaultdict(float)
-
     recent = draws[-window:]
+
+    freq = defaultdict(float)
 
     total = max(len(recent), 1)
 
@@ -306,30 +399,30 @@ def frequency_score(draws, window=80):
 
 def omission_score(draws):
 
-    latest = {
+    latest_seen = {
         n: None
         for n in ALL_NUMBERS
     }
 
-    rev = list(reversed(draws))
+    reversed_draws = list(reversed(draws))
 
-    for idx, draw in enumerate(rev):
+    for idx, draw in enumerate(reversed_draws):
 
         for n in draw.numbers:
 
-            if latest[n] is None:
-                latest[n] = idx
+            if latest_seen[n] is None:
+                latest_seen[n] = idx
 
     mx = max(
         v if v is not None else 0
-        for v in latest.values()
+        for v in latest_seen.values()
     )
 
     result = {}
 
     for n in ALL_NUMBERS:
 
-        gap = latest[n]
+        gap = latest_seen[n]
 
         if gap is None:
             gap = mx + 1
@@ -341,63 +434,66 @@ def omission_score(draws):
 def momentum_score(draws):
 
     recent = draws[-20:]
+
     older = draws[-60:-20]
 
     r = Counter()
+
     o = Counter()
 
     for draw in recent:
+
         for n in draw.numbers:
             r[n] += 1
 
     for draw in older:
+
         for n in draw.numbers:
             o[n] += 1
 
-    score = {}
+    result = {}
 
     for n in ALL_NUMBERS:
 
-        score[n] = (
-            r[n] - (o[n] / 2.0)
-        )
+        result[n] = r[n] - (o[n] / 2)
 
-    return normalize(score)
+    return normalize(result)
 
 def pair_affinity_score(draws):
 
     pair_count = defaultdict(int)
 
-    for draw in draws[-100:]:
+    for draw in draws[-120:]:
 
         nums = sorted(draw.numbers)
 
         for i in range(len(nums)):
+
             for j in range(i + 1, len(nums)):
 
                 pair_count[
                     (nums[i], nums[j])
                 ] += 1
 
-    score = defaultdict(float)
+    social = defaultdict(float)
 
     for (a, b), c in pair_count.items():
 
-        score[a] += c
-        score[b] += c
+        social[a] += c
+        social[b] += c
 
     for n in ALL_NUMBERS:
-        score.setdefault(n, 0.0)
+        social.setdefault(n, 0.0)
 
-    return normalize(score)
+    return normalize(social)
 
 # =========================================================
-# STRATEGY
+# STRATEGY ENGINE
 # =========================================================
 
 class EnsembleStrategy:
 
-    name = "ensemble_v3"
+    name = "ensemble_v5"
 
     def predict(self, draws):
 
@@ -423,23 +519,23 @@ class EnsembleStrategy:
             reverse=True
         )
 
-        top6 = ranked[:6]
+        main6 = ranked[:6]
 
         special = ranked[6]
 
         return {
-            "numbers": [n for n, _ in top6],
+            "numbers": [n for n, _ in main6],
             "special": special[0],
             "scores": final
         }
 
 # =========================================================
-# MONTE CARLO
+# MONTECARLO
 # =========================================================
 
 def montecarlo_baseline(draws, simulations=1000):
 
-    hits = []
+    scores = []
 
     for draw in draws[-20:]:
 
@@ -460,17 +556,17 @@ def montecarlo_baseline(draws, simulations=1000):
 
             total += hit
 
-        hits.append(
+        scores.append(
             total / simulations
         )
 
     return round(
-        sum(hits) / len(hits),
+        statistics.mean(scores),
         4
     )
 
 # =========================================================
-# BACKTEST
+# WALK FORWARD
 # =========================================================
 
 def walk_forward_backtest(draws, strategy, train_size=30):
@@ -512,7 +608,7 @@ def walk_forward_backtest(draws, strategy, train_size=30):
     return results
 
 # =========================================================
-# WAVE
+# WAVE PREDICTION
 # =========================================================
 
 def predict_wave(draws):
@@ -544,12 +640,86 @@ def predict_wave(draws):
     return ranked[0], ranked[1]
 
 # =========================================================
+# BIG SMALL
+# =========================================================
+
+def predict_big_small(draws):
+
+    recent = draws[-10:]
+
+    big = 0
+    small = 0
+
+    odd = 0
+    even = 0
+
+    for draw in recent:
+
+        s = draw.special
+
+        if s >= 25:
+            big += 1
+        else:
+            small += 1
+
+        if s % 2:
+            odd += 1
+        else:
+            even += 1
+
+    size_pred = "大" if big >= small else "小"
+    odd_pred = "单" if odd >= even else "双"
+
+    return size_pred, odd_pred
+
+# =========================================================
+# ANALYTICS
+# =========================================================
+
+def save_analytics(
+    conn,
+    avg_hit,
+    special_rate,
+    montecarlo
+):
+
+    conn.execute("""
+
+    INSERT INTO analytics (
+
+        created_at,
+        avg_hit,
+        special_rate,
+        montecarlo
+
+    ) VALUES (
+
+        ?,
+        ?,
+        ?,
+        ?
+
+    )
+
+    """, (
+
+        utc_now(),
+        avg_hit,
+        special_rate,
+        montecarlo
+
+    ))
+
+    conn.commit()
+
+# =========================================================
 # DASHBOARD
 # =========================================================
 
-def print_dashboard(draws):
+def print_dashboard(conn, draws):
 
     if not draws:
+
         print("暂无数据")
         return
 
@@ -560,17 +730,29 @@ def print_dashboard(draws):
         for x in latest.numbers
     )
 
-    print("=" * 60)
+    print("=" * 70)
 
     print(
-        f"最新开奖: {latest.issue_no}"
+        f"最新开奖: "
+        f"{latest.issue_no}"
     )
 
     print(
-        f"号码: {nums} + {str(latest.special).zfill(2)}"
+        f"号码: "
+        f"{nums} "
+        f"+ "
+        f"{str(latest.special).zfill(2)}"
     )
 
-    print("=" * 60)
+    print("=" * 70)
+
+    next_issue = str(
+        int(latest.issue_no) + 1
+    )
+
+    print(
+        f"\n预测期号: {next_issue}"
+    )
 
     strategy = EnsembleStrategy()
 
@@ -581,12 +763,13 @@ def print_dashboard(draws):
         for x in pred["numbers"]
     )
 
-    print("\n预测结果:")
+    print("\n🎯 集成预测:")
 
     print(
-        f"集成策略: "
+        f"号码: "
         f"{pred_nums} "
-        f"+ {str(pred['special']).zfill(2)}"
+        f"+ "
+        f"{str(pred['special']).zfill(2)}"
     )
 
     print(
@@ -594,21 +777,35 @@ def print_dashboard(draws):
         f"{special_text(pred['special'])}"
     )
 
-    print("\n波色预测:")
+    print("\n🎨 波色预测:")
 
     main_wave, second_wave = predict_wave(draws)
 
     print(
-        f"主强: {main_wave[0]} "
+        f"主强: "
+        f"{main_wave[0]} "
         f"({main_wave[1]})"
     )
 
     print(
-        f"次强: {second_wave[0]} "
+        f"次强: "
+        f"{second_wave[0]} "
         f"({second_wave[1]})"
     )
 
-    print("\n回测分析:")
+    print("\n📊 大小单双:")
+
+    size_pred, odd_pred = predict_big_small(draws)
+
+    print(
+        f"大小预测: {size_pred}"
+    )
+
+    print(
+        f"单双预测: {odd_pred}"
+    )
+
+    print("\n📈 WalkForward 回测:")
 
     results = walk_forward_backtest(
         draws,
@@ -617,36 +814,52 @@ def print_dashboard(draws):
 
     if results:
 
-        avg_hit = (
-            sum(r["hit"] for r in results)
-            / len(results)
+        avg_hit = round(
+            statistics.mean(
+                r["hit"]
+                for r in results
+            ),
+            4
         )
 
-        special_rate = (
-            sum(r["special_hit"] for r in results)
-            / len(results)
-        ) * 100
+        special_rate = round(
+            (
+                sum(
+                    r["special_hit"]
+                    for r in results
+                )
+                / len(results)
+            ) * 100,
+            2
+        )
+
+        montecarlo = montecarlo_baseline(draws)
 
         print(
-            f"平均命中: {avg_hit:.2f}"
+            f"平均命中: {avg_hit}"
         )
 
         print(
             f"特别号命中率: "
-            f"{special_rate:.2f}%"
+            f"{special_rate}%"
         )
 
-    baseline = montecarlo_baseline(draws)
+        print(
+            f"MonteCarlo基准: "
+            f"{montecarlo}"
+        )
 
-    print(
-        f"\nMonteCarlo随机基准: "
-        f"{baseline:.4f}"
-    )
+        save_analytics(
+            conn,
+            avg_hit,
+            special_rate,
+            montecarlo
+        )
 
-    print("=" * 60)
+    print("=" * 70)
 
 # =========================================================
-# COMMANDS
+# COMMAND
 # =========================================================
 
 def cmd_sync():
@@ -659,7 +872,7 @@ def cmd_sync():
 
     draws = load_draws(conn)
 
-    print_dashboard(draws)
+    print_dashboard(conn, draws)
 
     conn.close()
 
@@ -671,7 +884,7 @@ def cmd_show():
 
     draws = load_draws(conn)
 
-    print_dashboard(draws)
+    print_dashboard(conn, draws)
 
     conn.close()
 
@@ -693,12 +906,15 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "sync":
+
         cmd_sync()
 
     elif args.cmd == "show":
+
         cmd_show()
 
     else:
+
         parser.print_help()
 
 if __name__ == "__main__":
