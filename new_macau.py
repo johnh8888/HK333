@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import ssl
 import json
 import sqlite3
-import urllib.request
+import time
+import traceback
 from collections import Counter
 from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 DB_FILE = "new_macau.db"
 
@@ -67,76 +67,155 @@ def init_db():
     conn.close()
 
 # =========================
-# 获取数据（增强鲁棒性）
+# 通用请求
 # =========================
 
-def fetch_data():
-    """
-    从 marksix6.net 拉取最新开奖数据（通常返回最近120期）
-    失败时打印详细错误并返回空列表
-    """
-    url = "https://marksix6.net/index.php?api=1"
-    ctx = ssl._create_unverified_context()
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
-    }
-
+def request_api(url):
+    """发送请求并返回JSON对象，失败返回None"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    req = Request(url, headers=headers)
     try:
-        req = urllib.request.Request(url, headers=headers)
-        response = urllib.request.urlopen(req, timeout=20, context=ctx)
-        text = response.read().decode("utf-8", errors="ignore")
-        data = json.loads(text)
-
-        rows = []
-        for item in data:
-            issue = str(
-                item.get("expect") or
-                item.get("period") or
-                item.get("issue") or ""
-            )
-            opencode = (
-                item.get("opencode") or
-                item.get("openCode") or ""
-            )
-            nums = re.findall(r"\d+", opencode)
-            if len(nums) < 7:
-                continue
-            nums = list(map(int, nums[:7]))
-            rows.append({"issue": issue, "nums": nums})
-
-        rows.sort(key=lambda x: int(x["issue"]))
-        rows = rows[-120:]  # 保留最近120期，足够策略分析
-
-        if rows:
-            print(f"✅ 网页解析成功: {url}，获取到 {len(rows)} 条记录")
-            return rows
-
+        resp = urlopen(req, timeout=20)
+    except HTTPError as e:
+        print(f"❌ HTTP错误 {url}: {e.code} {e.reason}")
+        return None
+    except URLError as e:
+        print(f"❌ 网络错误 {url}: {e.reason}")
+        return None
     except Exception as e:
-        print(f"❌ 数据源失败: {url} -> {e}")
-    return []
+        print(f"❌ 未知网络错误 {url}: {e}")
+        return None
+
+    if resp.status != 200:
+        print(f"⚠️ 状态码异常 {url}: {resp.status}")
+        return None
+
+    raw = resp.read().decode("utf-8", errors="ignore")
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print(f"❌ JSON解析失败 {url}: {e}")
+        print(f"原始响应前200字符: {raw[:200]}")
+        return None
 
 # =========================
-# 保存数据（去重）
+# 解析单条记录
+# =========================
+
+def parse_record(item):
+    """从API返回的字典中提取一期开奖数据，返回(期号, 号码列表)或None"""
+    issue = str(item.get("expect", "")).strip()
+    opencode = item.get("openCode") or item.get("opencode", "")
+    if not issue or not opencode:
+        return None
+    nums = [int(x) for x in opencode.split(",") if x.strip().isdigit()]
+    if len(nums) != 7:
+        return None
+    draw_date = str(item.get("openTime", "") or item.get("opentime", ""))[:10]
+    return (issue, draw_date, nums)
+
+# =========================
+# 获取最新一期
+# =========================
+
+def fetch_latest():
+    """获取最新一期开奖数据"""
+    url = "https://api3.marksix6.net/lottery_api.php?type=newMacau"
+    payload = request_api(url)
+    if not payload:
+        return None
+
+    # 兼容旧格式(data数组)和新格式(单个对象)
+    data_list = payload.get("data")
+    if isinstance(data_list, list) and data_list:
+        for item in data_list:
+            r = parse_record(item)
+            if r:
+                return r
+    else:
+        return parse_record(payload)
+    return None
+
+# =========================
+# 按期号获取历史
+# =========================
+
+def fetch_by_issue(issue_no):
+    """根据期号拉取单期数据"""
+    url = f"https://api3.marksix6.net/lottery_api.php?type=newMacau&expect={issue_no}"
+    payload = request_api(url)
+    if not payload:
+        return None
+    return parse_record(payload)
+
+# =========================
+# 自动获取最近10期（至少）
+# =========================
+
+def fetch_recent_10(existing_issues=None):
+    """
+    从最新期号开始向前拉取，直到累积至少10条记录或连续失败3次。
+    返回 (issue, draw_date, nums) 列表，按期号升序排列。
+    """
+    if existing_issues is None:
+        existing_issues = set()
+
+    # 获取最新期作为基准
+    latest = fetch_latest()
+    if not latest:
+        print("⚠️ 无法获取最新期号，历史拉取中断")
+        return []
+
+    records = [latest]
+    current_issue = int(latest[0]) - 1
+    fails = 0
+
+    # 如果最新期已在库中，且数据库已有>=10条，就不再拉取
+    if latest[0] in existing_issues:
+        print("📌 最新期已存在，不再重复拉取历史")
+        return []
+
+    while len(records) < 10 and fails < 3:
+        # 跳过已存在的期号
+        if str(current_issue) in existing_issues:
+            current_issue -= 1
+            continue
+
+        rec = fetch_by_issue(current_issue)
+        if rec:
+            records.append(rec)
+            fails = 0
+            print(f"   ✅ 期号 {rec[0]} 拉取成功")
+        else:
+            fails += 1
+            print(f"   ⚠️ 期号 {current_issue} 无数据或请求失败")
+
+        current_issue -= 1
+        time.sleep(0.5)  # 礼貌间隔
+
+    # 按期号升序排列
+    records.sort(key=lambda x: int(x[0]))
+    return records
+
+# =========================
+# 保存数据
 # =========================
 
 def save_records(rows):
     conn = sqlite3.connect(DB_FILE)
     new_count = 0
-    for row in rows:
-        issue = row["issue"]
-        nums = row["nums"]
-        exists = conn.execute("SELECT issue FROM lottery WHERE issue=?", (issue,)).fetchone()
+    for r in rows:
+        issue, draw_date, nums = r
+        exists = conn.execute(
+            "SELECT issue FROM lottery WHERE issue=?",
+            (issue,)
+        ).fetchone()
         if exists:
             continue
-        conn.execute("""
-        INSERT INTO lottery VALUES(?,?,?,?,?,?,?,?)
-        """, (issue, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6]))
+        conn.execute(
+            "INSERT INTO lottery VALUES(?,?,?,?,?,?,?,?)",
+            (issue, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6])
+        )
         new_count += 1
     conn.commit()
     conn.close()
@@ -186,7 +265,7 @@ def get_attrs(n):
     return f"{ds}/{dx} {hds}/{hdx} {tw} {color} {element}"
 
 # =========================
-# 选号策略（增加空数据保护）
+# 选号策略
 # =========================
 
 def hot_strategy(hist):
@@ -245,9 +324,7 @@ def pattern_strategy(hist):
     if len(hist) < 1:
         return None, None
     latest = hist[-1][1:7]
-    main = list(latest[:6])
-    sp = latest[0]
-    return main, sp
+    return list(latest[:6]), latest[0]
 
 # =========================
 # 波色预测
@@ -334,28 +411,35 @@ def show_strategy(name, main, sp):
 def sync():
     init_db()
 
-    # 1. 尝试在线拉取数据
-    rows = fetch_data()
-    if rows:
-        new_count = save_records(rows)
-        print(f"📦 本次保存 {new_count} 条新记录")
-    else:
-        print("⚠️ 未获取到在线数据，将使用本地数据库进行分析")
+    # 1. 获取数据库中已有期号集合
+    conn = sqlite3.connect(DB_FILE)
+    existing = {row[0] for row in conn.execute("SELECT issue FROM lottery").fetchall()}
+    conn.close()
 
-    # 2. 获取历史记录
+    print(f"📊 当前数据库已有 {len(existing)} 期数据")
+
+    # 2. 自动补全历史（如果不足10期，拉取最近10期；否则只拉最新一期）
+    if len(existing) < 10:
+        print("🔍 数据不足10期，尝试在线拉取最近10期历史...")
+        records = fetch_recent_10(existing)
+    else:
+        # 正常只拉最新一期
+        latest = fetch_latest()
+        records = [latest] if latest else []
+
+    if records:
+        new_count = save_records(records)
+        print(f"✅ 本次保存 {new_count} 条新记录")
+    else:
+        print("⚠️ 未获取到新数据，将基于现有数据库进行分析")
+
+    # 3. 获取历史并预测
     hist = get_history()
     total = len(hist)
-    print(f"📊 当前数据库共有 {total} 期数据")
-
     if total == 0:
         print("❌ 数据库无任何开奖记录，无法生成预测")
         return
 
-    # 3. 自动补全建议（首次运行后通常已有足够数据）
-    if total < 10:
-        print("🔍 历史数据不足10期，预测准确性可能较低，请等待定时任务自动积累。")
-
-    # 4. 输出最新开奖及预测
     latest = hist[-1]
     issue_next = int(latest[0]) + 1
 
@@ -365,7 +449,7 @@ def sync():
           f" + {latest[7]:02d}")
     print(f"\n预测期号: {issue_next}")
 
-    # 各策略推荐
+    # 策略输出
     h_main, h_sp = hot_strategy(hist)
     c_main, c_sp = cold_strategy(hist)
     m_main, m_sp = momentum_strategy(hist)
