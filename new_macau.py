@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import ssl
 import json
 import sqlite3
 import urllib.request
+import ssl
 import sys
 from collections import Counter
 
-DB_PATH = "macau.db"
+DB_FILE = "new_macau.db"
+
+# =========================================
+# 波色
+# =========================================
 
 RED = {
     1, 2, 7, 8, 12, 13, 18, 19,
@@ -29,20 +31,80 @@ GREEN = {
     43, 44, 49
 }
 
-ELEMENT = {
-    "金": [4,5,12,13,26,27,34,35,48,49],
-    "木": [3,8,17,18,25,30,39,40,47],
-    "水": [2,9,10,23,24,31,32,45,46],
-    "火": [1,14,15,22,29,36,37,44],
-    "土": [6,7,11,16,19,20,21,28,33,38,41,42,43]
+# =========================================
+# 五行
+# =========================================
+
+ELEMENT_MAP = {
+    "金": {1, 2, 15, 16, 23, 24, 31, 32, 45, 46},
+    "木": {5, 6, 13, 14, 21, 22, 35, 36, 43, 44},
+    "水": {3, 4, 11, 12, 19, 20, 27, 28, 41, 42, 49},
+    "火": {7, 8, 17, 18, 25, 26, 33, 34, 47, 48},
+    "土": {9, 10, 29, 30, 37, 38, 39, 40}
 }
 
-def init_db():
+# =========================================
+# 工具
+# =========================================
 
-    conn = sqlite3.connect(DB_PATH)
+def get_color(n):
+    if n in RED:
+        return "红"
+    if n in BLUE:
+        return "蓝"
+    return "绿"
+
+
+def get_element(n):
+    for k, v in ELEMENT_MAP.items():
+        if n in v:
+            return k
+    return "土"
+
+
+def get_big_small(n):
+    return "大" if n >= 25 else "小"
+
+
+def get_odd_even(n):
+    return "双" if n % 2 == 0 else "单"
+
+
+def get_sum_type(n):
+    s = sum(map(int, str(n)))
+    return "合双" if s % 2 == 0 else "合单"
+
+
+def get_sum_big_small(n):
+    s = sum(map(int, str(n)))
+    return "合大" if s >= 7 else "合小"
+
+
+def get_tail_big_small(n):
+    t = n % 10
+    return "尾大" if t >= 5 else "尾小"
+
+
+def special_info(n):
+    return (
+        f"{get_odd_even(n)}/"
+        f"{get_big_small(n)} "
+        f"{get_sum_type(n)}/"
+        f"{get_sum_big_small(n)} "
+        f"{get_tail_big_small(n)} "
+        f"{get_color(n)} "
+        f"{get_element(n)}"
+    )
+
+# =========================================
+# 数据库
+# =========================================
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS lottery(
+    CREATE TABLE IF NOT EXISTS lottery (
         issue TEXT PRIMARY KEY,
         n1 INTEGER,
         n2 INTEGER,
@@ -57,299 +119,271 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_color(num):
-
-    if num in RED:
-        return "红"
-
-    if num in BLUE:
-        return "蓝"
-
-    return "绿"
-
-def get_element(num):
-
-    for k,v in ELEMENT.items():
-
-        if num in v:
-            return k
-
-    return "土"
-
-def get_attrs(num):
-
-    ds = "单" if num % 2 else "双"
-
-    dx = "大" if num >= 25 else "小"
-
-    hs = sum(int(x) for x in str(num))
-
-    hds = "合单" if hs % 2 else "合双"
-
-    hdx = "合大" if hs >= 7 else "合小"
-
-    tail = num % 10
-
-    tw = "尾大" if tail >= 5 else "尾小"
-
-    color = get_color(num)
-
-    element = get_element(num)
-
-    return f"{ds}/{dx} {hds}/{hdx} {tw} {color} {element}"
+# =========================================
+# API抓取
+# =========================================
 
 def fetch_data():
 
     url = "https://marksix6.net/index.php?api=1"
 
-    try:
+    ctx = ssl._create_unverified_context()
 
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Cache-Control": "no-cache"
-            }
-        )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Cache-Control": "no-cache"
+        }
+    )
 
-        ctx = ssl._create_unverified_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=20) as r:
+        data = json.loads(r.read().decode())
 
-        response = urllib.request.urlopen(
-            req,
-            timeout=20,
-            context=ctx
-        )
+    print(f"API获取成功: {url}")
 
-        raw = response.read().decode("utf-8")
+    records = []
 
-        data = json.loads(raw)
+    for item in data["lottery_data"]:
 
-        lotteries = data.get("lottery_data", [])
+        history = item.get("history", [])
 
-        rows = []
+        for row in history:
 
-        for lottery in lotteries:
+            try:
 
-            name = str(
-                lottery.get("name", "")
-            )
+                parts = row.split("|")
 
-            if "新澳门" not in name:
-                continue
+                issue = parts[0].strip()
 
-            issue = str(
-                lottery.get("expect", "")
-            ).strip()
+                nums = parts[1].strip().split(",")
 
-            open_code = str(
-                lottery.get("openCode", "")
-            )
+                nums = [int(x) for x in nums]
 
-            nums = [
-                int(x)
-                for x in re.findall(r"\d+", open_code)
-            ]
+                if len(nums) != 7:
+                    continue
 
-            if len(nums) >= 7:
-
-                rows.append({
+                records.append({
                     "issue": issue,
-                    "nums": nums[:7]
+                    "numbers": nums[:6],
+                    "special": nums[6]
                 })
 
-            histories = lottery.get(
-                "history",
-                []
-            )
+            except:
+                pass
 
-            for h in histories:
+    print(f"抓取到历史数据: {len(records)} 条")
 
-                try:
+    return records
 
-                    line = str(h).strip()
+# =========================================
+# 保存
+# =========================================
 
-                    parts = re.findall(
-                        r"\d+",
-                        line
-                    )
+def save_records(records):
 
-                    if len(parts) < 8:
-                        continue
-
-                    h_issue = parts[0]
-
-                    h_nums = [
-                        int(x)
-                        for x in parts[1:8]
-                    ]
-
-                    rows.append({
-                        "issue": h_issue,
-                        "nums": h_nums
-                    })
-
-                except:
-                    pass
-
-        unique = {}
-
-        for r in rows:
-            unique[r["issue"]] = r
-
-        rows = list(unique.values())
-
-        rows.sort(
-            key=lambda x: int(x["issue"]),
-            reverse=True
-        )
-
-        print(f"API获取成功: {url}")
-        print(f"抓取到历史数据: {len(rows)} 条")
-
-        return rows[:600]
-
-    except Exception as e:
-
-        print(f"API获取失败: {e}")
-
-        return []
-
-def sync():
-
-    init_db()
-
-    rows = fetch_data()
-
-    if not rows:
-
-        print("未抓到真实开奖数据")
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-
-    cur = conn.cursor()
+    conn = sqlite3.connect(DB_FILE)
 
     new_count = 0
 
-    for row in rows:
+    for r in records:
 
-        issue = row["issue"]
-
-        nums = row["nums"]
-
-        exists = cur.execute(
-            "SELECT 1 FROM lottery WHERE issue=?",
-            (issue,)
+        exists = conn.execute(
+            "SELECT issue FROM lottery WHERE issue=?",
+            (r["issue"],)
         ).fetchone()
 
         if exists:
             continue
 
-        cur.execute(
-            """
-            INSERT INTO lottery
-            (
-                issue,
-                n1,n2,n3,n4,n5,n6,special
-            )
-            VALUES (?,?,?,?,?,?,?,?)
-            """,
-            (
-                issue,
-                nums[0],
-                nums[1],
-                nums[2],
-                nums[3],
-                nums[4],
-                nums[5],
-                nums[6]
-            )
+        nums = r["numbers"]
+
+        conn.execute("""
+        INSERT INTO lottery VALUES(
+            ?,?,?,?,?,?,?,?
         )
+        """, (
+            r["issue"],
+            nums[0],
+            nums[1],
+            nums[2],
+            nums[3],
+            nums[4],
+            nums[5],
+            r["special"]
+        ))
 
         new_count += 1
 
     conn.commit()
-
-    total = cur.execute(
-        "SELECT COUNT(*) FROM lottery"
-    ).fetchone()[0]
-
     conn.close()
 
-    print(
-        f"数据同步完成: total={total}, new={new_count}"
-    )
+    return new_count
 
-    predict()
+# =========================================
+# 读取
+# =========================================
 
 def load_records():
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_FILE)
 
     rows = conn.execute("""
-    SELECT
-    issue,n1,n2,n3,n4,n5,n6,special
+    SELECT *
     FROM lottery
-    ORDER BY issue DESC
+    ORDER BY issue
     """).fetchall()
 
     conn.close()
 
-    return rows
+    records = []
 
-def pick_hot(records):
+    for r in rows:
+
+        records.append({
+            "issue": r[0],
+            "numbers": [r[1], r[2], r[3], r[4], r[5], r[6]],
+            "special": r[7]
+        })
+
+    return records
+
+# =========================================
+# 策略
+# =========================================
+
+def hot_strategy(records):
 
     nums = []
 
-    for r in records[:20]:
-        nums += list(r[1:7])
+    for r in records[-20:]:
+        nums.extend(r["numbers"])
 
     c = Counter(nums)
 
-    return [x[0] for x in c.most_common(6)]
+    picks = [x[0] for x in c.most_common(6)]
 
-def pick_cold(records):
+    special = picks[0]
+
+    return picks, special
+
+
+def cold_strategy(records):
 
     nums = []
 
-    for r in records[:50]:
-        nums += list(r[1:7])
+    for r in records[-30:]:
+        nums.extend(r["numbers"])
 
     c = Counter(nums)
 
-    return [x[0] for x in c.most_common()[-6:]]
+    all_nums = set(range(1, 50))
 
-def predict_color(records):
+    miss = []
 
-    recent = records[:10]
+    for n in all_nums:
+        miss.append((n, c.get(n, 0)))
+
+    miss.sort(key=lambda x: x[1])
+
+    picks = [x[0] for x in miss[:6]]
+
+    special = picks[0]
+
+    return picks, special
+
+
+def momentum_strategy(records):
+
+    nums = []
+
+    for r in records[-10:]:
+        nums.extend(r["numbers"])
+
+    c = Counter(nums)
+
+    picks = [x[0] for x in c.most_common(6)]
+
+    special = picks[-1]
+
+    return picks, special
+
+
+def pattern_strategy(records):
+
+    latest = records[-1]
+
+    picks = latest["numbers"][:]
+
+    special = latest["numbers"][0]
+
+    return picks, special
+
+
+def ensemble_strategy(records):
+
+    a, _ = hot_strategy(records)
+    b, _ = momentum_strategy(records)
+
+    mix = list(dict.fromkeys(a + b))
+
+    picks = mix[:6]
+
+    special = picks[0]
+
+    return picks, special
+
+
+def combo_strategy(records):
+
+    a, _ = hot_strategy(records)
+    b, _ = cold_strategy(records)
+
+    mix = list(dict.fromkeys(a[:3] + b[:3]))
+
+    special = mix[0]
+
+    return mix[:6], special
+
+# =========================================
+# 波色预测
+# =========================================
+
+def predict_wave(records):
+
+    recent = records[-10:]
 
     score = {
-        "红":0,
-        "蓝":0,
-        "绿":0
+        "红": 0,
+        "蓝": 0,
+        "绿": 0
     }
 
     weight = 10
 
     for r in recent:
 
-        color = get_color(r[-1])
+        c = get_color(r["special"])
 
-        score[color] += weight
+        score[c] += weight
 
         weight -= 1
 
-    top2 = sorted(
+    s = sorted(
         score.items(),
-        key=lambda x:x[1],
+        key=lambda x: x[1],
         reverse=True
-    )[:2]
+    )
 
-    return top2
+    return s[0], s[1]
 
-def predict_ds(records):
+# =========================================
+# 大小单双预测
+# =========================================
 
-    recent = records[:10]
+def predict_bs_oe(records):
+
+    recent = records[-10:]
 
     big = 0
     small = 0
@@ -359,177 +393,311 @@ def predict_ds(records):
 
     for r in recent:
 
-        s = r[-1]
+        tm = r["special"]
 
-        if s >= 25:
+        if tm >= 25:
             big += 1
         else:
             small += 1
 
-        if s % 2:
-            odd += 1
-        else:
+        if tm % 2 == 0:
             even += 1
+        else:
+            odd += 1
 
-    size_predict = "大" if big >= small else "小"
+    bs = "大" if big >= small else "小"
 
-    odd_even_predict = "单" if odd >= even else "双"
+    oe = "双" if even >= odd else "单"
 
-    return size_predict, odd_even_predict
+    return bs, oe
 
-def backtest_color(records):
+# =========================================
+# 最近10期真实回测
+# =========================================
 
-    hit = 0
-    total = 0
+def backtest_recent_10(records):
 
-    max_miss = 0
-    current_miss = 0
+    if len(records) < 20:
+        return None
 
-    for i in range(10, len(records)-1):
+    test_records = records[-10:]
 
-        recent = records[i-10:i]
+    wave_hit = 0
+    wave_miss = 0
+    wave_max_miss = 0
+
+    bs_hit = 0
+    bs_miss = 0
+    bs_max_miss = 0
+
+    oe_hit = 0
+    oe_miss = 0
+    oe_max_miss = 0
+
+    for i in range(10):
+
+        history = records[: len(records) - 10 + i]
+
+        recent = history[-10:]
+
+        # 波色
 
         score = {
-            "红":0,
-            "蓝":0,
-            "绿":0
+            "红": 0,
+            "蓝": 0,
+            "绿": 0
         }
 
         weight = 10
 
         for r in recent:
 
-            color = get_color(r[-1])
+            c = get_color(r["special"])
 
-            score[color] += weight
+            score[c] += weight
 
             weight -= 1
 
-        top2 = sorted(
+        s = sorted(
             score.items(),
-            key=lambda x:x[1],
+            key=lambda x: x[1],
             reverse=True
-        )[:2]
-
-        predict_colors = [
-            x[0]
-            for x in top2
-        ]
-
-        actual = get_color(
-            records[i-1][-1]
         )
 
-        total += 1
+        pred1 = s[0][0]
+        pred2 = s[1][0]
 
-        if actual in predict_colors:
+        real_tm = test_records[i]["special"]
 
-            hit += 1
+        real_color = get_color(real_tm)
 
-            current_miss = 0
+        if real_color in [pred1, pred2]:
+
+            wave_hit += 1
+
+            wave_miss = 0
 
         else:
 
-            current_miss += 1
+            wave_miss += 1
 
-            max_miss = max(
-                max_miss,
-                current_miss
+            wave_max_miss = max(
+                wave_max_miss,
+                wave_miss
             )
 
-    rate = round(
-        hit * 100 / total,
-        1
-    ) if total else 0
+        # 大小
 
-    return hit,total,rate,max_miss
+        big = 0
+        small = 0
 
-def show_strategy(name, nums, special):
+        for r in recent:
 
-    print(f"  {name}　　　　: {' '.join(f'{x:02d}' for x in nums)} + {special:02d}")
-    print(f"         特码属性: {get_attrs(special)}")
+            if r["special"] >= 25:
+                big += 1
+            else:
+                small += 1
 
-def predict():
+        pred_bs = "大" if big >= small else "小"
+
+        real_bs = "大" if real_tm >= 25 else "小"
+
+        if pred_bs == real_bs:
+
+            bs_hit += 1
+
+            bs_miss = 0
+
+        else:
+
+            bs_miss += 1
+
+            bs_max_miss = max(
+                bs_max_miss,
+                bs_miss
+            )
+
+        # 单双
+
+        odd = 0
+        even = 0
+
+        for r in recent:
+
+            if r["special"] % 2 == 0:
+                even += 1
+            else:
+                odd += 1
+
+        pred_oe = "双" if even >= odd else "单"
+
+        real_oe = "双" if real_tm % 2 == 0 else "单"
+
+        if pred_oe == real_oe:
+
+            oe_hit += 1
+
+            oe_miss = 0
+
+        else:
+
+            oe_miss += 1
+
+            oe_max_miss = max(
+                oe_max_miss,
+                oe_miss
+            )
+
+    return {
+        "wave_hit": wave_hit,
+        "wave_rate": round(wave_hit / 10 * 100, 1),
+        "wave_max_miss": wave_max_miss,
+
+        "bs_hit": bs_hit,
+        "bs_rate": round(bs_hit / 10 * 100, 1),
+        "bs_max_miss": bs_max_miss,
+
+        "oe_hit": oe_hit,
+        "oe_rate": round(oe_hit / 10 * 100, 1),
+        "oe_max_miss": oe_max_miss
+    }
+
+# =========================================
+# 主程序
+# =========================================
+
+def sync():
+
+    init_db()
+
+    data = fetch_data()
+
+    if not data:
+        print("未抓到真实开奖数据")
+        return
+
+    new_count = save_records(data)
 
     records = load_records()
 
-    if len(records) < 20:
+    print(
+        f"数据同步完成: total={len(records)}, new={new_count}"
+    )
 
+    if len(records) < 20:
         print("数据不足")
         return
 
-    latest = records[0]
+    latest = records[-1]
 
-    next_issue = str(
-        int(latest[0]) + 1
+    print(
+        f"最新开奖: {latest['issue']} | "
+        f"{' '.join(f'{x:02d}' for x in latest['numbers'])} "
+        f"+ {latest['special']:02d}"
     )
 
-    print(f"最新开奖: {latest[0]} | {' '.join(f'{x:02d}' for x in latest[1:7])} + {latest[7]:02d}")
+    next_issue = str(int(latest["issue"]) + 1)
 
     print()
-
     print(f"预测期号: {next_issue}")
 
-    hot = pick_hot(records)
+    strategies = {
+        "组合策略": combo_strategy,
+        "冷号回补": cold_strategy,
+        "集成投票": ensemble_strategy,
+        "热号策略": hot_strategy,
+        "近期动量": momentum_strategy,
+        "规律挖掘": pattern_strategy
+    }
 
-    cold = pick_cold(records)
+    for name, func in strategies.items():
 
-    combo = hot[:3] + cold[:3]
+        picks, special = func(records)
 
-    vote = list(dict.fromkeys(
-        hot + cold
-    ))[:6]
+        print(
+            f"  {name}　　　　: "
+            f"{' '.join(f'{x:02d}' for x in picks)} "
+            f"+ {special:02d}"
+        )
 
-    momentum = hot[::-1][:6]
+        print(
+            f"         特码属性: "
+            f"{special_info(special)}"
+        )
 
-    mining = latest[1:7]
-
-    show_strategy("组合策略", combo, combo[0])
-
-    show_strategy("冷号回补", cold, cold[0])
-
-    show_strategy("集成投票", vote, vote[0])
-
-    show_strategy("热号策略", hot, hot[0])
-
-    show_strategy("近期动量", momentum, momentum[0])
-
-    show_strategy("规律挖掘", mining, mining[0])
+    # 波色
 
     print()
 
-    top2 = predict_color(records)
-
-    main_color = top2[0][0]
-    second_color = top2[1][0]
+    main_wave, second_wave = predict_wave(records)
 
     print("🎨 特码波色预测（最近10期真实数据）：")
-    print(f"   主强: {main_color} (得分 {top2[0][1]})   次强: {second_color} (得分 {top2[1][1]})")
+
+    print(
+        f"   主强: {main_wave[0]} "
+        f"(得分 {main_wave[1]})   "
+        f"次强: {second_wave[0]} "
+        f"(得分 {second_wave[1]})"
+    )
+
+    # 大小单双
+
+    bs, oe = predict_bs_oe(records)
 
     print()
-
-    size_predict, odd_even_predict = predict_ds(records)
 
     print("📊 大小单双预测（最近10期真实数据）：")
-    print(f"   大小预测: {size_predict}   单双预测: {odd_even_predict}")
+
+    print(
+        f"   大小预测: {bs}   "
+        f"单双预测: {oe}"
+    )
+
+    # 回测
+
+    bt = backtest_recent_10(records)
 
     print()
 
-    hit,total,rate,max_miss = backtest_color(records)
+    print("📊 历史回测（最近10期真实数据）：")
 
-    print("📊 历史回测（最近10期，二中一真实回测）：")
-    print(f"   二中一命中率: {rate}%")
-    print(f"   最近10期命中: {hit}/{total}")
-    print(f"   最大连空: {max_miss}期")
+    print(
+        f"   波色二中一命中: "
+        f"{bt['wave_hit']}/10   "
+        f"命中率: {bt['wave_rate']}%   "
+        f"最大连空: {bt['wave_max_miss']}期"
+    )
 
-if __name__ == "__main__":
+    print(
+        f"   大小命中: "
+        f"{bt['bs_hit']}/10   "
+        f"命中率: {bt['bs_rate']}%   "
+        f"最大连空: {bt['bs_max_miss']}期"
+    )
+
+    print(
+        f"   单双命中: "
+        f"{bt['oe_hit']}/10   "
+        f"命中率: {bt['oe_rate']}%   "
+        f"最大连空: {bt['oe_max_miss']}期"
+    )
+
+# =========================================
+# main
+# =========================================
+
+def main():
 
     cmd = "sync"
 
-    if len(sys.argv) > 1:
+    if len(sys.argv) >= 2:
         cmd = sys.argv[1]
 
     if cmd == "sync":
         sync()
     else:
-        predict()
+        sync()
+
+
+if __name__ == "__main__":
+    main()
