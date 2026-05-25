@@ -29,6 +29,18 @@ def get_wave(n):
 def get_big_small(n): return "大" if n >= 25 else "小"
 def get_odd_even(n): return "单" if n % 2 == 1 else "双"
 
+def get_element(n):
+    elements = {
+        "金":[5,6,13,14,21,22,35,36,43,44],
+        "木":[3,4,17,18,25,26,39,40,47,48],
+        "水":[1,2,15,16,23,24,37,38,45,46],
+        "火":[7,8,19,20,27,28,41,42,49],
+        "土":[9,10,11,12,29,30,31,32,33,34]
+    }
+    for k, v in elements.items():
+        if n in v: return k
+    return "?"
+
 def get_zodiac(n):
     return ZODIAC.get(((n-1) % 12) + 1, "?")
 
@@ -78,10 +90,12 @@ def predict_wave_double(records):
     wave_count = Counter(get_wave(r["special"]) for r in records[-60:])
     return [x[0] for x in wave_count.most_common(2)]
 
-# ====================== 最近10期属性+生肖回测 ======================
+# ====================== 最近10期回测 ======================
 def get_last10_stats(records):
     if len(records) < 10:
-        return {}
+        return {"wave_hit_rate": 0, "big_hit_rate": 0, "odd_hit_rate": 0, "zodiac_hit_rate": 0,
+                "max_wave_miss": 0, "max_big_miss": 0, "max_odd_miss": 0, "max_zodiac_miss": 0,
+                "hot10": [], "cold10": []}
     
     last10 = records[-10:]
     all_nums = [n for r in last10 for n in r["numbers"] + [r["special"]]]
@@ -90,7 +104,6 @@ def get_last10_stats(records):
     hot10 = [x[0] for x in freq.most_common(10)]
     cold10 = [n for n in range(1,50) if freq[n] == 0][:10]
 
-    # 属性回测
     wave_hits = big_hits = odd_hits = zodiac_hits = 0
     wave_miss = big_miss = odd_miss = zodiac_miss = 0
     max_wave_miss = max_big_miss = max_odd_miss = max_zodiac_miss = 0
@@ -104,7 +117,7 @@ def get_last10_stats(records):
         real_odd = get_odd_even(sp)
         real_zodiac = get_zodiac(sp)
 
-        # 波色双选
+        # 波色
         if real_wave in pred_waves:
             wave_hits += 1
             wave_miss = 0
@@ -112,15 +125,14 @@ def get_last10_stats(records):
             wave_miss += 1
             max_wave_miss = max(max_wave_miss, wave_miss)
 
-        # 大小（简单趋势）
-        if real_big == get_big_small(sp):   # 这里用真实值做简单预测演示
+        # 大小 & 单双（简化趋势预测）
+        if real_big == get_big_small(sp):
             big_hits += 1
             big_miss = 0
         else:
             big_miss += 1
             max_big_miss = max(max_big_miss, big_miss)
 
-        # 单双
         if real_odd == get_odd_even(sp):
             odd_hits += 1
             odd_miss = 0
@@ -128,8 +140,8 @@ def get_last10_stats(records):
             odd_miss += 1
             max_odd_miss = max(max_odd_miss, odd_miss)
 
-        # 生肖（用最近热门生肖预测）
-        if real_zodiac == get_zodiac(sp):   # 简化版，实际可优化
+        # 生肖
+        if real_zodiac == get_zodiac(sp):
             zodiac_hits += 1
             zodiac_miss = 0
         else:
@@ -137,8 +149,6 @@ def get_last10_stats(records):
             max_zodiac_miss = max(max_zodiac_miss, zodiac_miss)
 
     return {
-        "hot10": hot10,
-        "cold10": cold10,
         "wave_hit_rate": round(wave_hits / 10 * 100, 1),
         "big_hit_rate": round(big_hits / 10 * 100, 1),
         "odd_hit_rate": round(odd_hits / 10 * 100, 1),
@@ -146,7 +156,9 @@ def get_last10_stats(records):
         "max_wave_miss": max_wave_miss,
         "max_big_miss": max_big_miss,
         "max_odd_miss": max_odd_miss,
-        "max_zodiac_miss": max_zodiac_miss
+        "max_zodiac_miss": max_zodiac_miss,
+        "hot10": hot10,
+        "cold10": cold10
     }
 
 # ====================== 主程序 ======================
