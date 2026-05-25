@@ -1,13 +1,16 @@
 name: 新澳门彩数据同步与预测
 
-于:
+on:
   schedule:
-    - cron: "0 13,1 * * *"   # 每天 UTC 13:00 和 01:00 运行
-  workflow_dispatch:
+    # 每天 UTC 13:00 和 01:00 执行（对应北京时间 21:00 和 09:00）
+    - cron: "0 13,1 * * *"
+  workflow_dispatch:   # 允许手动触发
 
 jobs:
-  update-predict:
+  update-and-predict:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -17,12 +20,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 下载历史数据库（可选）
+      - name: 下载历史数据库（首次或过期时跳过）
         uses: actions/download-artifact@v4
         with:
           name: macau-db
           path: .
-        continue-on-error: true   # 首次或过期时不会失败
+        continue-on-error: true   # 找不到 artifact 时不中断工作流
 
       - name: 运行预测脚本
         run: python new_macau.py
@@ -32,4 +35,4 @@ jobs:
         with:
           name: macau-db
           path: new_macau.db
-          retention-days: 7   # 保持一周，确保下次运行能下载
+          retention-days: 7   # 保留7天，确保下次运行能下载到
