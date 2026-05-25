@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ========================================================
- 新澳门六合彩 AI 超级预测系统 V22.5（使用原数据源）
+ 新澳门六合彩 AI 超级预测系统 V22.6（原数据源优化版）
 ========================================================
 """
 
@@ -62,7 +62,7 @@ def init_db():
     conn.commit()
     return conn
 
-# ====================== 使用你原来的数据源 ======================
+# ====================== 原数据源 - 增强解析 ======================
 def fetch_real_data():
     print("正在使用原数据源获取新澳门六合彩...")
     url = "https://marksix6.net/index.php?api=1"
@@ -76,45 +76,50 @@ def fetch_real_data():
             data = json.loads(resp.read().decode("utf-8"))
 
         records = []
-        
-        # 最新一期
+
+        # 查找新澳门六合彩
         for item in data.get("lottery_data", []):
-            if "新澳门" in item.get("name", ""):
+            if "新澳门" in item.get("name", "") or "newMacau" in str(item.get("name", "")):
+                # 最新一期
                 open_code = item.get("openCode", "")
-                nums = [int(x.strip()) for x in open_code.split(",") if x.strip().isdigit()]
+                nums = [int(x.strip()) for x in str(open_code).split(",") if x.strip().isdigit()]
                 if len(nums) >= 7:
                     records.append({
                         "issue": str(item.get("expect", "")),
                         "numbers": nums[:6],
                         "special": nums[6]
                     })
-                break
 
-        # 历史数据（尝试解析）
-        for row in data.get("history", []):
-            if isinstance(row, str) and "期：" in row:
-                try:
-                    issue = row.split("期：")[0].strip()
-                    code = row.split("期：")[1]
-                    nums = [int(x.strip()) for x in code.split(",") if x.strip().isdigit()]
-                    if len(nums) >= 7:
-                        records.append({
-                            "issue": issue,
-                            "numbers": nums[:6],
-                            "special": nums[6]
-                        })
-                except:
-                    continue
+                # 关键修复：解析 history 数组
+                for row in item.get("history", []):
+                    if isinstance(row, str) and "期：" in row:
+                        try:
+                            parts = row.split("期：")
+                            issue = parts[0].strip()
+                            code_str = parts[1].strip()
+                            nums = [int(x.strip()) for x in code_str.split(",") if x.strip().isdigit()]
+                            if len(nums) >= 7:
+                                records.append({
+                                    "issue": issue,
+                                    "numbers": nums[:6],
+                                    "special": nums[6]
+                                })
+                        except:
+                            continue
+                break  # 只处理新澳门
 
-        # 去重
-        uniq = {r["issue"]: r for r in records}
+        # 去重并排序
+        uniq = {r["issue"]: r for r in records if r.get("issue")}
         result = sorted(uniq.values(), key=lambda x: str(x["issue"]))
-        
+
         print(f"✅ 原数据源获取成功: {len(result)} 期")
+        if len(result) > 0:
+            print(f"最新期号: {result[-1]['issue']}")
+        
         return result
 
     except Exception as e:
-        print(f"❌ 数据源获取失败: {e}")
+        print(f"❌ 数据获取失败: {e}")
         return []
 
 # ====================== 保存 & 加载 ======================
@@ -137,7 +142,7 @@ def attribute_prediction(records):
     if len(records) < 8:
         return {"wave": "红", "big_small": "大", "odd_even": "单", "element": "火", "zodiac": "马"}
     
-    recent = records[-60:]
+    recent = records[-80:]
     return {
         "wave": Counter(get_wave(r["special"]) for r in recent).most_common(1)[0][0],
         "big_small": Counter(get_big_small(r["special"]) for r in recent).most_common(1)[0][0],
@@ -148,31 +153,31 @@ def attribute_prediction(records):
 
 # ====================== 号码预测 ======================
 def generate_prediction(records):
-    if len(records) < 12:
+    if len(records) < 15:
         print("⚠️ 历史数据不足，使用默认预测")
-        return [5,12,19,26,33,40], 7, 40
+        return [5,12,19,26,33,40], 7, 45
 
     freq = Counter()
-    for r in records[-120:]:
+    for r in records[-150:]:
         for n in r["numbers"] + [r["special"]]:
             freq[n] += 2 if n == r["special"] else 1
 
     pred = [x[0] for x in freq.most_common(6)]
     special = freq.most_common(1)[0][0]
-    confidence = min(85, 35 + len(records)//2)
+    confidence = min(88, 40 + len(records)//3)
     return pred, special, confidence
 
 # ====================== HTML ======================
 def generate_html(records, pred, special, confidence, attr):
     latest = records[-1]
     html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>澳门六合彩 V22.5</title>
+<html><head><meta charset="utf-8"><title>澳门六合彩 V22.6</title>
 <style>
     body{{font-family:Arial;background:#0a0a1f;color:#0f0;padding:25px;}}
     .panel{{background:#1a1a2e;border-radius:12px;padding:20px;margin:15px 0;}}
     .red{{color:#ff6666;}} .blue{{color:#66bbff;}} .green{{color:#66ff99;}}
 </style></head><body>
-<h1>🀄 新澳门六合彩 AI V22.5（原数据源）</h1>
+<h1>🀄 新澳门六合彩 AI V22.6</h1>
 
 <div class="panel"><h2>最新开奖</h2>
 <p>{latest['issue']}<br>
@@ -196,7 +201,7 @@ def generate_html(records, pred, special, confidence, attr):
 
 # ====================== 主程序 ======================
 def main():
-    print("🚀 新澳门六合彩 AI V22.5（原数据源）启动...\n")
+    print("🚀 新澳门六合彩 AI V22.6 启动...\n")
     conn = init_db()
     records = fetch_real_data()
     save_data(conn, records)
