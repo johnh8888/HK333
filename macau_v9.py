@@ -85,7 +85,7 @@ def predict_wave_double(records):
     wave_count = Counter(get_wave(r["special"]) for r in records[-60:])
     return [x[0] for x in wave_count.most_common(2)]
 
-# ====================== 真实最近10期回测 ======================
+# ====================== 真实回测 ======================
 def get_last10_stats(records):
     if len(records) < 11:
         return {"wave_hit_rate":0, "big_hit_rate":0, "odd_hit_rate":0, "zodiac_hit_rate":0,
@@ -93,8 +93,12 @@ def get_last10_stats(records):
                 "hot10":[], "cold10":[]}
     
     last10 = records[-10:]
-    hot10 = []
-    cold10 = []
+    all_nums = [n for r in last10 for n in r["numbers"] + [r["special"]]]
+    freq = Counter(all_nums)
+    
+    hot10 = [x[0] for x in freq.most_common(10)]
+    cold10 = [n for n in range(1,50) if freq[n] == 0][:10]
+
     wave_hits = big_hits = odd_hits = zodiac_hits = 0
     wave_miss = big_miss = odd_miss = zodiac_miss = 0
     max_wave_miss = max_big_miss = max_odd_miss = max_zodiac_miss = 0
@@ -104,14 +108,13 @@ def get_last10_stats(records):
         real = records[i]
         sp = real["special"]
 
-        # 使用过去数据预测
         pred_wave = predict_wave_double(train)
         real_wave = get_wave(sp)
         real_big = get_big_small(sp)
         real_odd = get_odd_even(sp)
         real_zodiac = get_zodiac(sp)
 
-        # 波色
+        # 波色双选
         if real_wave in pred_wave:
             wave_hits += 1
             wave_miss = 0
@@ -119,8 +122,8 @@ def get_last10_stats(records):
             wave_miss += 1
             max_wave_miss = max(max_wave_miss, wave_miss)
 
-        # 大小（用历史趋势简单预测）
-        pred_big = "大" if sum(get_big_small(r["special"])=="大" for r in train[-20:]) > 10 else "小"
+        # 大小（历史趋势）
+        pred_big = "大" if sum(1 for r in train[-20:] if get_big_small(r["special"]) == "大") >= 10 else "小"
         if real_big == pred_big:
             big_hits += 1
             big_miss = 0
@@ -129,7 +132,7 @@ def get_last10_stats(records):
             max_big_miss = max(max_big_miss, big_miss)
 
         # 单双
-        pred_odd = "单" if sum(get_odd_even(r["special"])=="单" for r in train[-20:]) > 10 else "双"
+        pred_odd = "单" if sum(1 for r in train[-20:] if get_odd_even(r["special"]) == "单") >= 10 else "双"
         if real_odd == pred_odd:
             odd_hits += 1
             odd_miss = 0
@@ -137,9 +140,9 @@ def get_last10_stats(records):
             odd_miss += 1
             max_odd_miss = max(max_odd_miss, odd_miss)
 
-        # 生肖（用最近热门生肖）
-        recent_zodiac = Counter(get_zodiac(r["special"]) for r in train[-30:])
-        pred_zodiac = recent_zodiac.most_common(1)[0][0] if recent_zodiac else "鼠"
+        # 生肖
+        recent_z = Counter(get_zodiac(r["special"]) for r in train[-30:])
+        pred_zodiac = recent_z.most_common(1)[0][0] if recent_z else "鼠"
         if real_zodiac == pred_zodiac:
             zodiac_hits += 1
             zodiac_miss = 0
@@ -156,8 +159,8 @@ def get_last10_stats(records):
         "max_big_miss": max_big_miss,
         "max_odd_miss": max_odd_miss,
         "max_zodiac_miss": max_zodiac_miss,
-        "hot10": [x[0] for x in Counter([n for r in last10 for n in r["numbers"]+[r["special"]]]).most_common(10)],
-        "cold10": [n for n in range(1,50) if n not in [x[0] for x in Counter([n for r in last10 for n in r["numbers"]+[r["special"]]]).most_common(20)])][:10]
+        "hot10": hot10,
+        "cold10": cold10
     }
 
 # ====================== 主程序 ======================
