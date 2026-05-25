@@ -1,15 +1,12 @@
-name: 新澳门六合彩预测
+name: 新澳门预测
 
 on:
   workflow_dispatch:
-
   schedule:
-    # 每30分钟运行一次
-    - cron: '*/30 * * * *'
+    - cron: "*/30 * * * *"
 
 jobs:
-
-  predict:
+  run:
 
     runs-on: ubuntu-latest
 
@@ -21,25 +18,18 @@ jobs:
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: 创建数据库目录
+      - name: 运行预测
+        run: python new_macau.py sync
+
+      - name: 提交数据库
         run: |
-          mkdir -p data
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
 
-      - name: 缓存数据库
-        uses: actions/cache@v4
-        with:
-          path: |
-            new_macau.db
-          key: new-macau-db-v1
+          git add .
 
-      - name: 运行新澳门预测
-        run: |
-          python new_macau.py sync
+          git commit -m "update" || echo "no changes"
 
-      - name: 上传数据库
-        uses: actions/upload-artifact@v4
-        with:
-          name: new-macau-db
-          path: new_macau.db
+          git push
