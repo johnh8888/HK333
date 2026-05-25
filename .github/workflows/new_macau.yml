@@ -2,17 +2,20 @@ name: 新澳门六合彩预测
 
 on:
   workflow_dispatch:
+
   schedule:
-    # 北京时间每30分钟运行
+    # 每30分钟运行一次
     - cron: '*/30 * * * *'
 
 jobs:
+
   predict:
+
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: 拉取仓库
+      - name: 拉取代码
         uses: actions/checkout@v4
 
       - name: 安装 Python
@@ -29,7 +32,7 @@ jobs:
         with:
           path: |
             new_macau.db
-          key: new-macau-db
+          key: new-macau-db-v1
 
       - name: 运行新澳门预测
         run: |
