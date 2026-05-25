@@ -304,6 +304,81 @@ def ensemble_with_weights(records, strategy_weights):
     return [n for n, _ in ranked], ranked[0][0]
 
 
+# ----------------- 波色回测 -----------------
+def backtest_wave(records):
+    """最近10期波色二中一回测，返回 (命中次数, 总次数, 最大连空)"""
+    recent = records[-10:]
+    hit = total = 0
+    max_miss = miss = 0
+    for i in range(2, len(recent)):
+        hist = recent[:i]
+        # 计算当前历史数据的波色预测
+        specials = [r["special"] for r in hist]
+        if len(specials) < 3:
+            continue
+        score = {"红": 0, "蓝": 0, "绿": 0}
+        w = len(specials)
+        for sp in reversed(specials):
+            score[get_wave(sp)] += w
+            w -= 1
+        sorted_wave = sorted(score.items(), key=lambda x: x[1], reverse=True)
+        main_color = sorted_wave[0][0]
+        second_color = sorted_wave[1][0] if len(sorted_wave) > 1 else main_color
+
+        actual = get_wave(recent[i]["special"])
+        total += 1
+        if actual in (main_color, second_color):
+            hit += 1
+            miss = 0
+        else:
+            miss += 1
+            max_miss = max(max_miss, miss)
+    return hit, total, max_miss
+
+
+# ----------------- 大小单双回测 -----------------
+def backtest_size_odd(records):
+    """最近10期大小单双回测，返回 (大小命中, 单双命中, 总次数, 大小最大连空, 单双最大连空)"""
+    recent = records[-10:]
+    size_hit = odd_hit = 0
+    size_miss = odd_miss = 0
+    size_max = odd_max = 0
+    total = 0
+    for i in range(2, len(recent)):
+        hist = recent[:i]
+        specials = [r["special"] for r in hist]
+        if len(specials) < 2:
+            continue
+        # 简单多数预测
+        big = sum(1 for sp in specials if sp >= 25)
+        small = len(specials) - big
+        size_pred = "大" if big >= small else "小"
+        odd = sum(1 for sp in specials if sp % 2)
+        even = len(specials) - odd
+        odd_pred = "单" if odd >= even else "双"
+
+        real = recent[i]["special"]
+        total += 1
+        real_size = "大" if real >= 25 else "小"
+        real_odd = "单" if real % 2 else "双"
+
+        if size_pred == real_size:
+            size_hit += 1
+            size_miss = 0
+        else:
+            size_miss += 1
+            size_max = max(size_max, size_miss)
+
+        if odd_pred == real_odd:
+            odd_hit += 1
+            odd_miss = 0
+        else:
+            odd_miss += 1
+            odd_max = max(odd_max, odd_miss)
+
+    return size_hit, odd_hit, total, size_max, odd_max
+
+
 # ----------------- 主逻辑 -----------------
 def sync():
     init_db()
@@ -366,16 +441,24 @@ def sync():
         if ens_special:
             print(f"         特码属性: {special_text(ens_special)}")
 
-    # 4. 波色预测
+    # 4. 波色预测与回测
     if len(all_records) >= 10:
         specials = [r["special"] for r in all_records[-10:]]
         scores = defaultdict(int)
         for i, sp in enumerate(reversed(specials)):
             scores[get_wave(sp)] += 10 - i
         sorted_wave = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        print("\n🎨 特码波色预测（加权）:")
+        print("\n🎨 特码波色预测（加权，基于最近10期）:")
         print(f"   主强: {sorted_wave[0][0]} (得分 {sorted_wave[0][1]})   "
               f"次强: {sorted_wave[1][0]} (得分 {sorted_wave[1][1]})")
+
+        # 波色回测
+        wave_hit, wave_total, wave_max_miss = backtest_wave(all_records)
+        if wave_total > 0:
+            print(f"\n📊 最近10期波色回测（二中一）:")
+            print(f"   命中: {wave_hit}/{wave_total}")
+            print(f"   命中率: {round(wave_hit/wave_total*100, 1)}%")
+            print(f"   最大连空: {wave_max_miss}期")
 
         # 大小单双预测
         recent_specials = [r["special"] for r in all_records[-10:]]
@@ -385,9 +468,17 @@ def sync():
             else: small += 1
             if sp % 2: odd += 1
             else: even += 1
-        print("📊 大小单双预测:")
+        print("\n📊 大小单双预测（基于最近10期）:")
         print(f"   大小: {'大' if big >= small else '小'}   单双: {'单' if odd >= even else '双'}")
 
+        # 大小单双回测
+        size_hit, odd_hit, ds_total, size_max, odd_max = backtest_size_odd(all_records)
+        if ds_total > 0:
+            print(f"\n📊 最近10期大小单双回测:")
+            print(f"   大小命中: {size_hit}/{ds_total} (命中率 {round(size_hit/ds_total*100,1)}%)")
+            print(f"   大小最大连空: {size_max}期")
+            print(f"   单双命中: {odd_hit}/{ds_total} (命中率 {round(odd_hit/ds_total*100,1)}%)")
+            print(f"   单双最大连空: {odd_max}期")
     else:
         print("\n波色预测数据不足")
 
