@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ========================================================
- 新澳门六合彩 AI 超级预测系统 V23.5（生肖回测版）
+ 新澳门六合彩 AI 超级预测系统 V23.6（真实回测版）
 ========================================================
 """
 
@@ -30,14 +30,9 @@ def get_big_small(n): return "大" if n >= 25 else "小"
 def get_odd_even(n): return "单" if n % 2 == 1 else "双"
 
 def get_element(n):
-    elements = {
-        "金":[5,6,13,14,21,22,35,36,43,44],
-        "木":[3,4,17,18,25,26,39,40,47,48],
-        "水":[1,2,15,16,23,24,37,38,45,46],
-        "火":[7,8,19,20,27,28,41,42,49],
-        "土":[9,10,11,12,29,30,31,32,33,34]
-    }
-    for k, v in elements.items():
+    elements = {"金":[5,6,13,14,21,22,35,36,43,44],"木":[3,4,17,18,25,26,39,40,47,48],
+                "水":[1,2,15,16,23,24,37,38,45,46],"火":[7,8,19,20,27,28,41,42,49],"土":[9,10,11,12,29,30,31,32,33,34]}
+    for k,v in elements.items():
         if n in v: return k
     return "?"
 
@@ -90,58 +85,62 @@ def predict_wave_double(records):
     wave_count = Counter(get_wave(r["special"]) for r in records[-60:])
     return [x[0] for x in wave_count.most_common(2)]
 
-# ====================== 最近10期回测 ======================
+# ====================== 真实最近10期回测 ======================
 def get_last10_stats(records):
-    if len(records) < 10:
-        return {"wave_hit_rate": 0, "big_hit_rate": 0, "odd_hit_rate": 0, "zodiac_hit_rate": 0,
-                "max_wave_miss": 0, "max_big_miss": 0, "max_odd_miss": 0, "max_zodiac_miss": 0,
-                "hot10": [], "cold10": []}
+    if len(records) < 11:
+        return {"wave_hit_rate":0, "big_hit_rate":0, "odd_hit_rate":0, "zodiac_hit_rate":0,
+                "max_wave_miss":0, "max_big_miss":0, "max_odd_miss":0, "max_zodiac_miss":0,
+                "hot10":[], "cold10":[]}
     
     last10 = records[-10:]
-    all_nums = [n for r in last10 for n in r["numbers"] + [r["special"]]]
-    freq = Counter(all_nums)
-    
-    hot10 = [x[0] for x in freq.most_common(10)]
-    cold10 = [n for n in range(1,50) if freq[n] == 0][:10]
-
+    hot10 = []
+    cold10 = []
     wave_hits = big_hits = odd_hits = zodiac_hits = 0
     wave_miss = big_miss = odd_miss = zodiac_miss = 0
     max_wave_miss = max_big_miss = max_odd_miss = max_zodiac_miss = 0
 
-    pred_waves = predict_wave_double(records)
+    for i in range(len(records)-10, len(records)):
+        train = records[:i]
+        real = records[i]
+        sp = real["special"]
 
-    for r in last10:
-        sp = r["special"]
+        # 使用过去数据预测
+        pred_wave = predict_wave_double(train)
         real_wave = get_wave(sp)
         real_big = get_big_small(sp)
         real_odd = get_odd_even(sp)
         real_zodiac = get_zodiac(sp)
 
         # 波色
-        if real_wave in pred_waves:
+        if real_wave in pred_wave:
             wave_hits += 1
             wave_miss = 0
         else:
             wave_miss += 1
             max_wave_miss = max(max_wave_miss, wave_miss)
 
-        # 大小 & 单双（简化趋势预测）
-        if real_big == get_big_small(sp):
+        # 大小（用历史趋势简单预测）
+        pred_big = "大" if sum(get_big_small(r["special"])=="大" for r in train[-20:]) > 10 else "小"
+        if real_big == pred_big:
             big_hits += 1
             big_miss = 0
         else:
             big_miss += 1
             max_big_miss = max(max_big_miss, big_miss)
 
-        if real_odd == get_odd_even(sp):
+        # 单双
+        pred_odd = "单" if sum(get_odd_even(r["special"])=="单" for r in train[-20:]) > 10 else "双"
+        if real_odd == pred_odd:
             odd_hits += 1
             odd_miss = 0
         else:
             odd_miss += 1
             max_odd_miss = max(max_odd_miss, odd_miss)
 
-        # 生肖
-        if real_zodiac == get_zodiac(sp):
+        # 生肖（用最近热门生肖）
+        recent_zodiac = Counter(get_zodiac(r["special"]) for r in train[-30:])
+        pred_zodiac = recent_zodiac.most_common(1)[0][0] if recent_zodiac else "鼠"
+        if real_zodiac == pred_zodiac:
             zodiac_hits += 1
             zodiac_miss = 0
         else:
@@ -157,13 +156,13 @@ def get_last10_stats(records):
         "max_big_miss": max_big_miss,
         "max_odd_miss": max_odd_miss,
         "max_zodiac_miss": max_zodiac_miss,
-        "hot10": hot10,
-        "cold10": cold10
+        "hot10": [x[0] for x in Counter([n for r in last10 for n in r["numbers"]+[r["special"]]]).most_common(10)],
+        "cold10": [n for n in range(1,50) if n not in [x[0] for x in Counter([n for r in last10 for n in r["numbers"]+[r["special"]]]).most_common(20)])][:10]
     }
 
 # ====================== 主程序 ======================
 def main():
-    print("🚀 新澳门六合彩 AI V23.5（生肖回测版）启动...\n")
+    print("🚀 新澳门六合彩 AI V23.6（真实回测版）启动...\n")
     
     conn = init_db()
     new_records = fetch_real_data()
@@ -186,7 +185,7 @@ def main():
     print(f"• 波色双选：{' + '.join(pred_waves)}")
     print(f"• 属性：{get_wave(special)} {get_big_small(special)} {get_odd_even(special)} {get_element(special)} {get_zodiac(special)}\n")
 
-    print("📊 最近10期属性回测统计:")
+    print("📊 最近10期真实回测统计:")
     print(f"波色双选命中率: {stats['wave_hit_rate']}%   (最大连空: {stats['max_wave_miss']} 期)")
     print(f"大小命中率: {stats['big_hit_rate']}%       (最大连空: {stats['max_big_miss']} 期)")
     print(f"单双命中率: {stats['odd_hit_rate']}%       (最大连空: {stats['max_odd_miss']} 期)")
