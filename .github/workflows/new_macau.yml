@@ -1,47 +1,45 @@
-name: 新澳门六合彩自动预测
+name: 新澳门彩数据同步与预测
 
 on:
   schedule:
-    - cron: '0 14 * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    # 每天 UTC 时间 13:00 和 01:00 运行（对应北京时间 21:00 和 09:00，可自行调整）
+    - cron: "0 13,1 * * *"
+  workflow_dispatch:   # 允许手动触发
+  push:
+    branches:
+      - main           # 当 main 分支有推送时也运行（可根据需要修改或删除）
 
 jobs:
-  predict:
+  update-and-predict:
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # 最长运行10分钟，避免网络超时挂死
 
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: 安装依赖
-        run: |
-          pip install requests pandas numpy
+      - name: 安装依赖（脚本无额外依赖，此步可选）
+        run: pip install --upgrade pip
 
-      - name: 删除旧数据库
-        run: rm -f new_macau.db
+      - name: 运行数据同步与预测
+        run: python new_macau.py
 
-      - name: 执行预测
-        run: python new_macau.py sync
-
-      - name: 提交数据库
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add .
-
-          git commit -m "🤖 自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
-
-          git push
-
-      - name: 上传数据库
+      - name: 上传数据库文件作为构件（可选，便于下载查看）
         uses: actions/upload-artifact@v4
         with:
           name: new-macau-db
           path: new_macau.db
+          retention-days: 3   # 保留3天
+
+      - name: 上传运行日志（可选）
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log
+          path: ${{ runner.temp }}/run.log
+          retention-days: 3
+        if: always()   # 即使失败也保留日志
