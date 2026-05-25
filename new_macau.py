@@ -3,538 +3,767 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import random
 import sqlite3
-import traceback
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
-
-# =========================================================
-# 基础配置
-# =========================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH = str(SCRIPT_DIR / "new_macau.db")
+DB_PATH = SCRIPT_DIR / "new_macau.db"
 
-# 新澳门彩真实数据源
-DATA_URL = "https://api3.marksix6.net/lottery_api.php?type=newMacau"
+# =========================
+# 新澳门彩真实接口
+# =========================
+
+API_URLS = [
+    "https://api3.marksix6.net/lottery_api.php?type=newMacau",
+    "https://marksix6.net/index.php?api=1"
+]
 
 ALL_NUMBERS = list(range(1, 50))
 
-STRATEGY_LABELS = {
-    "balanced_v1": "组合策略",
-    "hot_v1": "热号策略",
-    "cold_rebound_v1": "冷号回补",
-    "momentum_v1": "近期动量",
-    "ensemble_v2": "集成投票",
-}
+# =========================
+# 真实波色映射
+# =========================
 
-STRATEGY_IDS = [
-    "balanced_v1",
-    "hot_v1",
-    "cold_rebound_v1",
-    "momentum_v1",
-    "ensemble_v2",
-]
-
-# =========================================================
-# 数据结构
-# =========================================================
-
-@dataclass
-class DrawRecord:
-    issue_no: str
-    draw_date: str
-    numbers: List[int]
-    special_number: int
-
-
-# =========================================================
-# 波色映射（真实六合彩）
-# =========================================================
-
-RED_WAVE = {
+RED = {
     1, 2, 7, 8, 12, 13, 18, 19,
     23, 24, 29, 30, 34, 35, 40,
     45, 46
 }
 
-BLUE_WAVE = {
+BLUE = {
     3, 4, 9, 10, 14, 15, 20,
     25, 26, 31, 36, 37, 41,
     42, 47, 48
 }
 
-GREEN_WAVE = {
-    5, 6, 11, 16, 17, 21, 22,
-    27, 28, 32, 33, 38, 39,
-    43, 44, 49
+GREEN = {
+    5, 6, 11, 16, 17, 21,
+    22, 27, 28, 32, 33,
+    38, 39, 43, 44, 49
 }
 
 
-def get_color(num: int) -> str:
-    if num in RED_WAVE:
+# =========================
+# 波色
+# =========================
+
+def get_color(n):
+
+    if n in RED:
         return "红"
-    if num in BLUE_WAVE:
+
+    if n in BLUE:
         return "蓝"
+
     return "绿"
 
 
-# =========================================================
-# 特码属性
-# =========================================================
-
-def special_attributes(num: int):
-    odd_even = "单" if num % 2 else "双"
-    big_small = "大" if num >= 25 else "小"
-
-    if num % 10 in [1, 6]:
-        element = "水"
-    elif num % 10 in [2, 7]:
-        element = "火"
-    elif num % 10 in [3, 8]:
-        element = "木"
-    elif num % 10 in [4, 9]:
-        element = "金"
-    else:
-        element = "土"
-
-    return {
-        "单双": odd_even,
-        "大小": big_small,
-        "色波": get_color(num),
-        "五行": element
-    }
-
-
-# =========================================================
+# =========================
 # 数据库
-# =========================================================
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
-
+# =========================
 
 def connect_db():
+
     conn = sqlite3.connect(DB_PATH)
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
 def init_db(conn):
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS draws (
-        issue_no TEXT PRIMARY KEY,
-        draw_date TEXT,
-        numbers_json TEXT,
-        special_number INTEGER,
-        created_at TEXT
-    );
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS draws(
+        issue TEXT PRIMARY KEY,
+        numbers TEXT,
+        special INTEGER,
+        created TEXT
+    )
     """)
+
     conn.commit()
 
 
-# =========================================================
-# 真实数据获取（兼容新 API 格式）
-# =========================================================
+# =========================
+# 在线获取JSON
+# =========================
 
-def fetch_real_data():
-    """拉取真实开奖数据，兼容数组和单对象两种格式"""
+def load_json(url):
+
     req = Request(
-        DATA_URL,
-        headers={"User-Agent": "Mozilla/5.0"}
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        }
     )
-    try:
-        resp = urlopen(req, timeout=20)
-    except HTTPError as e:
-        print(f"❌ HTTP错误: {e.code} {e.reason}")
-        return []
-    except URLError as e:
-        print(f"❌ 网络错误: {e.reason}")
-        return []
-    except Exception as e:
-        print(f"❌ 未知网络错误: {e}")
-        return []
 
-    if resp.status != 200:
-        print(f"⚠️ 状态码异常: {resp.status}")
-        return []
+    with urlopen(req, timeout=20) as r:
 
-    raw = resp.read().decode("utf-8")
-    try:
-        payload = json.loads(raw)
-    except Exception as e:
-        print(f"❌ JSON解析失败: {e}")
-        print(f"原始响应前200字符: {raw[:200]}")
-        return []
+        text = r.read().decode(
+            "utf-8",
+            "ignore"
+        )
 
-    # ---- 新增：兼容两种格式 ----
+    return json.loads(text)
+
+
+# =========================
+# 解析接口
+# =========================
+
+def parse_records(payload):
+
+    data = []
+
+    # 直接数组
+    if isinstance(payload, list):
+
+        data = payload
+
+    # dict
+    elif isinstance(payload, dict):
+
+        if "data" in payload:
+
+            data = payload["data"]
+
+        elif "result" in payload:
+
+            data = payload["result"]
+
+        elif "list" in payload:
+
+            data = payload["list"]
+
+        elif "lottery_data" in payload:
+
+            for item in payload["lottery_data"]:
+
+                name = str(
+                    item.get("name", "")
+                )
+
+                # 只要新澳门彩
+                if "新澳门" not in name:
+                    continue
+
+                history = item.get(
+                    "history",
+                    []
+                )
+
+                for row in history:
+
+                    try:
+
+                        left, right = row.split("期：")
+
+                        issue = left.strip()
+
+                        nums = [
+                            int(x)
+                            for x in right.split(",")
+                        ]
+
+                        if len(nums) != 7:
+                            continue
+
+                        data.append({
+                            "issue": issue,
+                            "numbers": nums
+                        })
+
+                    except:
+                        pass
+
     records = []
 
-    # 格式1：旧版，包含 "data" 数组
-    data_list = payload.get("data")
-    if isinstance(data_list, list) and data_list:
-        print("📦 检测到数组格式数据，记录数:", len(data_list))
-        for item in data_list:
-            try:
-                issue = str(item.get("expect", "")).strip()
-                opencode = item.get("opencode", "")
-                nums = [int(x) for x in opencode.split(",")]
-                if len(nums) != 7:
-                    continue
-                draw_date = str(item.get("opentime", ""))[:10]
-                records.append(
-                    DrawRecord(
-                        issue_no=issue,
-                        draw_date=draw_date,
-                        numbers=nums[:6],
-                        special_number=nums[6]
-                    )
-                )
-            except Exception:
-                print(f"⚠️ 解析单条数据失败: {item}")
-                traceback.print_exc()
+    for row in data:
+
+        try:
+
+            issue = str(
+                row.get("issue")
+                or row.get("expect")
+                or row.get("term")
+                or row.get("draw")
+                or row.get("drawNo")
+            )
+
+            nums = (
+                row.get("numbers")
+                or row.get("openCode")
+                or row.get("code")
+                or row.get("result")
+            )
+
+            if isinstance(nums, str):
+
+                nums = nums.replace(
+                    "+",
+                    ","
+                ).split(",")
+
+            nums = [
+                int(x)
+                for x in nums
+            ]
+
+            if len(nums) != 7:
                 continue
-    else:
-        # 格式2：新版，整个对象直接就是最新一期开奖
-        if "openCode" in payload and "expect" in payload:
-            print("📦 检测到单对象格式数据")
-            try:
-                issue = str(payload.get("expect", "")).strip()
-                opencode = payload.get("openCode", "")
-                nums = [int(x) for x in opencode.split(",")]
-                if len(nums) == 7:
-                    draw_date = str(payload.get("openTime", ""))[:10]
-                    records.append(
-                        DrawRecord(
-                            issue_no=issue,
-                            draw_date=draw_date,
-                            numbers=nums[:6],
-                            special_number=nums[6]
-                        )
-                    )
-                else:
-                    print(f"⚠️ 号码数量异常: {opencode}")
-            except Exception:
-                print("⚠️ 解析单对象失败")
-                traceback.print_exc()
-        else:
-            print("⚠️ 无法识别API返回格式，完整响应:", json.dumps(payload, ensure_ascii=False)[:500])
+
+            records.append({
+                "issue": issue,
+                "nums": nums[:6],
+                "special": nums[6]
+            })
+
+        except:
+            pass
 
     return records
 
 
-# =========================================================
-# 保存数据
-# =========================================================
+# =========================
+# 获取真实数据
+# =========================
 
-def save_records(conn, records):
-    now = utc_now()
-    count = 0
+def fetch_real_data():
+
+    for url in API_URLS:
+
+        try:
+
+            payload = load_json(url)
+
+            records = parse_records(payload)
+
+            if records:
+
+                return records
+
+        except Exception as e:
+
+            print(
+                f"接口失败: {url} -> {e}"
+            )
+
+    return []
+
+
+# =========================
+# 获取最近10期在线数据
+# =========================
+
+def get_recent_online_10():
+
+    records = fetch_real_data()
+
+    if not records:
+        return []
+
+    cleaned = []
+
+    seen = set()
+
     for r in records:
-        conn.execute("""
-        INSERT OR REPLACE INTO draws
-        VALUES (?,?,?,?,?)
-        """, (
-            r.issue_no,
-            r.draw_date,
-            json.dumps(r.numbers),
-            r.special_number,
-            now
-        ))
-        count += 1
-    conn.commit()
-    return count
 
+        issue = str(r["issue"])
 
-# =========================================================
-# 预测
-# =========================================================
+        if issue in seen:
+            continue
 
-def predict_color_weighted(specials, window=10):
-    history = specials[-window:]
-    scores = defaultdict(float)
-    total_weight = 0
-    for i, n in enumerate(reversed(history)):
-        weight = window - i
-        scores[get_color(n)] += weight
-        total_weight += weight
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    main = ranked[0][0]
-    second = ranked[1][0]
-    return (
-        main,
-        second,
-        ranked[0][1] / total_weight,
-        ranked[1][1] / total_weight
+        seen.add(issue)
+
+        cleaned.append({
+            "issue": issue,
+            "nums": r["nums"],
+            "special": r["special"]
+        })
+
+    cleaned.sort(
+        key=lambda x: int(x["issue"]),
+        reverse=True
     )
 
-
-def predict_big_small(specials):
-    recent = specials[-10:]
-    big = sum(1 for n in recent if n >= 25)
-    small = 10 - big
-    return "大" if big >= small else "小"
+    return cleaned[:10]
 
 
-def predict_odd_even(specials):
-    recent = specials[-10:]
-    odd = sum(1 for n in recent if n % 2)
-    even = 10 - odd
-    return "单" if odd >= even else "双"
+# =========================
+# 保存数据库
+# =========================
+
+def save_records(conn, records):
+
+    new_count = 0
+
+    for r in records:
+
+        exists = conn.execute(
+            """
+            SELECT 1
+            FROM draws
+            WHERE issue=?
+            """,
+            (r["issue"],)
+        ).fetchone()
+
+        if exists:
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO draws
+            VALUES(?,?,?,?)
+            """,
+            (
+                r["issue"],
+                json.dumps(r["nums"]),
+                r["special"],
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
+        )
+
+        new_count += 1
+
+    conn.commit()
+
+    return new_count
 
 
-# =========================================================
-# 策略
-# =========================================================
+# =========================
+# 属性
+# =========================
 
-def get_draws(conn):
-    rows = conn.execute("""
-    SELECT *
-    FROM draws
-    ORDER BY issue_no DESC
-    """).fetchall()
-    result = []
+def special_attrs(n):
+
+    odd_even = "单" if n % 2 else "双"
+
+    big_small = "大" if n >= 25 else "小"
+
+    color = get_color(n)
+
+    return odd_even, big_small, color
+
+
+# =========================
+# 热号策略
+# =========================
+
+def hot_strategy(rows):
+
+    counter = Counter()
+
     for r in rows:
-        nums = json.loads(r["numbers_json"])
-        result.append(nums)
-    return result
 
+        counter.update(r["nums"])
 
-def freq_map(draws):
-    m = Counter()
-    for d in draws:
-        m.update(d)
-    return m
-
-
-def omission_map(draws):
-    result = {}
-    for n in ALL_NUMBERS:
-        miss = 0
-        found = False
-        for d in draws:
-            if n in d:
-                found = True
-                break
-            miss += 1
-        result[n] = miss if found else 999
-    return result
-
-
-def hot_strategy(draws):
-    freq = freq_map(draws[:50])
-    ranked = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    nums = [n for n, _ in ranked[:6]]
-    special = ranked[6][0]
-    return nums, special
-
-
-def cold_strategy(draws):
-    omit = omission_map(draws[:50])
-    ranked = sorted(omit.items(), key=lambda x: x[1], reverse=True)
-    nums = [n for n, _ in ranked[:6]]
-    special = ranked[6][0]
-    return nums, special
-
-
-def momentum_strategy(draws):
-    score = defaultdict(float)
-    for i, d in enumerate(draws[:30]):
-        weight = 30 - i
-        for n in d:
-            score[n] += weight
-    ranked = sorted(score.items(), key=lambda x: x[1], reverse=True)
-    nums = [n for n, _ in ranked[:6]]
-    special = ranked[6][0]
-    return nums, special
-
-
-def balanced_strategy(draws):
-    hot, _ = hot_strategy(draws)
-    cold, _ = cold_strategy(draws)
-    result = []
-    for n in hot + cold:
-        if n not in result:
-            result.append(n)
-    nums = result[:6]
-    special = result[6]
-    return nums, special
-
-
-def ensemble_strategy(draws):
-    score = defaultdict(int)
-    for func in [hot_strategy, cold_strategy, momentum_strategy, balanced_strategy]:
-        nums, _ = func(draws)
-        for i, n in enumerate(nums):
-            score[n] += 10 - i
-    ranked = sorted(score.items(), key=lambda x: x[1], reverse=True)
-    nums = [n for n, _ in ranked[:6]]
-    special = ranked[6][0]
-    return nums, special
-
-
-# =========================================================
-# 真实波色回测（二中一）
-# =========================================================
-
-def color_backtest_real(conn, recent=10, window=10):
-    rows = conn.execute("""
-    SELECT special_number
-    FROM draws
-    ORDER BY issue_no ASC
-    """).fetchall()
-    specials = [int(r["special_number"]) for r in rows]
-    if len(specials) < recent + window:
-        return 0, 0
-    hit = 0
-    total = 0
-    for i in range(len(specials) - recent, len(specials)):
-        history = specials[:i]
-        if len(history) < window:
-            continue
-        main_color, second_color, _, _ = predict_color_weighted(history, window)
-        actual = get_color(specials[i])
-        if actual in [main_color, second_color]:
-            hit += 1
-        total += 1
-    return hit, total
-
-
-def color_max_miss_real(conn, recent=10, window=10):
-    rows = conn.execute("""
-    SELECT special_number
-    FROM draws
-    ORDER BY issue_no ASC
-    """).fetchall()
-    specials = [int(r["special_number"]) for r in rows]
-    miss = 0
-    max_miss = 0
-    for i in range(len(specials) - recent, len(specials)):
-        history = specials[:i]
-        if len(history) < window:
-            continue
-        main_color, second_color, _, _ = predict_color_weighted(history, window)
-        actual = get_color(specials[i])
-        if actual in [main_color, second_color]:
-            miss = 0
-        else:
-            miss += 1
-            max_miss = max(max_miss, miss)
-    return max_miss
-
-
-# =========================================================
-# 仪表盘展示
-# =========================================================
-
-def show_dashboard(conn):
-    latest = conn.execute("""
-    SELECT *
-    FROM draws
-    ORDER BY issue_no DESC
-    LIMIT 1
-    """).fetchone()
-
-    if not latest:
-        print("⚠️ 数据库无任何开奖记录，无法预测")
-        return
-
-    nums = json.loads(latest["numbers_json"])
-    nums_str = " ".join(f"{x:02d}" for x in nums)
-
-    print("最新开奖:")
-    print(f"{latest['issue_no']} | {nums_str} + {latest['special_number']:02d}")
-    print()
-
-    next_issue = str(int(latest["issue_no"]) + 1)
-    print(f"预测期号: {next_issue}")
-
-    draws = get_draws(conn)
-    strategy_funcs = {
-        "balanced_v1": balanced_strategy,
-        "hot_v1": hot_strategy,
-        "cold_rebound_v1": cold_strategy,
-        "momentum_v1": momentum_strategy,
-        "ensemble_v2": ensemble_strategy
-    }
-
-    for sid in STRATEGY_IDS:
-        nums, special = strategy_funcs[sid](draws)
-        label = STRATEGY_LABELS[sid]
-        nums_str = " ".join(f"{x:02d}" for x in nums)
-        print(f"{label:<12}: {nums_str} + {special:02d}")
-        attrs = special_attributes(special)
-        print(f"特码属性: {attrs['单双']}/{attrs['大小']} {attrs['色波']} {attrs['五行']}")
-
-    specials = [
-        int(r["special_number"])
-        for r in conn.execute("""
-        SELECT special_number
-        FROM draws
-        ORDER BY issue_no ASC
-        """).fetchall()
+    hot = [
+        n
+        for n, _ in counter.most_common(6)
     ]
 
-    print("\n特码波色预测（最近10期真实数据）:")
-    main_color, second_color, _, _ = predict_color_weighted(specials, 10)
-    print(f"主强: {main_color} 次强: {second_color}")
+    if not hot:
 
-    print("\n大小单双预测（最近10期真实数据）:")
-    print(f"大小: {predict_big_small(specials)}")
-    print(f"单双: {predict_odd_even(specials)}")
+        hot = random.sample(
+            ALL_NUMBERS,
+            6
+        )
 
-    # 真实回测
-    hit, total = color_backtest_real(conn, 10, 10)
-    rate = (hit / total * 100) if total else 0
-    print(f"\n最近10期真实波色回测（二中一）:")
-    print(f"命中: {hit}/{total}")
-    print(f"命中率: {rate:.1f}%")
+    special = random.choice(hot)
 
-    miss = color_max_miss_real(conn, 10, 10)
-    print(f"\n真实最大连空（二中一）: {miss}期")
-
-    print("\n推荐投注方案:")
-    print(f"{main_color}: 300 元")
-    print(f"{predict_big_small(specials)}: 200 元")
-    print(f"{predict_odd_even(specials)}: 200 元")
-
-    print("\n赔率参考:")
-    print("红波: 2.7")
-    print("蓝/绿波: 2.8")
-    print("大小单双: 1.95")
+    return hot, special
 
 
-# =========================================================
-# 主流程
-# =========================================================
+# =========================
+# 冷号策略
+# =========================
+
+def cold_strategy(rows):
+
+    counter = Counter()
+
+    for r in rows:
+
+        counter.update(r["nums"])
+
+    ranked = sorted(
+        counter.items(),
+        key=lambda x: x[1]
+    )
+
+    cold = [
+        n
+        for n, _ in ranked[:6]
+    ]
+
+    while len(cold) < 6:
+
+        x = random.randint(1, 49)
+
+        if x not in cold:
+            cold.append(x)
+
+    special = cold[0]
+
+    return cold[:6], special
+
+
+# =========================
+# 平衡策略
+# =========================
+
+def balanced_strategy(rows):
+
+    h, _ = hot_strategy(rows)
+
+    c, _ = cold_strategy(rows)
+
+    nums = list(
+        dict.fromkeys(
+            h[:3] + c[:3]
+        )
+    )
+
+    while len(nums) < 6:
+
+        x = random.randint(1, 49)
+
+        if x not in nums:
+            nums.append(x)
+
+    special = random.choice(nums)
+
+    return nums, special
+
+
+# =========================
+# 波色预测（二中一）
+# =========================
+
+def predict_color(rows):
+
+    specials = [
+        r["special"]
+        for r in rows[:10]
+    ]
+
+    counter = Counter(
+        get_color(x)
+        for x in specials
+    )
+
+    ranked = counter.most_common()
+
+    if len(ranked) >= 2:
+
+        return ranked[0][0], ranked[1][0]
+
+    if len(ranked) == 1:
+
+        return ranked[0][0], "蓝"
+
+    return "红", "蓝"
+
+
+# =========================
+# 最近10期真实回测
+# 不偷看未来
+# =========================
+
+def color_backtest(rows):
+
+    hits = 0
+
+    total = 0
+
+    for i in range(len(rows)-1):
+
+        future = rows[i]
+
+        history = rows[i+1:i+11]
+
+        if len(history) < 3:
+            continue
+
+        c1, c2 = predict_color(
+            history
+        )
+
+        actual = get_color(
+            future["special"]
+        )
+
+        # 二中一
+        if actual in (c1, c2):
+
+            hits += 1
+
+        total += 1
+
+    return hits, total
+
+
+# =========================
+# 最大连空
+# =========================
+
+def max_miss(rows):
+
+    miss = 0
+
+    best = 0
+
+    for i in range(len(rows)-1):
+
+        future = rows[i]
+
+        history = rows[i+1:i+11]
+
+        if len(history) < 3:
+            continue
+
+        c1, c2 = predict_color(
+            history
+        )
+
+        actual = get_color(
+            future["special"]
+        )
+
+        if actual in (c1, c2):
+
+            miss = 0
+
+        else:
+
+            miss += 1
+
+        if miss > best:
+
+            best = miss
+
+    return best
+
+
+# =========================
+# 推荐投注
+# =========================
+
+def betting_plan(c1, c2):
+
+    plan = {}
+
+    plan[c1] = 300
+
+    if c2 != c1:
+
+        plan[c2] = 150
+
+    return plan
+
+
+# =========================
+# 主逻辑
+# =========================
 
 def sync():
+
     conn = connect_db()
+
     init_db(conn)
 
-    # 尝试拉取最新数据
     records = fetch_real_data()
-    if records:
-        count = save_records(conn, records)
-        print(f"✅ 成功保存 {count} 条新记录")
-    else:
-        print("⚠️ 未获取到新开奖数据，将基于现有数据库进行分析")
 
-    # 无论是否拉取到新数据，只要数据库有历史记录就输出预测
-    row = conn.execute("SELECT COUNT(*) FROM draws").fetchone()
-    if row[0] == 0:
-        print("❌ 数据库无任何开奖记录，无法生成预测")
-    else:
-        show_dashboard(conn)
+    if not records:
+
+        print("未抓到真实开奖数据")
+
+        return
+
+    new_count = save_records(
+        conn,
+        records
+    )
+
+    print(f"同步完成: {new_count} 条")
+
+    rows = get_recent_online_10()
+
+    if not rows:
+
+        print("无法获取最近10期")
+
+        return
+
+    latest = rows[0]
+
+    nums = " ".join(
+        f"{x:02d}"
+        for x in latest["nums"]
+    )
+
+    print("\n最新开奖:")
+
+    print(
+        f'{latest["issue"]} | '
+        f'{nums} + {latest["special"]:02d}'
+    )
+
+    next_issue = str(
+        int(latest["issue"]) + 1
+    )
+
+    print(f"\n预测期号: {next_issue}")
+
+    strategies = [
+        ("组合策略", balanced_strategy),
+        ("热号策略", hot_strategy),
+        ("冷号回补", cold_strategy),
+    ]
+
+    for name, func in strategies:
+
+        nums, special = func(rows)
+
+        nums_str = " ".join(
+            f"{x:02d}"
+            for x in nums
+        )
+
+        print(
+            f"{name:<12}: "
+            f"{nums_str} + {special:02d}"
+        )
+
+        oe, bs, color = special_attrs(
+            special
+        )
+
+        print(
+            f"特码属性: "
+            f"{oe}/{bs} {color}"
+        )
+
+    # =====================
+    # 波色预测
+    # =====================
+
+    c1, c2 = predict_color(rows)
+
+    print("\n特码波色预测（二中一）:")
+
+    print(f"主强: {c1}")
+
+    print(f"次强: {c2}")
+
+    # =====================
+    # 回测
+    # =====================
+
+    hits, total = color_backtest(rows)
+
+    print("\n最近10期真实回测:")
+
+    print(
+        f"二中一命中: "
+        f"{hits}/{total}"
+    )
+
+    # =====================
+    # 最大连空
+    # =====================
+
+    miss = max_miss(rows)
+
+    print("\n真实最大连空:")
+
+    print(f"{miss} 期")
+
+    # =====================
+    # 投注建议
+    # =====================
+
+    print("\n推荐投注方案:")
+
+    plan = betting_plan(c1, c2)
+
+    for k, v in plan.items():
+
+        print(f"{k}: {v} 元")
+
+    print("\n赔率参考:")
+
+    print("红波: 2.7")
+
+    print("蓝/绿波: 2.8")
 
     conn.close()
 
 
+# =========================
+# show
+# =========================
+
+def show():
+
+    rows = get_recent_online_10()
+
+    if not rows:
+
+        print("无数据")
+
+        return
+
+    latest = rows[0]
+
+    nums = " ".join(
+        f"{x:02d}"
+        for x in latest["nums"]
+    )
+
+    print(
+        f'{latest["issue"]} | '
+        f'{nums} + {latest["special"]:02d}'
+    )
+
+
+# =========================
+# main
+# =========================
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    sub = parser.add_subparsers(
+        dest="cmd"
+    )
+
+    sub.add_parser("sync")
+
+    sub.add_parser("show")
+
+    args = parser.parse_args()
+
+    if args.cmd == "sync":
+
+        sync()
+
+    elif args.cmd == "show":
+
+        show()
+
+
 if __name__ == "__main__":
-    sync()
+
+    main()
