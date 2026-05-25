@@ -1,35 +1,37 @@
-name: 新澳门预测
+name: 新澳门彩数据同步与预测
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 13,1 * * *"   # 北京时间 21:00 / 09:00
+  workflow_dispatch:
 
 jobs:
-  run:
-
+  update-and-predict:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-
-      - name: 拉取代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 运行预测
+      - name: 下载历史数据库（首次或过期时跳过）
+        uses: actions/download-artifact@v4
+        with:
+          name: macau-db
+          path: .
+        continue-on-error: true
+
+      - name: 运行预测脚本
         run: python new_macau.py sync
 
-      - name: 提交数据库
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-
-          git add .
-
-          git commit -m "update" || echo "no changes"
-
-          git push
+      - name: 上传数据库（供下次使用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: macau-db
+          path: new_macau.db
+          retention-days: 7   # 保留7天，确保每天运行都能下载到
