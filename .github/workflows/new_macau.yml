@@ -21,23 +21,22 @@ jobs:
 
       - name: 安装依赖
         run: |
-          pip install requests beautifulsoup4 lxml
+          pip install requests pandas numpy
 
-      # 第一次升级必须删旧库
       - name: 删除旧数据库
         run: rm -f new_macau.db
 
-      - name: 运行预测系统
+      - name: 执行预测
         run: python new_macau.py sync
 
       - name: 提交数据库
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add new_macau.db
+          git add .
 
-          git commit -m "澳门六合彩自动更新 $(date '+%Y-%m-%d %H:%M')" || echo "No changes"
+          git commit -m "🤖 自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
 
           git push
 
