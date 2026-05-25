@@ -13,31 +13,36 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - name: 安装依赖
+        run: |
+          pip install requests beautifulsoup4 lxml
+
+      # 第一次升级必须删旧库
       - name: 删除旧数据库
         run: rm -f new_macau.db
 
-      - name: 执行预测
+      - name: 运行预测系统
         run: python new_macau.py sync
 
       - name: 提交数据库
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github.com"
 
           git add new_macau.db
 
-          git commit -m "🤖 自动更新 $(date)" || echo "No changes"
+          git commit -m "澳门六合彩自动更新 $(date '+%Y-%m-%d %H:%M')" || echo "No changes"
 
           git push
 
-      - uses: actions/upload-artifact@v4
+      - name: 上传数据库
+        uses: actions/upload-artifact@v4
         with:
           name: new-macau-db
           path: new_macau.db
