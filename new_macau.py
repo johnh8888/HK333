@@ -4,7 +4,7 @@
 import json
 import sqlite3
 import random
-import requests
+from urllib.request import Request, urlopen
 from collections import Counter
 from datetime import datetime
 
@@ -35,9 +35,23 @@ GREEN = {
 }
 
 # =========================
+# 波色
+# =========================
+def get_color(num):
+
+    if num in RED:
+        return "红"
+
+    if num in BLUE:
+        return "蓝"
+
+    return "绿"
+
+# =========================
 # 五行
 # =========================
 def get_element(num):
+
     tail = num % 10
 
     if tail in [1, 6]:
@@ -53,18 +67,6 @@ def get_element(num):
         return "金"
 
     return "土"
-
-# =========================
-# 波色
-# =========================
-def get_color(num):
-    if num in RED:
-        return "红"
-
-    if num in BLUE:
-        return "蓝"
-
-    return "绿"
 
 # =========================
 # 特码属性
@@ -126,9 +128,14 @@ def fetch_data():
     for url in API_URLS:
 
         try:
-            r = requests.get(url, headers=headers, timeout=15)
 
-            data = r.json()
+            req = Request(url, headers=headers)
+
+            with urlopen(req, timeout=15) as resp:
+
+                text = resp.read().decode("utf-8")
+
+                data = json.loads(text)
 
             if not data:
                 continue
@@ -158,7 +165,7 @@ def fetch_data():
             if rows:
                 return rows
 
-        except Exception:
+        except:
             continue
 
     return []
@@ -197,7 +204,7 @@ def save_records(conn, rows):
     return count
 
 # =========================
-# 读取最近数据
+# 最近10期
 # =========================
 def get_recent_draws(conn, limit=10):
 
@@ -229,11 +236,11 @@ def hot_strategy(rows):
     for r in rows:
         counter.update(r["numbers"])
 
-    hot = [n for n, _ in counter.most_common(6)]
+    nums = [n for n, _ in counter.most_common(6)]
 
     special = rows[0]["special"]
 
-    return hot, special
+    return nums, special
 
 # =========================
 # 冷号策略
@@ -245,30 +252,13 @@ def cold_strategy(rows):
     for r in rows:
         counter.update(r["numbers"])
 
-    all_nums = set(range(1, 50))
+    ranked = sorted(counter.items(), key=lambda x: x[1])
 
-    missing = []
+    nums = [n for n, _ in ranked[:6]]
 
-    for n in all_nums:
+    special = nums[0]
 
-        if n not in counter:
-            missing.append(n)
-
-    if len(missing) < 6:
-
-        remain = sorted(counter.items(), key=lambda x: x[1])
-
-        for n, _ in remain:
-
-            if n not in missing:
-                missing.append(n)
-
-            if len(missing) >= 6:
-                break
-
-    special = random.choice(missing)
-
-    return missing[:6], special
+    return nums, special
 
 # =========================
 # 组合策略
@@ -279,11 +269,11 @@ def balanced_strategy(rows):
 
     cold, _ = cold_strategy(rows)
 
-    picks = hot[:3] + cold[:3]
+    nums = hot[:3] + cold[:3]
 
-    special = random.choice(picks)
+    special = random.choice(nums)
 
-    return picks, special
+    return nums, special
 
 # =========================
 # 波色预测（二中一）
@@ -308,18 +298,16 @@ def predict_colors(rows):
     return ranked[0][0], ranked[1][0]
 
 # =========================
-# 二中一真实回测
+# 最近10期真实回测
 # 不偷看未来
 # =========================
-def backtest_color_hit(rows):
-
-    if len(rows) < 10:
-        return 0, 0
-
-    hits = 0
-    total = 0
+def backtest(rows):
 
     ordered = list(reversed(rows))
+
+    hits = 0
+
+    total = 0
 
     for i in range(3, len(ordered)):
 
@@ -327,7 +315,7 @@ def backtest_color_hit(rows):
 
         current = ordered[i]
 
-        c1, c2 = predict_colors(history[-10:])
+        c1, c2 = predict_colors(history)
 
         actual = get_color(current["special"])
 
@@ -339,7 +327,7 @@ def backtest_color_hit(rows):
     return hits, total
 
 # =========================
-# 真实最大连空
+# 最大连空
 # =========================
 def max_miss(rows):
 
@@ -355,7 +343,7 @@ def max_miss(rows):
 
         current = ordered[i]
 
-        c1, c2 = predict_colors(history[-10:])
+        c1, c2 = predict_colors(history)
 
         actual = get_color(current["special"])
 
@@ -399,10 +387,6 @@ def show_result(conn):
 
     print(f"\n预测期号: {next_issue}")
 
-    # =====================
-    # 策略
-    # =====================
-
     strategies = {
         "组合策略": balanced_strategy,
         "热号策略": hot_strategy,
@@ -423,10 +407,6 @@ def show_result(conn):
             f"特码属性: {special_attributes(special)}"
         )
 
-    # =====================
-    # 波色预测
-    # =====================
-
     c1, c2 = predict_colors(rows)
 
     print("\n特码波色预测（二中一）:")
@@ -435,19 +415,11 @@ def show_result(conn):
 
     print(f"次强: {c2}")
 
-    # =====================
-    # 回测
-    # =====================
-
-    hits, total = backtest_color_hit(rows)
+    hits, total = backtest(rows)
 
     print("\n最近10期真实回测:")
 
     print(f"二中一命中: {hits}/{total}")
-
-    # =====================
-    # 最大连空
-    # =====================
 
     miss = max_miss(rows)
 
@@ -455,19 +427,11 @@ def show_result(conn):
 
     print(f"{miss} 期")
 
-    # =====================
-    # 投注
-    # =====================
-
     print("\n推荐投注方案:")
 
     print(f"{c1}: 300 元")
 
     print(f"{c2}: 150 元")
-
-    # =====================
-    # 赔率
-    # =====================
 
     print("\n赔率参考:")
 
@@ -485,7 +449,9 @@ def sync():
     rows = fetch_data()
 
     if not rows:
+
         print("未抓到真实开奖数据")
+
         return
 
     count = save_records(conn, rows)
@@ -503,9 +469,7 @@ def main():
 
     if len(sys.argv) >= 2:
 
-        cmd = sys.argv[1]
-
-        if cmd == "sync":
+        if sys.argv[1] == "sync":
             sync()
             return
 
