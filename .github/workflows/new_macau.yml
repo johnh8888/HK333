@@ -2,10 +2,8 @@ name: 新澳门六合彩 AI 自动预测 Pro
 
 on:
   schedule:
-    # 每天香港时间 21:40 左右运行
-    # 香港 UTC+8
-    # GitHub Actions 使用 UTC
-    # 21:40 = UTC 13:40
+    # 香港时间 21:40
+    # UTC = 13:40
     - cron: '40 13 * * *'
 
   workflow_dispatch:
@@ -14,6 +12,7 @@ permissions:
   contents: write
 
 jobs:
+
   predict:
 
     runs-on: ubuntu-latest
@@ -24,18 +23,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Python
+      # Python 3.11
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 安装依赖
+      # 更新 pip
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
 
-      # 执行预测系统
+      # 删除旧数据库（修复表结构冲突）
+      - name: Remove Old Database
+        run: |
+          rm -f new_macau.db
+
+      # 执行 AI 预测系统
       - name: Run AI Prediction System
         run: |
           python new_macau.py sync
@@ -49,21 +53,22 @@ jobs:
 
           git add new_macau.db
 
-          git commit -m "🤖 新澳门自动预测更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "No changes"
+          git commit -m "🤖 新澳门 AI 自动预测 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "No changes"
 
           git push
 
-      # 保存 Artifact
+      # 上传数据库备份
       - name: Upload Database Artifact
         uses: actions/upload-artifact@v4
         with:
           name: new-macau-db
           path: new_macau.db
 
-      # 保存日志
+      # 上传日志（如果存在）
       - name: Upload Logs
         uses: actions/upload-artifact@v4
         with:
           name: runtime-log
           path: |
             *.log
+          if-no-files-found: ignore
