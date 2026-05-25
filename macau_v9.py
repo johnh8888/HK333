@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 ========================================================
- 新澳门六合彩 AI 超级预测系统 V22.3 属性完整版
+ 新澳门六合彩 AI 超级预测系统 V22.4 完整属性版
 ========================================================
+优化：加强1234kj历史数据解析 + 属性预测
 """
 
 import os
 import json
-import random
 import sqlite3
 import statistics
 import urllib.request
@@ -25,9 +25,13 @@ RED = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
 BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
 GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
 
-ELEMENTS = {"金":[5,6,13,14,21,22,35,36,43,44],"木":[3,4,17,18,25,26,39,40,47,48],
-            "水":[1,2,15,16,23,24,37,38,45,46],"火":[7,8,19,20,27,28,41,42,49],
-            "土":[9,10,11,12,29,30,31,32,33,34]}
+ELEMENTS = {
+    "金": [5,6,13,14,21,22,35,36,43,44],
+    "木": [3,4,17,18,25,26,39,40,47,48],
+    "水": [1,2,15,16,23,24,37,38,45,46],
+    "火": [7,8,19,20,27,28,41,42,49],
+    "土": [9,10,11,12,29,30,31,32,33,34]
+}
 
 ZODIAC = {1:"鼠",2:"牛",3:"虎",4:"兔",5:"龙",6:"蛇",7:"马",8:"羊",9:"猴",10:"鸡",11:"狗",12:"猪"}
 
@@ -59,7 +63,7 @@ def init_db():
     conn.commit()
     return conn
 
-# ====================== 数据抓取 ======================
+# ====================== 增强数据抓取 ======================
 def fetch_real_data():
     sources = [
         ("https://1234kj.com/api/opencode/2033?type=all", "1234kj"),
@@ -68,29 +72,50 @@ def fetch_real_data():
     ]
 
     all_records = []
+
     for url, name in sources:
         try:
             print(f"尝试 [{name}]: {url}")
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            })
+            with urllib.request.urlopen(req, timeout=25) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
             records = []
-            if name == "1234kj" and "data" in data:
-                for item in data["data"].values():
-                    if isinstance(item, dict) and "openCode" in item:
+
+            # 重点优化 1234kj 数据解析
+            if name == "1234kj" and isinstance(data, dict) and "data" in data:
+                for key, item in data["data"].items():
+                    if isinstance(item, dict) and "openCode" in item and "issue" in item:
                         nums = [int(x.strip()) for x in str(item["openCode"]).split(",") if x.strip().isdigit()]
                         if len(nums) >= 7:
-                            records.append({"issue": str(item["issue"]), "numbers": nums[:6], "special": nums[6]})
+                            records.append({
+                                "issue": str(item["issue"]),
+                                "numbers": nums[:6],
+                                "special": nums[6]
+                            })
+
+            # 其他接口兼容
+            elif name == "marksix_new" and "openCode" in data:
+                nums = [int(x.strip()) for x in str(data.get("openCode","")).split(",") if x.strip().isdigit()]
+                if len(nums) >= 7:
+                    records.append({"issue": str(data.get("expect","")), "numbers": nums[:6], "special": nums[6]})
 
             if records:
-                print(f"✅ [{name}] 获取 {len(records)} 条")
+                print(f"✅ [{name}] 成功获取 {len(records)} 条历史数据")
                 all_records.extend(records)
-        except:
+                if len(records) >= 12:  # 优先使用丰富数据源
+                    break
+
+        except Exception as e:
             print(f"❌ [{name}] 失败")
 
+    # 去重排序
     uniq = {r["issue"]: r for r in all_records if r.get("issue")}
-    return sorted(uniq.values(), key=lambda x: str(x["issue"]))
+    result = sorted(uniq.values(), key=lambda x: str(x["issue"]))
+    print(f"📊 最终获取有效数据: {len(result)} 条")
+    return result
 
 # ====================== 保存 & 加载 ======================
 def save_data(conn, records):
@@ -101,42 +126,36 @@ def save_data(conn, records):
         conn.execute("INSERT OR REPLACE INTO draws VALUES(?,?,?,?,?,?,?,?,?)",
                      (r["issue"], *r["numbers"], r["special"], datetime.now().isoformat()))
     conn.commit()
-    print(f"💾 新增/更新 {new_count} 条")
+    print(f"💾 数据库更新: 新增 {new_count} 条")
 
 def load_records(conn):
     rows = conn.execute("SELECT * FROM draws ORDER BY issue").fetchall()
     return [{"issue": r[0], "numbers": list(r[1:7]), "special": r[7]} for r in rows]
 
-# ====================== 完整属性预测 ======================
+# ====================== 属性预测 ======================
 def attribute_prediction(records):
-    if len(records) < 20:
-        return {
-            "wave": "红",
-            "big_small": "大",
-            "odd_even": "单",
-            "element": "火",
-            "zodiac": "马"
-        }
+    if len(records) < 10:
+        return {"wave": "红", "big_small": "大", "odd_even": "单", "element": "火", "zodiac": "马"}
     
-    recent = records[-80:]
+    recent = records[-100:]
     waves = Counter(get_wave(r["special"]) for r in recent)
     bigs = Counter(get_big_small(r["special"]) for r in recent)
     odds = Counter(get_odd_even(r["special"]) for r in recent)
-    elements = Counter(get_element(r["special"]) for r in recent)
+    elems = Counter(get_element(r["special"]) for r in recent)
     
     return {
         "wave": waves.most_common(1)[0][0],
         "big_small": bigs.most_common(1)[0][0],
         "odd_even": odds.most_common(1)[0][0],
-        "element": elements.most_common(1)[0][0],
-        "zodiac": get_zodiac(max(Counter(r["special"] for r in recent).keys(), default=7))
+        "element": elems.most_common(1)[0][0],
+        "zodiac": get_zodiac(max([r["special"] for r in recent], default=7))
     }
 
-# ====================== 预测核心 ======================
+# ====================== 号码预测 ======================
 def generate_prediction(records):
     if len(records) < 30:
-        print("⚠️ 数据不足，使用默认预测")
-        return [5,12,19,26,33,40], 7, 38
+        print("⚠️ 数据不足，使用默认热号")
+        return [5,12,19,26,33,40], 7, 40
 
     freq = Counter()
     for r in records[-150:]:
@@ -145,27 +164,27 @@ def generate_prediction(records):
 
     pred = [x[0] for x in freq.most_common(6)]
     special = freq.most_common(1)[0][0]
-    confidence = min(88, 40 + len(records)//3)
+    confidence = min(85, 40 + len(records)//3)
     return pred, special, confidence
 
-# ====================== HTML（增加完整属性显示） ======================
+# ====================== HTML ======================
 def generate_html(records, pred, special, confidence, attr):
     latest = records[-1]
     html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>澳门六合彩 V22.3</title>
+<html><head><meta charset="utf-8"><title>澳门六合彩 V22.4</title>
 <style>
     body{{font-family:Arial;background:#0a0a1f;color:#0f0;padding:25px;}}
     .panel{{background:#1a1a2e;border-radius:12px;padding:20px;margin:15px 0;}}
     .red{{color:#ff6666;}} .blue{{color:#66bbff;}} .green{{color:#66ff99;}}
 </style></head><body>
-<h1>🀄 新澳门六合彩 AI V22.3 属性完整版</h1>
+<h1>🀄 新澳门六合彩 AI V22.4</h1>
 
 <div class="panel"><h2>最新开奖</h2>
 <p>{latest['issue']}<br>
 {' '.join(str(x).zfill(2) for x in latest['numbers'])} + <span class="{get_wave(latest['special']).lower()}">{str(latest['special']).zfill(2)}</span></p>
 </div>
 
-<div class="panel"><h2>🎯 AI预测 (置信度 {confidence}%)</h2>
+<div class="panel"><h2>🎯 AI号码预测 (置信度 {confidence}%)</h2>
 <p>{' '.join(str(x).zfill(2) for x in pred)} + <span class="{get_wave(special).lower()}">{str(special).zfill(2)}</span></p>
 </div>
 
@@ -183,19 +202,20 @@ def generate_html(records, pred, special, confidence, attr):
 
 # ====================== 主程序 ======================
 def main():
-    print("🚀 新澳门六合彩 AI V22.3 属性完整版 启动...\n")
+    print("🚀 新澳门六合彩 AI V22.4 启动...\n")
     conn = init_db()
     records = fetch_real_data()
     save_data(conn, records)
     records = load_records(conn)
 
     if not records:
-        print("❌ 未获取到数据")
+        print("❌ 未获取数据")
         return
 
     latest = records[-1]
     print(f"🔔 最新开奖: {latest['issue']}")
     print("号码:", " ".join(str(x).zfill(2) for x in latest["numbers"]), "+", str(latest["special"]).zfill(2))
+    print(f"📊 当前历史数据总量: {len(records)} 期")
 
     pred, special, confidence = generate_prediction(records)
     attr = attribute_prediction(records)
@@ -205,14 +225,11 @@ def main():
     print("特码:", str(special).zfill(2))
     
     print("\n🔮 特码属性预测:")
-    print(f"波色：{attr['wave']}")
-    print(f"大小：{attr['big_small']}")
-    print(f"单双：{attr['odd_even']}")
-    print(f"五行：{attr['element']}")
-    print(f"生肖：{attr['zodiac']}")
+    for k, v in attr.items():
+        print(f"  {k}：{v}")
 
     generate_html(records, pred, special, confidence, attr)
-    print("\n✅ dashboard_v22.html 已生成（含完整属性）")
+    print("\n✅ dashboard_v22.html 已生成")
 
 if __name__ == "__main__":
     main()
