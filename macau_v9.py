@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 ========================================================
- 新澳门六合彩 AI 超级预测系统 V23.0（热冷+统计增强版）
+ 新澳门六合彩 AI 超级预测系统 V23.1（最终优化版）
 ========================================================
 """
 
 import os
 import json
 import sqlite3
-import statistics
 import urllib.request
 from collections import Counter
-from datetime import datetime
-import logging
 
 DB_FILE = "macau_v22.db"
 
@@ -39,7 +36,7 @@ def get_zodiac(n):
     z = {1:"鼠",2:"牛",3:"虎",4:"兔",5:"龙",6:"蛇",7:"马",8:"羊",9:"猴",10:"鸡",11:"狗",12:"猪"}
     return z.get(((n-1)%12)+1, "?")
 
-# ====================== 数据库 ======================
+# ====================== 数据库 & 数据获取 ======================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY,n1 INT,n2 INT,n3 INT,n4 INT,n5 INT,n6 INT,special INT,created_at TEXT)""")
@@ -77,73 +74,51 @@ def load_records(conn):
     rows = conn.execute("SELECT * FROM draws ORDER BY issue").fetchall()
     return [{"issue": r[0], "numbers": list(r[1:7]), "special": r[7]} for r in rows]
 
-# ====================== 增强版预测 ======================
+# ====================== 预测核心 ======================
 def generate_prediction(records):
-    if len(records) < 30:
-        return [5,12,19,26,33,40], 7, 40
-
-    recent = records[-120:]
     freq = Counter()
-    for r in recent:
+    for r in records[-150:]:
         for n in r["numbers"] + [r["special"]]:
-            freq[n] += 2 if n == r["special"] else 1
+            freq[n] += 2 if n == r["special"] else 1.2
 
-    # 热号 + 冷号混合策略
-    hot = [x[0] for x in freq.most_common(15)]
-    cold = [n for n in range(1,50) if n not in freq]
-    candidates = hot[:10] + cold[:5]
+    hot = [x[0] for x in freq.most_common(12)]
+    cold = [n for n in range(1,50) if n not in freq][:8]
 
-    # 严格去重
+    candidates = hot + cold
     pred = []
     seen = set()
     for n in candidates:
         if n not in seen:
             pred.append(n)
             seen.add(n)
-        if len(pred) >= 7:
-            break
+        if len(pred) >= 7: break
 
     main_numbers = sorted(pred[:6])
     special = pred[6] if len(pred) > 6 else hot[0]
-    confidence = min(90, 45 + len(records)//4)
-
-    return main_numbers, special, confidence
+    return main_numbers, special, min(92, 48 + len(records)//4)
 
 def predict_wave_double(records):
-    recent = records[-80:]
-    wave_count = Counter(get_wave(r["special"]) for r in recent)
+    wave_count = Counter(get_wave(r["special"]) for r in records[-80:])
     return [x[0] for x in wave_count.most_common(2)]
 
-# ====================== 更多统计 ======================
 def get_more_stats(records):
     recent50 = records[-50:]
     all_nums = [n for r in recent50 for n in r["numbers"] + [r["special"]]]
     freq = Counter(all_nums)
-
     hot10 = [x[0] for x in freq.most_common(10)]
     cold10 = [n for n in range(1,50) if n not in freq][:10]
-
-    # 连号统计
-    consecutive = sum(1 for r in recent50 for i in range(5) if abs(r["numbers"][i] - r["numbers"][i+1]) == 1)
-
     return {
         "hot10": hot10,
         "cold10": cold10,
-        "consecutive_count": consecutive,
-        "wave_dist": Counter(get_wave(r["special"]) for r in recent50)
+        "wave_dist": dict(Counter(get_wave(r["special"]) for r in recent50))
     }
 
 # ====================== 主程序 ======================
 def main():
-    print("🚀 新澳门六合彩 AI V23.0 热冷统计版 启动...\n")
+    print("🚀 新澳门六合彩 AI V23.1 启动...\n")
     conn = init_db()
     records = fetch_real_data()
-    # save_data...
     records = load_records(conn) if len(records) == 0 else records
-
-    if len(records) == 0:
-        print("❌ 未获取数据")
-        return
 
     latest = records[-1]
     print(f"🔔 最新开奖: {latest['issue']}")
@@ -163,9 +138,7 @@ def main():
     print("📊 更多统计（最近50期）:")
     print(f"热号Top10: {stats['hot10']}")
     print(f"冷号Top10: {stats['cold10']}")
-    print(f"出现连号次数: {stats['consecutive_count']} 次")
-    print(f"波色分布: {dict(stats['wave_dist'])}")
-
+    print(f"波色分布: {stats['wave_dist']}")
     print(f"\n📈 置信度: {confidence}%")
 
 if __name__ == "__main__":
