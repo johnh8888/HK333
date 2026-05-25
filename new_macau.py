@@ -12,12 +12,10 @@ RED = {
     1, 2, 7, 8, 12, 13, 18, 19, 23, 24,
     29, 30, 34, 35, 40, 45, 46
 }
-
 BLUE = {
     3, 4, 9, 10, 14, 15, 20, 25, 26,
     31, 36, 37, 41, 42, 47, 48
 }
-
 GREEN = {
     5, 6, 11, 16, 17, 21, 22, 27,
     28, 32, 33, 38, 39, 43, 44, 49
@@ -51,7 +49,7 @@ def init_db():
 
 
 def fetch_api_data():
-    """从 marksix6.net 获取新澳门彩数据，只保留最近 10 期"""
+    """从 marksix6.net 获取新澳门彩数据，保留最近 12 期（确保完整回测最近10期）"""
     url = "https://marksix6.net/index.php?api=1"
     try:
         req = urllib.request.Request(url, headers={
@@ -132,11 +130,11 @@ def fetch_api_data():
         result = list(uniq.values())
         result.sort(key=lambda x: x["issue"])
 
-        # 只保留最近 10 期
-        if len(result) > 10:
-            result = result[-10:]
+        # ★ 保留最近 12 期
+        if len(result) > 12:
+            result = result[-12:]
 
-        print(f"抓取到历史数据: {len(result)} 条（仅保留最近10期）")
+        print(f"抓取到历史数据: {len(result)} 条（保留最近12期）")
         return result
 
     except Exception as e:
@@ -242,26 +240,36 @@ def predict_numbers(records):
 
 
 def calc_wave_prediction(records):
+    """至少需要 10 期特码数据"""
+    if len(records) < 10:
+        return None, None
     last10 = records[-10:]
     score = {"红": 0, "蓝": 0, "绿": 0}
-    weight = min(10, len(last10))
-    for i, r in enumerate(reversed(last10)):
+    weight = 10
+    for r in reversed(last10):
         wave = get_wave(r["special"])
-        score[wave] += weight - i
+        score[wave] += weight
+        weight -= 1
     sorted_wave = sorted(score.items(), key=lambda x: x[1], reverse=True)
     return sorted_wave[0], sorted_wave[1]
 
 
 def backtest_wave(records):
-    """波色回测，返回 (命中, 总次数, 最大连空)"""
-    if len(records) < 2:
+    """使用最近 11 期数据，对最近 10 期进行回测（因为需要至少 1 期训练数据）"""
+    if len(records) < 11:
         return 0, 0, 0
-    recent = records[-10:]  # 最多取最近10期
+    # 取最近 11 期，最后 10 期作为测试期
+    recent = records[-11:]
     hit = total = 0
     max_miss = miss = 0
-    for i in range(2, len(recent)):   # 至少需要2期历史才能预测
-        hist = recent[:i]
+    # 从第2期开始预测（即索引1），因为需要前面的数据训练
+    for i in range(1, len(recent)):
+        hist = recent[:i]          # 训练集
+        if len(hist) < 10:
+            continue
         main, second = calc_wave_prediction(hist)
+        if main is None:
+            continue
         real = get_wave(recent[i]["special"])
         total += 1
         if real in [main[0], second[0]]:
@@ -274,7 +282,7 @@ def backtest_wave(records):
 
 
 def predict_big_small(records):
-    if len(records) < 1:
+    if len(records) < 10:
         return "数据不足", "数据不足"
     recent = records[-10:]
     big = small = odd = even = 0
@@ -288,16 +296,20 @@ def predict_big_small(records):
 
 
 def backtest_size_odd(records):
-    if len(records) < 2:
+    if len(records) < 11:
         return 0, 0, 0, 0, 0
-    recent = records[-10:]
+    recent = records[-11:]
     size_hit = odd_hit = 0
     size_miss = odd_miss = 0
     size_max = odd_max = 0
     total = 0
-    for i in range(2, len(recent)):
+    for i in range(1, len(recent)):
         hist = recent[:i]
+        if len(hist) < 10:
+            continue
         size_pred, odd_pred = predict_big_small(hist)
+        if size_pred == "数据不足":
+            continue
         real = recent[i]["special"]
         total += 1
         real_size = "大" if real >= 25 else "小"
@@ -330,7 +342,7 @@ def sync():
     print(f"数据同步完成: total={len(all_records)}, new={new_count}")
 
     if len(all_records) < 10:
-        print(f"⚠️ 历史数据不足10期，当前仅有 {len(all_records)} 期，部分预测可能不准")
+        print(f"⚠️ 历史数据不足10期，当前仅有 {len(all_records)} 期，回测与波色/大小单双预测需要10期数据")
 
     if len(all_records) == 0:
         print("无数据，退出")
@@ -356,38 +368,39 @@ def sync():
 
     print()
 
-    # 波色预测与回测（只要有2期就做）
-    if len(all_records) >= 2:
-        # 波色预测
+    # 波色预测与回测（需要至少 10 期）
+    if len(all_records) >= 10:
         main, second = calc_wave_prediction(all_records)
-        print("🎨 特码波色预测（加权）：")
-        print(f"   主强: {main[0]} (得分 {main[1]})   次强: {second[0]} (得分 {second[1]})")
+        print("🎨 特码波色预测（最近10期真实数据）：")
+        print(f"   主强: {main[0]} (得分 {main[1]})   "
+              f"次强: {second[0]} (得分 {second[1]})")
 
-        # 波色回测
         wave_hit, wave_total, wave_max_miss = backtest_wave(all_records)
         if wave_total > 0:
-            print(f"\n📊 波色回测（最近{wave_total}期）：")
-            print(f"   二中一命中: {wave_hit}/{wave_total}")
-            print(f"   命中率: {round(wave_hit/wave_total*100,1)}%")
+            print(f"\n📊 最近10期波色回测（二中一）：")
+            print(f"   命中: {wave_hit}/{wave_total}")
+            print(f"   命中率: {round(wave_hit/wave_total*100, 1)}%")
             print(f"   最大连空: {wave_max_miss}期")
     else:
-        print("🎨 特码波色预测：数据不足")
+        print("🎨 特码波色预测：数据不足（需≥10期）")
+
+    print()
 
     # 大小单双预测与回测
-    if len(all_records) >= 2:
+    if len(all_records) >= 10:
         size_pred, odd_pred = predict_big_small(all_records)
-        print("\n📊 大小单双预测：")
-        print(f"   大小: {size_pred}   单双: {odd_pred}")
+        print("📊 大小单双预测（最近10期真实数据）：")
+        print(f"   大小预测: {size_pred}   单双预测: {odd_pred}")
 
         size_hit, odd_hit, total, size_max, odd_max = backtest_size_odd(all_records)
         if total > 0:
-            print(f"\n📊 大小单双回测（最近{total}期）：")
-            print(f"   大小命中: {size_hit}/{total} ({round(size_hit/total*100,1)}%)")
+            print(f"\n📊 最近10期大小单双回测：")
+            print(f"   大小命中: {size_hit}/{total} ({round(size_hit/total*100, 1)}%)")
             print(f"   大小最大连空: {size_max}期")
-            print(f"   单双命中: {odd_hit}/{total} ({round(odd_hit/total*100,1)}%)")
+            print(f"   单双命中: {odd_hit}/{total} ({round(odd_hit/total*100, 1)}%)")
             print(f"   单双最大连空: {odd_max}期")
     else:
-        print("\n📊 大小单双预测：数据不足")
+        print("📊 大小单双预测：数据不足（需≥10期）")
 
 
 if __name__ == "__main__":
