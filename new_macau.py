@@ -240,7 +240,6 @@ def predict_numbers(records):
 
 
 def calc_wave_prediction(records):
-    """至少需要 10 期特码数据"""
     if len(records) < 10:
         return None, None
     last10 = records[-10:]
@@ -255,19 +254,16 @@ def calc_wave_prediction(records):
 
 
 def backtest_wave(records):
-    """使用最近 11 期数据，对最近 10 期进行回测（因为需要至少 1 期训练数据）"""
+    """使用最近11期，对最近10期进行滚动回测（需至少11期数据）"""
     if len(records) < 11:
         return 0, 0, 0
-    # 取最近 11 期，最后 10 期作为测试期
-    recent = records[-11:]
+    recent = records[-11:]  # 取最近11期，后10期作为测试目标
     hit = total = 0
     max_miss = miss = 0
-    # 从第2期开始预测（即索引1），因为需要前面的数据训练
-    for i in range(1, len(recent)):
-        hist = recent[:i]          # 训练集
-        if len(hist) < 10:
-            continue
-        main, second = calc_wave_prediction(hist)
+    # 从第2期开始（索引1）预测到最后一期（索引10），共10次预测
+    for i in range(1, 11):
+        train = recent[:i]          # 前i期作为训练集
+        main, second = calc_wave_prediction(train)
         if main is None:
             continue
         real = get_wave(recent[i]["special"])
@@ -296,6 +292,7 @@ def predict_big_small(records):
 
 
 def backtest_size_odd(records):
+    """大小单双回测，同样基于最近11期，测试最近10期"""
     if len(records) < 11:
         return 0, 0, 0, 0, 0
     recent = records[-11:]
@@ -303,11 +300,9 @@ def backtest_size_odd(records):
     size_miss = odd_miss = 0
     size_max = odd_max = 0
     total = 0
-    for i in range(1, len(recent)):
-        hist = recent[:i]
-        if len(hist) < 10:
-            continue
-        size_pred, odd_pred = predict_big_small(hist)
+    for i in range(1, 11):
+        train = recent[:i]
+        size_pred, odd_pred = predict_big_small(train)
         if size_pred == "数据不足":
             continue
         real = recent[i]["special"]
@@ -342,7 +337,7 @@ def sync():
     print(f"数据同步完成: total={len(all_records)}, new={new_count}")
 
     if len(all_records) < 10:
-        print(f"⚠️ 历史数据不足10期，当前仅有 {len(all_records)} 期，回测与波色/大小单双预测需要10期数据")
+        print(f"⚠️ 历史数据不足10期，当前仅有 {len(all_records)} 期，预测可能不准确")
 
     if len(all_records) == 0:
         print("无数据，退出")
@@ -368,19 +363,21 @@ def sync():
 
     print()
 
-    # 波色预测与回测（需要至少 10 期）
+    # 波色预测与回测
     if len(all_records) >= 10:
         main, second = calc_wave_prediction(all_records)
         print("🎨 特码波色预测（最近10期真实数据）：")
-        print(f"   主强: {main[0]} (得分 {main[1]})   "
-              f"次强: {second[0]} (得分 {second[1]})")
+        print(f"   主强: {main[0]} (得分 {main[1]})   次强: {second[0]} (得分 {second[1]})")
 
-        wave_hit, wave_total, wave_max_miss = backtest_wave(all_records)
-        if wave_total > 0:
-            print(f"\n📊 最近10期波色回测（二中一）：")
-            print(f"   命中: {wave_hit}/{wave_total}")
-            print(f"   命中率: {round(wave_hit/wave_total*100, 1)}%")
-            print(f"   最大连空: {wave_max_miss}期")
+        if len(all_records) >= 11:
+            wave_hit, wave_total, wave_max_miss = backtest_wave(all_records)
+            if wave_total > 0:
+                print(f"\n📊 最近10期波色回测（二中一）：")
+                print(f"   命中: {wave_hit}/{wave_total}")
+                print(f"   命中率: {round(wave_hit/wave_total*100, 1)}%")
+                print(f"   最大连空: {wave_max_miss}期")
+        else:
+            print("（回测需≥11期数据，当前不足）")
     else:
         print("🎨 特码波色预测：数据不足（需≥10期）")
 
@@ -392,13 +389,16 @@ def sync():
         print("📊 大小单双预测（最近10期真实数据）：")
         print(f"   大小预测: {size_pred}   单双预测: {odd_pred}")
 
-        size_hit, odd_hit, total, size_max, odd_max = backtest_size_odd(all_records)
-        if total > 0:
-            print(f"\n📊 最近10期大小单双回测：")
-            print(f"   大小命中: {size_hit}/{total} ({round(size_hit/total*100, 1)}%)")
-            print(f"   大小最大连空: {size_max}期")
-            print(f"   单双命中: {odd_hit}/{total} ({round(odd_hit/total*100, 1)}%)")
-            print(f"   单双最大连空: {odd_max}期")
+        if len(all_records) >= 11:
+            size_hit, odd_hit, total, size_max, odd_max = backtest_size_odd(all_records)
+            if total > 0:
+                print(f"\n📊 最近10期大小单双回测：")
+                print(f"   大小命中: {size_hit}/{total} ({round(size_hit/total*100, 1)}%)")
+                print(f"   大小最大连空: {size_max}期")
+                print(f"   单双命中: {odd_hit}/{total} ({round(odd_hit/total*100, 1)}%)")
+                print(f"   单双最大连空: {odd_max}期")
+        else:
+            print("（回测需≥11期数据，当前不足）")
     else:
         print("📊 大小单双预测：数据不足（需≥10期）")
 
