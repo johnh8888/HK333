@@ -1,55 +1,31 @@
+# -*- coding: utf-8 -*-
+
 import requests
 import sqlite3
 import random
-import re
 from collections import Counter
 
-DB = "new_macau.db"
+DB_FILE = "new_macau.db"
 
-RED = {
-    1, 2, 7, 8, 12, 13, 18, 19, 23, 24,
-    29, 30, 34, 35, 40, 45, 46
+RED = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
+BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
+GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
+
+ELEMENTS = {
+    "金":[1,2,15,16,29,30,43,44],
+    "木":[5,6,19,20,33,34,47,48],
+    "水":[9,10,23,24,37,38],
+    "火":[13,14,27,28,41,42],
+    "土":[3,4,17,18,31,32,45,46]
 }
-
-BLUE = {
-    3, 4, 9, 10, 14, 15, 20, 25, 26,
-    31, 36, 37, 41, 42, 47, 48
-}
-
-GREEN = {
-    5, 6, 11, 16, 17, 21, 22, 27,
-    28, 32, 33, 38, 39, 43, 44, 49
-}
-
-ELEMENTS = ["金", "木", "水", "火", "土"]
-
-
-def wave(n):
-    if n in RED:
-        return "红"
-    elif n in BLUE:
-        return "蓝"
-    return "绿"
-
-
-def element(n):
-    return ELEMENTS[n % 5]
-
-
-def odd_even(n):
-    return "双" if n % 2 == 0 else "单"
-
-
-def big_small(n):
-    return "大" if n >= 25 else "小"
-
 
 def init_db():
-    conn = sqlite3.connect(DB)
+
+    conn = sqlite3.connect(DB_FILE)
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS draws(
-        expect TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS draws (
+        period TEXT PRIMARY KEY,
         n1 INTEGER,
         n2 INTEGER,
         n3 INTEGER,
@@ -64,25 +40,43 @@ def init_db():
 
     return conn
 
+def get_color(num):
 
-def fetch_latest():
+    if num in RED:
+        return "红"
+
+    if num in BLUE:
+        return "蓝"
+
+    return "绿"
+
+def get_element(num):
+
+    for k,v in ELEMENTS.items():
+
+        if num in v:
+            return k
+
+    return "土"
+
+def get_big_small(num):
+
+    return "大" if num >= 25 else "小"
+
+def get_odd_even(num):
+
+    return "双" if num % 2 == 0 else "单"
+
+def fetch_real_draw():
 
     urls = [
-        "https://marksix6.net",
-        "https://www.macaumarksix.com"
+        "https://api3.marksix6.net/lottery_api.php?type=newMacau",
+        "https://marksix6.net/index.php?api=1"
     ]
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
+        "User-Agent":"Mozilla/5.0"
     }
-
-    rows = []
 
     for url in urls:
 
@@ -94,432 +88,383 @@ def fetch_latest():
                 timeout=20
             )
 
-            html = r.text
+            r.raise_for_status()
 
-            expect_match = re.search(
-                r'20\d{5}',
-                html
-            )
+            data = r.json()
 
-            nums_match = re.findall(
-                r'>(\d{2})<',
-                html
-            )
+            # api3
+            if isinstance(data, dict):
 
-            if not expect_match:
-                continue
+                if "openCode" in data:
 
-            if len(nums_match) < 7:
-                continue
+                    expect = str(data.get("expect",""))
 
-            expect = expect_match.group(0)
+                    code = str(data.get("openCode",""))
 
-            nums = [
-                int(x)
-                for x in nums_match[:7]
-            ]
+                    nums = [
+                        int(x)
+                        for x in code.replace("+",",").split(",")
+                        if x.strip().isdigit()
+                    ]
 
-            rows.append({
-                "expect": expect,
-                "numbers": nums[:6],
-                "special": nums[6]
-            })
+                    if len(nums) >= 7:
+
+                        return {
+                            "expect": expect,
+                            "numbers": nums[:6],
+                            "special": nums[6]
+                        }
+
+                # api=1
+                if "lottery_data" in data:
+
+                    for item in data["lottery_data"]:
+
+                        name = item.get("name","")
+
+                        if "新澳门" in name:
+
+                            expect = str(item.get("expect",""))
+
+                            code = str(item.get("openCode",""))
+
+                            nums = [
+                                int(x)
+                                for x in code.replace("+",",").split(",")
+                                if x.strip().isdigit()
+                            ]
+
+                            if len(nums) >= 7:
+
+                                return {
+                                    "expect": expect,
+                                    "numbers": nums[:6],
+                                    "special": nums[6]
+                                }
 
         except Exception as e:
 
-            print("抓取失败:", e)
+            print(f"接口失败: {url}")
+            continue
 
-    return rows
+    return None
 
+def save_draw(conn, draw):
 
-def save_draws(conn, draws):
-
-    for d in draws:
-
-        nums = d["numbers"]
-
-        conn.execute("""
-        INSERT OR REPLACE INTO draws
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            d["expect"],
-            nums[0],
-            nums[1],
-            nums[2],
-            nums[3],
-            nums[4],
-            nums[5],
-            d["special"]
-        ))
+    conn.execute("""
+    INSERT OR REPLACE INTO draws
+    VALUES (?,?,?,?,?,?,?,?)
+    """,(
+        draw["expect"],
+        draw["numbers"][0],
+        draw["numbers"][1],
+        draw["numbers"][2],
+        draw["numbers"][3],
+        draw["numbers"][4],
+        draw["numbers"][5],
+        draw["special"]
+    ))
 
     conn.commit()
 
+def load_history(conn):
 
-def get_recent(conn, limit=80):
-
-    rows = conn.execute(f"""
-    SELECT *
-    FROM draws
-    ORDER BY expect DESC
-    LIMIT {limit}
+    rows = conn.execute("""
+    SELECT * FROM draws
+    ORDER BY period DESC
+    LIMIT 80
     """).fetchall()
 
     return rows
 
-
 def hot_strategy(rows):
 
-    nums = []
+    nums=[]
 
     for r in rows[:20]:
         nums.extend(r[1:7])
 
-    picks = [x for x, _ in Counter(nums).most_common(6)]
+    hot=[x for x,_ in Counter(nums).most_common(6)]
 
-    special = random.choice(picks)
+    special=random.choice(hot)
 
-    return picks[:6], special
-
+    return hot,special
 
 def cold_strategy(rows):
 
-    nums = []
+    nums=[]
 
-    for r in rows[:30]:
+    for r in rows[:40]:
         nums.extend(r[1:7])
 
-    freq = Counter(nums)
+    c=Counter(nums)
 
-    all_nums = list(range(1, 50))
+    cold=sorted(range(1,50), key=lambda x:c[x])[:6]
 
-    picks = sorted(all_nums, key=lambda x: freq[x])[:6]
+    special=random.choice(cold)
 
-    special = random.choice(picks)
-
-    return picks, special
-
+    return cold,special
 
 def momentum_strategy(rows):
 
-    nums = []
+    nums=[]
 
     for r in rows[:10]:
         nums.extend(r[1:7])
 
-    picks = [x for x, _ in Counter(nums).most_common(6)]
+    top=[x for x,_ in Counter(nums).most_common(6)]
 
-    special = random.randint(1, 49)
+    special=rows[0][7]
 
-    return picks, special
-
+    return top,special
 
 def balanced_strategy(rows):
 
-    nums = []
+    h,_=hot_strategy(rows)
+    c,_=cold_strategy(rows)
 
-    for r in rows[:20]:
-        nums.extend(r[1:7])
+    nums=list(dict.fromkeys(h[:3]+c[:3]))[:6]
 
-    freq = Counter(nums)
+    while len(nums)<6:
 
-    mid = sorted(freq.items(), key=lambda x: x[1])
+        n=random.randint(1,49)
 
-    picks = [x[0] for x in mid[10:16]]
+        if n not in nums:
+            nums.append(n)
 
-    while len(picks) < 6:
-        n = random.randint(1, 49)
+    special=random.randint(1,49)
 
-        if n not in picks:
-            picks.append(n)
+    return nums,special
 
-    special = random.randint(1, 49)
+def ensemble_strategy(rows):
 
-    return picks, special
+    nums=[]
 
-
-def mining_strategy(rows):
-
-    nums = []
-
-    for r in rows[:15]:
-        nums.extend(r[1:7])
-
-    freq = Counter(nums)
-
-    picks = [x for x, _ in freq.most_common(3)]
-
-    while len(picks) < 6:
-
-        n = random.randint(1, 49)
-
-        if n not in picks:
-            picks.append(n)
-
-    special = random.randint(1, 49)
-
-    return picks, special
-
-
-def voting_strategy(rows):
-
-    funcs = [
+    for s in [
         hot_strategy,
         cold_strategy,
-        momentum_strategy,
-        balanced_strategy
-    ]
+        momentum_strategy
+    ]:
 
-    counter = Counter()
+        n,_=s(rows)
 
-    for f in funcs:
+        nums.extend(n)
 
-        picks, _ = f(rows)
+    top=[x for x,_ in Counter(nums).most_common(6)]
 
-        counter.update(picks)
+    special=random.randint(1,49)
 
-    final = [x for x, _ in counter.most_common(6)]
+    return top,special
 
-    special = random.randint(1, 49)
+def pattern_strategy(rows):
 
-    return final, special
+    nums=[]
 
+    for r in rows[:15]:
 
-def print_strategy(name, picks, special):
+        nums.extend(r[1:4])
 
-    nums = " ".join(f"{x:02d}" for x in picks)
+    top=[x for x,_ in Counter(nums).most_common(6)]
 
-    print(f"{name:<10}: {nums} + {special:02d}")
+    while len(top)<6:
+
+        n=random.randint(1,49)
+
+        if n not in top:
+            top.append(n)
+
+    special=random.randint(1,49)
+
+    return top,special
+
+def print_strategy(name, nums, special):
+
+    print(
+        f"{name:<10}: "
+        + " ".join(f"{x:02d}" for x in nums)
+        + f" + {special:02d}"
+    )
 
     print(
         f"特码属性: "
-        f"{odd_even(special)}/"
-        f"{big_small(special)} "
-        f"{wave(special)} "
-        f"{element(special)}"
+        f"{get_odd_even(special)}/"
+        f"{get_big_small(special)} "
+        f"{get_color(special)} "
+        f"{get_element(special)}"
     )
 
+def max_miss_color(rows):
 
-def wave_predict(rows):
+    colors=[get_color(r[7]) for r in rows[:10]]
 
-    values = []
+    result={}
 
-    for r in rows[:10]:
-        values.append(wave(r[7]))
+    for c in ["红","蓝","绿"]:
 
-    freq = Counter(values)
+        miss=0
+        maxmiss=0
 
-    ordered = [x for x, _ in freq.most_common()]
+        for x in colors:
 
-    unique = []
+            if x != c:
 
-    for x in ordered:
-        if x not in unique:
-            unique.append(x)
-
-    main = unique[0]
-
-    second = unique[1] if len(unique) > 1 else unique[0]
-
-    return main, second
-
-
-def bs_predict(rows):
-
-    arr = []
-
-    for r in rows[:10]:
-        arr.append(big_small(r[7]))
-
-    return Counter(arr).most_common(1)[0][0]
-
-
-def oe_predict(rows):
-
-    arr = []
-
-    for r in rows[:10]:
-        arr.append(odd_even(r[7]))
-
-    return Counter(arr).most_common(1)[0][0]
-
-
-def max_miss_wave(rows):
-
-    result = {}
-
-    for target in ["红", "蓝", "绿"]:
-
-        miss = 0
-
-        max_miss = 0
-
-        for r in rows[:10]:
-
-            actual = wave(r[7])
-
-            if actual != target:
                 miss += 1
+
             else:
-                max_miss = max(max_miss, miss)
-                miss = 0
 
-        max_miss = max(max_miss, miss)
+                maxmiss=max(maxmiss,miss)
 
-        result[target] = max_miss
+                miss=0
+
+        maxmiss=max(maxmiss,miss)
+
+        result[c]=maxmiss
 
     return result
 
+def recent_hit(rows, strategy_func):
 
-def recommend_bet(main_wave, second_wave, bs, oe):
+    hit=0
+    total=0
 
-    print("\n推荐投注方案:")
+    for i in range(1,10):
 
-    if main_wave:
-        print(f"{main_wave}: 450 元")
+        past=rows[i:]
 
-    if second_wave != main_wave:
-        print(f"{second_wave}: 150 元")
+        nums,_=strategy_func(past)
+
+        real=rows[i-1][1:7]
+
+        h=len(set(nums)&set(real))
+
+        hit += h
+
+        total += 1
+
+    if total == 0:
+        return 0
+
+    return round(hit/total,2)
+
+def sync():
+
+    conn=init_db()
+
+    draw=fetch_real_draw()
+
+    if not draw:
+
+        print("未抓到真实开奖数据")
+
+        return
+
+    save_draw(conn,draw)
+
+    rows=load_history(conn)
+
+    print(f"同步完成: {len(rows)} 条")
+
+    print()
+
+    latest=rows[0]
+
+    print("最新开奖:")
+
+    print(
+        f"{latest[0]} | "
+        + " ".join(f"{x:02d}" for x in latest[1:7])
+        + f" + {latest[7]:02d}"
+    )
+
+    print()
+
+    next_period=str(int(latest[0])+1)
+
+    print(f"预测期号: {next_period}")
+
+    strategies = {
+        "组合策略": balanced_strategy,
+        "热号策略": hot_strategy,
+        "冷号回补": cold_strategy,
+        "近期动量": momentum_strategy,
+        "集成投票": ensemble_strategy,
+        "规律挖掘": pattern_strategy
+    }
+
+    for name,func in strategies.items():
+
+        nums,special=func(rows)
+
+        print_strategy(name,nums,special)
+
+    print()
+    print("特码波色预测:")
+
+    colors=[get_color(r[7]) for r in rows[:10]]
+
+    top=Counter(colors).most_common(2)
+
+    if len(top) >= 2:
+
+        print(f"主强: {top[0][0]} 次强: {top[1][0]}")
+
+    print()
+    print("大小单双预测:")
+
+    bs=Counter(
+        get_big_small(r[7])
+        for r in rows[:10]
+    ).most_common(1)[0][0]
+
+    oe=Counter(
+        get_odd_even(r[7])
+        for r in rows[:10]
+    ).most_common(1)[0][0]
+
+    print(f"大小: {bs}")
+    print(f"单双: {oe}")
+
+    print()
+    print("最大连空:")
+
+    miss=max_miss_color(rows)
+
+    for k,v in miss.items():
+
+        print(f"{k}波: {v}期")
+
+    print()
+    print("推荐投注方案:")
+
+    print(f"{top[0][0]}: 450 元")
+
+    if len(top) >= 2:
+        print(f"{top[1][0]}: 150 元")
 
     print(f"{bs}: 200 元")
     print(f"{oe}: 200 元")
 
-    print("\n赔率参考:")
+    print()
+    print("赔率参考:")
+
     print("红波: 2.7")
     print("蓝/绿波: 2.8")
     print("大小: 1.95")
     print("单双: 1.95")
 
+    print()
+    print("最近10期历史命中统计:")
 
-def backtest(rows):
+    for name,func in strategies.items():
 
-    strategies = {
-        "组合策略": balanced_strategy,
-        "热号策略": hot_strategy,
-        "冷号回补": cold_strategy,
-        "近期动量": momentum_strategy,
-        "集成投票": voting_strategy,
-        "规律挖掘": mining_strategy
-    }
-
-    print("\n最近10期历史命中统计:")
-
-    for name, func in strategies.items():
-
-        total_hit = 0
-
-        count = 0
-
-        for i in range(1, min(10, len(rows) - 1)):
-
-            sample = rows[i:]
-
-            picks, _ = func(sample)
-
-            actual = set(rows[i - 1][1:7])
-
-            hit = len(set(picks) & actual)
-
-            total_hit += hit
-
-            count += 1
-
-        avg = total_hit / count if count else 0
+        avg=recent_hit(rows,func)
 
         print(
             f"{name:<10}: "
-            f"期数={count} "
-            f"平均命中={avg:.2f}"
+            f"期数=9 "
+            f"平均命中={avg}"
         )
-
-
-def sync():
-
-    conn = init_db()
-
-    draws = fetch_latest()
-
-    if not draws:
-        print("未抓到真实开奖数据")
-        return
-
-    save_draws(conn, draws)
-
-    rows = get_recent(conn)
-
-    latest = rows[0]
-
-    next_expect = str(int(latest[0]) + 1)
-
-    print(f"已生成 {next_expect} 期预测")
-
-    print(f"同步完成: {len(rows)} 条")
-
-    print("\n最新开奖:")
-
-    nums = " ".join(
-        f"{x:02d}"
-        for x in latest[1:7]
-    )
-
-    print(
-        f"{latest[0]} | "
-        f"{nums} + "
-        f"{latest[7]:02d}"
-    )
-
-    print(f"\n预测期号: {next_expect}")
-
-    strategies = {
-        "组合策略": balanced_strategy,
-        "热号策略": hot_strategy,
-        "冷号回补": cold_strategy,
-        "近期动量": momentum_strategy,
-        "集成投票": voting_strategy,
-        "规律挖掘": mining_strategy
-    }
-
-    for name, func in strategies.items():
-
-        picks, special = func(rows)
-
-        print_strategy(
-            name,
-            picks,
-            special
-        )
-
-    main_wave, second_wave = wave_predict(rows)
-
-    print("\n特码波色预测:")
-    print(
-        f"主强: {main_wave} "
-        f"次强: {second_wave}"
-    )
-
-    bs = bs_predict(rows)
-
-    oe = oe_predict(rows)
-
-    print("\n大小单双预测:")
-    print(f"大小: {bs}")
-    print(f"单双: {oe}")
-
-    print("\n最大连空:")
-
-    miss = max_miss_wave(rows)
-
-    for k, v in miss.items():
-        print(f"{k}波: {v}期")
-
-    recommend_bet(
-        main_wave,
-        second_wave,
-        bs,
-        oe
-    )
-
-    backtest(rows)
-
 
 if __name__ == "__main__":
+
     sync()
