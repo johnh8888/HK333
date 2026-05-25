@@ -1,9 +1,12 @@
-name: 新澳门六合彩自动预测
+name: 新澳门六合彩 AI 自动预测 Pro
 
 on:
   schedule:
-    # UTC 14:00 = 港澳时间 22:00
-    - cron: '0 14 * * *'
+    # 每天香港时间 21:40 左右运行
+    # 香港 UTC+8
+    # GitHub Actions 使用 UTC
+    # 21:40 = UTC 13:40
+    - cron: '40 13 * * *'
 
   workflow_dispatch:
 
@@ -17,35 +20,50 @@ jobs:
 
     steps:
 
+      # 拉取仓库
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 运行同步与预测
+      # 安装依赖
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      # 执行预测系统
+      - name: Run AI Prediction System
         run: |
           python new_macau.py sync
 
-      - name: 运行真实 Walk Forward 回测
+      # 提交数据库
+      - name: Commit Database
         run: |
-          python new_macau.py backtest
 
-      - name: 提交数据库更新
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add new_macau.db
 
-          git commit -m "🤖 新澳门自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
+          git commit -m "🤖 新澳门自动预测更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "No changes"
 
           git push
 
-      - name: 保存数据库备份
+      # 保存 Artifact
+      - name: Upload Database Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: new-macau-db-backup
+          name: new-macau-db
           path: new_macau.db
+
+      # 保存日志
+      - name: Upload Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-log
+          path: |
+            *.log
