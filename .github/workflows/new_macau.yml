@@ -2,8 +2,9 @@ name: 新澳门六合彩自动预测
 
 on:
   schedule:
-    # 新澳门彩每天约 21:30 开奖，UTC+8 → UTC 13:30，设定 14:00 运行
+    # UTC 14:00 = 港澳时间 22:00
     - cron: '0 14 * * *'
+
   workflow_dispatch:
 
 permissions:
@@ -11,25 +12,39 @@ permissions:
 
 jobs:
   predict:
+
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 运行同步、回测、调优与预测
-        run: python new_macau.py sync --with-backtest --auto-tune
+      - name: 运行同步与预测
+        run: |
+          python new_macau.py sync
+
+      - name: 运行真实 Walk Forward 回测
+        run: |
+          python new_macau.py backtest
 
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add new_macau.db
+
           git commit -m "🤖 新澳门自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
+
           git push
 
-      - name: 保存 Artifact（备查）
+      - name: 保存数据库备份
         uses: actions/upload-artifact@v4
         with:
           name: new-macau-db-backup
