@@ -52,7 +52,7 @@ def init_db():
 
 def fetch_api_data():
     """
-    从 marksix6.net 获取新澳门彩数据，包含最新一期和历史记录
+    从 marksix6.net 获取新澳门彩最新一期及历史数据，只保留最近 10 期
     """
     url = "https://marksix6.net/index.php?api=1"
     try:
@@ -112,7 +112,7 @@ def fetch_api_data():
             item = item.strip()
             # 支持两种常见格式：
             # 格式1: "2026144期：47,31,29,33,22,26,43"
-            # 格式2: "2026144 47 31 29 33 22 26 +43" 等
+            # 格式2: "2026144 47 31 29 33 22 26 +43"
             if "期：" in item:
                 parts = item.split("期：", 1)
                 issue = parts[0].strip()
@@ -136,7 +136,6 @@ def fetch_api_data():
                         except:
                             break
                     else:
-                        # 解析特码
                         special_str = parts[-1].replace("+", "")
                         try:
                             special = int(special_str)
@@ -156,7 +155,11 @@ def fetch_api_data():
         result = list(uniq.values())
         result.sort(key=lambda x: x["issue"])
 
-        print(f"抓取到历史数据: {len(result)} 条")
+        # ★ 只保留最近 10 期
+        if len(result) > 10:
+            result = result[-10:]
+
+        print(f"抓取到历史数据: {len(result)} 条（仅保留最近10期）")
         return result
 
     except Exception as e:
@@ -296,10 +299,8 @@ def calc_wave_prediction(records):
 
 def backtest_wave(records):
     recent = records[-10:]
-    hit = 0
-    total = 0
-    max_miss = 0
-    miss = 0
+    hit = total = 0
+    max_miss = miss = 0
     for i in range(2, len(recent)):
         hist = recent[:i]
         main, second = calc_wave_prediction(hist)
@@ -372,7 +373,6 @@ def sync():
 
     if len(all_records) < 10:
         print(f"⚠️ 历史数据不足10期，当前仅有 {len(all_records)} 期，部分预测可能不准")
-        # 即使不足10期，也继续显示已有数据
 
     latest = all_records[-1]
     print(
@@ -414,7 +414,7 @@ def sync():
 
     print()
 
-    # 回测（需要至少10期）
+    # 回测
     if len(all_records) >= 10:
         hit, total, max_miss = backtest_wave(all_records)
         size_hit, odd_hit, t2, size_max, odd_max = backtest_size_odd(all_records)
