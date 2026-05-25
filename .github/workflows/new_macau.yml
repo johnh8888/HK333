@@ -20,11 +20,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: 删除旧数据库
+        run: |
+          rm -f new_macau.db
+
       - name: 升级 pip
         run: |
           python -m pip install --upgrade pip
 
-      - name: 运行新澳门彩预测
+      - name: 运行预测系统
         run: |
           python new_macau.py sync
 
