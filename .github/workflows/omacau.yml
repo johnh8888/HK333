@@ -27,7 +27,7 @@ jobs:
 
       - name: 运行主脚本
         run: |
-          python macau_predictor_pro_v3.py sync
+          python macau_predictor_pro_v4.py sync
 
       - name: 提交数据库
         run: |
