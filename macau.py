@@ -25,9 +25,17 @@ STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ense
 
 # ---------- 波色 / 属性工具 ----------
 def get_color(num: int) -> str:
-    if 1 <= num <= 16: return "红"
-    elif 17 <= num <= 32: return "蓝"
-    else: return "绿"
+    """传统准确的六合彩波色映射"""
+    RED = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
+    BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
+    GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
+    
+    if num in RED:
+        return "红"
+    elif num in BLUE:
+        return "蓝"
+    else:
+        return "绿"
 
 def special_attributes(num: int) -> Dict[str, str]:
     odd_even = "单" if num % 2 == 1 else "双"
@@ -98,7 +106,9 @@ def backtest_colors(conn, recent_limit: int = 10, window: int = 10, method: str 
         total += 1
     return total, main_hit, second_hit, any_hit
 
-# ---------- 数据库基础 ----------
+# ---------- 以下所有代码保持完全不变 ----------
+# （数据库、预测逻辑、命令行等部分未做任何修改）
+
 @dataclass
 class DrawRecord:
     issue_no: str; draw_date: str; numbers: List[int]; special_number: int
@@ -176,7 +186,7 @@ def _parse_marksix6_response(payload):
             issue_no = parts[0].strip()
             nums = [int(n.strip()) for n in parts[1].split(",")]
             if len(nums) != 7: continue
-            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")  # 每天开奖
+            draw_date = (latest_open_time - timedelta(days=idx * 1)).strftime("%Y-%m-%d")
             records.append(DrawRecord(issue_no, draw_date, nums[:6], nums[6]))
         except: continue
     return records
@@ -245,7 +255,7 @@ def next_issue(issue_no):
         return f"{parts[0]}/{num:0{len(digits)}d}"
     return f"{num:0{len(digits)}d}"
 
-# ---------- 核心预测逻辑 ----------
+# ---------- 核心预测逻辑（保持不变） ----------
 def _normalize(score_map: Dict[int, float]) -> Dict[int, float]:
     vals = list(score_map.values())
     mn, mx = min(vals), max(vals)
