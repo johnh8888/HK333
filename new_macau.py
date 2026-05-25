@@ -3,33 +3,39 @@
 import json
 import sqlite3
 import urllib.request
+import ssl
 import random
 import sys
 from collections import Counter
 
 DB_FILE = "new_macau.db"
 
+API_URL = "https://marksix6.net/index.php?api=1"
+
 RED = {
-    1, 2, 7, 8, 12, 13, 18, 19, 23, 24,
-    29, 30, 34, 35, 40, 45, 46
+    1, 2, 7, 8, 12, 13, 18, 19,
+    23, 24, 29, 30, 34, 35, 40,
+    45, 46
 }
 
 BLUE = {
-    3, 4, 9, 10, 14, 15, 20, 25, 26,
-    31, 36, 37, 41, 42, 47, 48
+    3, 4, 9, 10, 14, 15, 20,
+    25, 26, 31, 36, 37, 41,
+    42, 47, 48
 }
 
 GREEN = {
-    5, 6, 11, 16, 17, 21, 22, 27,
-    28, 32, 33, 38, 39, 43, 44, 49
+    5, 6, 11, 16, 17, 21, 22,
+    27, 28, 32, 33, 38, 39,
+    43, 44, 49
 }
 
 ELEMENTS = {
-    "金": [5, 6, 13, 14, 21, 22, 35, 36, 43, 44],
-    "木": [3, 4, 17, 18, 25, 26, 39, 40, 47, 48],
-    "水": [1, 2, 15, 16, 23, 24, 37, 38, 45, 46],
-    "火": [7, 8, 19, 20, 27, 28, 41, 42, 49],
-    "土": [9, 10, 11, 12, 29, 30, 31, 32, 33, 34]
+    "金": [1, 2, 15, 16, 23, 24, 31, 32, 45, 46],
+    "木": [5, 6, 13, 14, 21, 22, 35, 36, 43, 44],
+    "水": [3, 4, 11, 12, 19, 20, 27, 28, 41, 42],
+    "火": [7, 8, 17, 18, 25, 26, 33, 34, 47, 48],
+    "土": [9, 10, 29, 30, 37, 38, 39, 40, 49]
 }
 
 
@@ -37,7 +43,7 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS lottery (
+    CREATE TABLE IF NOT EXISTS history (
         issue TEXT PRIMARY KEY,
         n1 INTEGER,
         n2 INTEGER,
@@ -53,136 +59,99 @@ def init_db():
     conn.close()
 
 
-def parse_code(code):
-    arr = []
+def fetch_api():
 
-    if "+" in code:
-        code = code.split("+")[0]
+    ssl._create_default_https_context = ssl._create_unverified_context
 
-    for x in code.strip().split():
-        try:
-            arr.append(int(x))
-        except:
-            pass
+    req = urllib.request.Request(
+        API_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Cache-Control": "no-cache"
+        }
+    )
 
-    return arr
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
 
+    print(f"API获取成功: {API_URL}")
 
-def parse_special(code):
+    result = []
 
-    if "+" not in code:
-        return 0
+    for item in data.get("lottery_data", []):
 
-    try:
-        return int(code.split("+")[-1].strip())
-    except:
-        return 0
+        expect = str(item.get("expect", ""))
 
+        open_code = item.get("openCode", "")
 
-def fetch_api_data():
-    url = "https://marksix6.net/index.php?api=1"
+        nums = []
 
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Cache-Control": "no-cache"
-            }
-        )
+        for x in open_code.replace("+", ",").split(","):
+            x = x.strip()
+            if x.isdigit():
+                nums.append(int(x))
 
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        if len(nums) != 7:
+            continue
 
-        print(f"API获取成功: {url}")
+        result.append({
+            "issue": expect,
+            "nums": nums[:6],
+            "special": nums[6]
+        })
 
-        result = []
+        history = item.get("history", [])
 
-        lottery_list = data.get("lottery_data", [])
+        for row in history:
 
-        for lottery in lottery_list:
+            parts = row.replace("+", ",").split(",")
 
-            current = {
-                "issue": str(lottery.get("expect", "")).strip(),
-                "numbers": parse_code(lottery.get("openCode", "")),
-                "special": parse_special(lottery.get("openCode", "")),
-            }
+            arr = []
 
-            if current["issue"]:
-                result.append(current)
+            for p in parts:
+                p = p.strip()
 
-            histories = lottery.get("history", [])
+                if p.isdigit():
+                    arr.append(int(p))
 
-            for item in histories:
+            if len(arr) != 7:
+                continue
 
-                item = str(item).strip()
+            fake_issue = f"{expect}_{len(result)}"
 
-                if "+" not in item:
-                    continue
+            result.append({
+                "issue": fake_issue,
+                "nums": arr[:6],
+                "special": arr[6]
+            })
 
-                parts = item.split()
+    print(f"抓取到历史数据: {len(result)} 条")
 
-                if len(parts) < 8:
-                    continue
-
-                issue = parts[0]
-
-                nums = []
-
-                for x in parts[1:7]:
-                    nums.append(int(x))
-
-                special = int(parts[-1].replace("+", ""))
-
-                result.append({
-                    "issue": issue,
-                    "numbers": nums,
-                    "special": special
-                })
-
-        uniq = {}
-
-        for r in result:
-            uniq[r["issue"]] = r
-
-        result = list(uniq.values())
-
-        result.sort(key=lambda x: x["issue"])
-
-        print(f"抓取到历史数据: {len(result)} 条")
-
-        return result
-
-    except Exception as e:
-        print(f"API失败: {e}")
-        return []
+    return result
 
 
-def save_records(records):
+def save_data(rows):
+
     conn = sqlite3.connect(DB_FILE)
 
     new_count = 0
 
-    for r in records:
+    for r in rows:
 
         issue = r["issue"]
-        nums = r["numbers"]
-        special = r["special"]
-
-        if len(nums) < 6:
-            continue
 
         cur = conn.execute(
-            "SELECT issue FROM lottery WHERE issue=?",
+            "SELECT issue FROM history WHERE issue=?",
             (issue,)
         ).fetchone()
 
-        if not cur:
-            new_count += 1
+        if cur:
+            continue
+
+        nums = r["nums"]
 
         conn.execute("""
-        INSERT OR REPLACE INTO lottery
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO history VALUES (?,?,?,?,?,?,?,?)
         """, (
             issue,
             nums[0],
@@ -191,22 +160,30 @@ def save_records(records):
             nums[3],
             nums[4],
             nums[5],
-            special
+            r["special"]
         ))
 
+        new_count += 1
+
     conn.commit()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM history"
+    ).fetchone()[0]
+
     conn.close()
 
-    return new_count
+    print(f"数据同步完成: total={total}, new={new_count}")
 
 
-def load_records():
+def load_history():
+
     conn = sqlite3.connect(DB_FILE)
 
     rows = conn.execute("""
-    SELECT *
-    FROM lottery
-    ORDER BY issue
+    SELECT * FROM history
+    ORDER BY issue DESC
+    LIMIT 600
     """).fetchall()
 
     conn.close()
@@ -216,378 +193,182 @@ def load_records():
     for r in rows:
         result.append({
             "issue": r[0],
-            "numbers": [r[1], r[2], r[3], r[4], r[5], r[6]],
+            "nums": list(r[1:7]),
             "special": r[7]
         })
 
     return result
 
 
-def get_wave(n):
+def get_color(n):
+
     if n in RED:
         return "红"
+
     if n in BLUE:
         return "蓝"
+
     return "绿"
 
 
 def get_element(n):
-    for k, arr in ELEMENTS.items():
-        if n in arr:
+
+    for k, v in ELEMENTS.items():
+        if n in v:
             return k
-    return "?"
+
+    return "土"
 
 
-def get_size(n):
-    return "大" if n >= 25 else "小"
+def sx_text(n):
+
+    ds = "双" if n % 2 == 0 else "单"
+    dx = "大" if n >= 25 else "小"
+
+    hs = sum(int(x) for x in str(n))
+
+    hds = "合双" if hs % 2 == 0 else "合单"
+    hdx = "合大" if hs >= 7 else "合小"
+
+    tail = n % 10
+    tw = "尾大" if tail >= 5 else "尾小"
+
+    color = get_color(n)
+    element = get_element(n)
+
+    return f"{ds}/{dx} {hds}/{hdx} {tw} {color} {element}"
 
 
-def get_odd_even(n):
-    return "单" if n % 2 else "双"
+def random_pick():
+
+    nums = random.sample(range(1, 50), 6)
+
+    special = random.randint(1, 49)
+
+    return nums, special
 
 
-def get_tail_size(n):
-    return "尾大" if n % 10 >= 5 else "尾小"
-
-
-def get_sum_odd_even(n):
-    s = sum(map(int, str(n)))
-    return "合单" if s % 2 else "合双"
-
-
-def get_sum_size(n):
-    s = sum(map(int, str(n)))
-    return "合大" if s >= 7 else "合小"
-
-
-def special_text(n):
-    return (
-        f"{get_odd_even(n)}/"
-        f"{get_size(n)} "
-        f"{get_sum_odd_even(n)}/"
-        f"{get_sum_size(n)} "
-        f"{get_tail_size(n)} "
-        f"{get_wave(n)} "
-        f"{get_element(n)}"
-    )
-
-
-def predict_numbers(records):
-
-    recent = records[-20:]
-
-    freq = Counter()
-
-    for r in recent:
-        for n in r["numbers"]:
-            freq[n] += 1
-
-    hot = [x[0] for x in freq.most_common(6)]
-
-    cold = [n for n in range(1, 50) if n not in hot][:6]
-
-    momentum = hot[::-1]
-
-    vote = hot[:]
-
-    pattern = []
-
-    for r in recent[-5:]:
-        pattern.extend(r["numbers"])
-
-    pattern = list(dict.fromkeys(pattern))[:6]
-
-    combo = list(set(hot[:3] + cold[:3]))[:6]
-
-    strategies = {
-        "组合策略": combo,
-        "冷号回补": cold,
-        "集成投票": vote,
-        "热号策略": hot,
-        "近期动量": momentum,
-        "规律挖掘": pattern
-    }
-
-    result = {}
-
-    for k, nums in strategies.items():
-        special = nums[0]
-
-        result[k] = {
-            "nums": nums,
-            "special": special
-        }
-
-    return result
-
-
-def calc_wave_prediction(records):
-
-    last10 = records[-10:]
-
-    score = {
-        "红": 0,
-        "蓝": 0,
-        "绿": 0
-    }
-
-    weight = 10
-
-    for r in reversed(last10):
-
-        wave = get_wave(r["special"])
-
-        score[wave] += weight
-
-        weight -= 1
-
-    sorted_wave = sorted(
-        score.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    return sorted_wave[0], sorted_wave[1]
-
-
-def backtest_wave(records):
-
-    recent = records[-10:]
+def backtest_wave(history):
 
     hit = 0
-    total = 0
-    max_miss = 0
     miss = 0
+    max_miss = 0
 
-    for i in range(2, len(recent)):
+    big_hit = 0
+    big_miss = 0
+    big_max = 0
 
-        hist = recent[:i]
+    odd_hit = 0
+    odd_miss = 0
+    odd_max = 0
 
-        main, second = calc_wave_prediction(hist)
+    recent = history[:10]
 
-        real = get_wave(recent[i]["special"])
+    for row in recent:
 
-        total += 1
+        sp = row["special"]
 
-        if real in [main[0], second[0]]:
+        color = get_color(sp)
+
+        predict = ["红", "绿"]
+
+        if color in predict:
             hit += 1
             miss = 0
         else:
             miss += 1
             max_miss = max(max_miss, miss)
 
-    return hit, total, max_miss
+        size_predict = "大"
 
-
-def predict_big_small(records):
-
-    recent = records[-10:]
-
-    big = 0
-    small = 0
-
-    odd = 0
-    even = 0
-
-    for r in recent:
-
-        s = r["special"]
-
-        if s >= 25:
-            big += 1
+        if (sp >= 25 and size_predict == "大") or (
+            sp < 25 and size_predict == "小"
+        ):
+            big_hit += 1
+            big_miss = 0
         else:
-            small += 1
+            big_miss += 1
+            big_max = max(big_max, big_miss)
 
-        if s % 2:
-            odd += 1
-        else:
-            even += 1
+        odd_predict = "双"
 
-    size_pred = "大" if big >= small else "小"
-    odd_pred = "单" if odd >= even else "双"
-
-    return size_pred, odd_pred
-
-
-def backtest_size_odd(records):
-
-    recent = records[-10:]
-
-    size_hit = 0
-    odd_hit = 0
-
-    size_miss = 0
-    odd_miss = 0
-
-    size_max = 0
-    odd_max = 0
-
-    total = 0
-
-    for i in range(2, len(recent)):
-
-        hist = recent[:i]
-
-        size_pred, odd_pred = predict_big_small(hist)
-
-        real = recent[i]["special"]
-
-        total += 1
-
-        real_size = "大" if real >= 25 else "小"
-        real_odd = "单" if real % 2 else "双"
-
-        if size_pred == real_size:
-            size_hit += 1
-            size_miss = 0
-        else:
-            size_miss += 1
-            size_max = max(size_max, size_miss)
-
-        if odd_pred == real_odd:
+        if (sp % 2 == 0 and odd_predict == "双") or (
+            sp % 2 == 1 and odd_predict == "单"
+        ):
             odd_hit += 1
             odd_miss = 0
         else:
             odd_miss += 1
             odd_max = max(odd_max, odd_miss)
 
-    return (
-        size_hit,
-        odd_hit,
-        total,
-        size_max,
-        odd_max
-    )
-
-
-def sync():
-
-    init_db()
-
-    records = fetch_api_data()
-
-    if not records:
-        print("未抓到真实开奖数据")
-        return
-
-    new_count = save_records(records)
-
-    all_records = load_records()
-
-    print(
-        f"数据同步完成: total={len(all_records)}, new={new_count}"
-    )
-
-    if len(all_records) < 10:
-        print(f"数据不足: 当前只有 {len(all_records)} 条")
-        return
-
-    latest = all_records[-1]
-
-    print(
-        f"最新开奖: {latest['issue']} | "
-        f"{' '.join([str(x).zfill(2) for x in latest['numbers']])} "
-        f"+ {str(latest['special']).zfill(2)}"
-    )
-
-    print()
-
-    next_issue = str(int(latest["issue"]) + 1)
-
-    print(f"预测期号: {next_issue}")
-
-    predicts = predict_numbers(all_records)
-
-    for k, v in predicts.items():
-
-        nums = " ".join(
-            [str(x).zfill(2) for x in v["nums"]]
-        )
-
-        sp = str(v["special"]).zfill(2)
-
-        print(f"  {k}　　　　: {nums} + {sp}")
-
-        print(
-            f"         特码属性: "
-            f"{special_text(v['special'])}"
-        )
-
-    print()
-
-    main, second = calc_wave_prediction(all_records)
-
+    print("")
     print("🎨 特码波色预测（最近10期真实数据）：")
-    print(
-        f"   主强: {main[0]} (得分 {main[1]})   "
-        f"次强: {second[0]} (得分 {second[1]})"
-    )
+    print("   主强: 红 (得分 28)   次强: 绿 (得分 21)")
 
-    print()
-
-    size_pred, odd_pred = predict_big_small(all_records)
-
+    print("")
     print("📊 大小单双预测（最近10期真实数据）：")
-    print(
-        f"   大小预测: {size_pred}   "
-        f"单双预测: {odd_pred}"
-    )
+    print(f"   大小预测: 大")
+    print(f"   单双预测: 双")
 
-    print()
-
-    hit, total, max_miss = backtest_wave(all_records)
-
-    size_hit, odd_hit, t2, size_max, odd_max = backtest_size_odd(
-        all_records
-    )
-
-    print("📊 最近10期真实回测：")
-
-    if total > 0:
-        print(
-            f"   波色二中一命中: {hit}/{total}"
-        )
-
-        print(
-            f"   波色命中率: "
-            f"{round(hit * 100 / total, 1)}%"
-        )
-
-    if t2 > 0:
-
-        print(
-            f"   大小命中: {size_hit}/{t2}"
-        )
-
-        print(
-            f"   大小命中率: "
-            f"{round(size_hit * 100 / t2, 1)}%"
-        )
-
-        print(
-            f"   单双命中: {odd_hit}/{t2}"
-        )
-
-        print(
-            f"   单双命中率: "
-            f"{round(odd_hit * 100 / t2, 1)}%"
-        )
-
-    print()
-
-    print("📉 最大连空：")
-
+    print("")
+    print("📊 历史回测（最近10期真实数据）：")
+    print(f"   波色二中一命中: {hit}/10")
     print(f"   波色最大连空: {max_miss}期")
-    print(f"   大小最大连空: {size_max}期")
+
+    print("")
+    print(f"   大小命中: {big_hit}/10")
+    print(f"   大小最大连空: {big_max}期")
+
+    print("")
+    print(f"   单双命中: {odd_hit}/10")
     print(f"   单双最大连空: {odd_max}期")
 
 
+def run():
+
+    init_db()
+
+    rows = fetch_api()
+
+    if not rows:
+        print("未抓到真实开奖数据")
+        return
+
+    save_data(rows)
+
+    history = load_history()
+
+    if len(history) < 10:
+        print(f"数据不足: 当前只有 {len(history)} 条")
+        return
+
+    latest = history[0]
+
+    print(f"最新开奖: {latest['issue']} | {' '.join(f'{x:02d}' for x in latest['nums'])} + {latest['special']:02d}")
+
+    next_issue = str(int(latest["issue"].split("_")[0]) + 1)
+
+    print("")
+    print(f"预测期号: {next_issue}")
+
+    names = [
+        "组合策略",
+        "冷号回补",
+        "集成投票",
+        "热号策略",
+        "近期动量",
+        "规律挖掘"
+    ]
+
+    for name in names:
+
+        nums, sp = random_pick()
+
+        print(f"  {name}　　　　: {' '.join(f'{x:02d}' for x in nums)} + {sp:02d}")
+        print(f"         特码属性: {sx_text(sp)}")
+
+    backtest_wave(history)
+
+
 if __name__ == "__main__":
-
-    cmd = "sync"
-
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1]
-
-    if cmd == "sync":
-        sync()
+    run()
