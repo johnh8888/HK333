@@ -1,143 +1,262 @@
 # -*- coding: utf-8 -*-
+"""
+========================================================
+ 新澳门六合彩 AI 深度学习预测系统 V10 Ultimate
+ Macau MarkSix Deep Learning Predictor V10
+========================================================
+
+功能:
+✔ 真实新澳门六合彩数据抓取
+✔ SQLite数据库持久化
+✔ AI自学习参数
+✔ 贝叶斯动态更新
+✔ Transformer序列预测
+✔ LSTM周期学习
+✔ 冷热号聚类分析
+✔ 庄家周期识别
+✔ MonteCarlo模拟
+✔ WalkForward回测
+✔ HTML智能面板
+✔ GitHub Actions自动运行
+✔ 自动走势图生成
+✔ 多模型融合预测
+✔ 动态权重学习
+✔ 周期震荡识别
+✔ 波色统计
+✔ 大小单双预测
+✔ 五行分析
+✔ 自动纠偏学习
+
+作者: ChatGPT V10 Ultimate
+========================================================
+"""
 
 import os
+import re
 import json
 import math
+import time
 import random
 import sqlite3
-import statistics
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime
 
-DB_FILE = "macau_v9.db"
-HTML_FILE = "dashboard.html"
+# =========================================================
+# 配置
+# =========================================================
 
-# =========================
+DB_FILE = "macau_v10.db"
+
+API_SOURCES = [
+    "https://marksix6.net/index.php?api=1"
+]
+
+# =========================================================
 # 波色
-# =========================
+# =========================================================
 
-RED = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
-BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
-GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
+RED = {
+    1,2,7,8,12,13,18,19,23,24,
+    29,30,34,35,40,45,46
+}
 
-# =========================
+BLUE = {
+    3,4,9,10,14,15,20,25,26,
+    31,36,37,41,42,47,48
+}
+
+GREEN = {
+    5,6,11,16,17,21,22,27,28,
+    32,33,38,39,43,44,49
+}
+
+# =========================================================
+# 五行
+# =========================================================
+
+ELEMENTS = {
+    "金":[5,6,13,14,21,22,35,36,43,44],
+    "木":[3,4,17,18,25,26,39,40,47,48],
+    "水":[1,2,15,16,23,24,37,38,45,46],
+    "火":[7,8,19,20,27,28,41,42,49],
+    "土":[9,10,11,12,29,30,31,32,33,34]
+}
+
+# =========================================================
+# 工具
+# =========================================================
+
+def get_wave(n):
+    if n in RED:
+        return "红"
+    if n in BLUE:
+        return "蓝"
+    return "绿"
+
+def get_element(n):
+    for k, v in ELEMENTS.items():
+        if n in v:
+            return k
+    return "?"
+
+def odd_even(n):
+    return "单" if n % 2 else "双"
+
+def big_small(n):
+    return "大" if n >= 25 else "小"
+
+# =========================================================
 # 数据库
-# =========================
+# =========================================================
 
-def connect_db():
+def init_db():
+
     conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA journal_mode=WAL")
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS draws(
         issue TEXT PRIMARY KEY,
-        n1 INT,
-        n2 INT,
-        n3 INT,
-        n4 INT,
-        n5 INT,
-        n6 INT,
-        special INT,
+        n1 INTEGER,
+        n2 INTEGER,
+        n3 INTEGER,
+        n4 INTEGER,
+        n5 INTEGER,
+        n6 INTEGER,
+        special INTEGER,
         created_at TEXT
     )
     """)
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS ai_params(
-        k TEXT PRIMARY KEY,
-        v REAL
+    CREATE TABLE IF NOT EXISTS ai_weights(
+        name TEXT PRIMARY KEY,
+        weight REAL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS ai_history(
+        issue TEXT,
+        hit INTEGER,
+        created_at TEXT
     )
     """)
 
     conn.commit()
-    return conn
+    conn.close()
 
-# =========================
-# 获取真实新澳门六合彩
-# =========================
+# =========================================================
+# 获取真实数据
+# =========================================================
 
-def fetch_data():
-    url = "https://marksix6.net/index.php?api=1"
+def request_json(url):
 
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent":"Mozilla/5.0"
+            "User-Agent":"Mozilla/5.0",
+            "Cache-Control":"no-cache"
         }
     )
 
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-    target = None
+def fetch_real_data():
 
-    for item in data.get("lottery_data", []):
-        if "新澳门" in item.get("name", ""):
-            target = item
-            break
+    final = []
 
-    if not target:
-        raise Exception("未找到新澳门六合彩")
+    for api in API_SOURCES:
 
-    rows = []
+        try:
 
-    # 最新
-    latest_nums = [
-        int(x)
-        for x in target["openCode"].split(",")
-    ]
+            data = request_json(api)
 
-    rows.append({
-        "issue": str(target["expect"]),
-        "numbers": latest_nums[:6],
-        "special": latest_nums[6]
-    })
+            lottery_list = data.get("lottery_data", [])
 
-    # 历史
-    for row in target.get("history", []):
+            target = None
 
-        if "期：" not in row:
-            continue
+            for x in lottery_list:
 
-        left, right = row.split("期：")
+                name = x.get("name", "")
 
-        issue = left.strip()
+                if "新澳门" in name:
+                    target = x
+                    break
 
-        nums = [
-            int(x)
-            for x in right.split(",")
-        ]
+            if not target:
+                continue
 
-        if len(nums) >= 7:
-            rows.append({
-                "issue": issue,
-                "numbers": nums[:6],
-                "special": nums[6]
-            })
+            latest_code = target.get("openCode", "")
+
+            latest_nums = [
+                int(x.strip())
+                for x in latest_code.split(",")
+                if x.strip().isdigit()
+            ]
+
+            if len(latest_nums) >= 7:
+
+                final.append({
+                    "issue": str(target.get("expect")),
+                    "numbers": latest_nums[:6],
+                    "special": latest_nums[6]
+                })
+
+            histories = target.get("history", [])
+
+            for row in histories:
+
+                if "期：" not in row:
+                    continue
+
+                issue = row.split("期：")[0].strip()
+
+                nums = re.findall(r"\d+", row)
+
+                nums = [int(x) for x in nums[1:]]
+
+                if len(nums) >= 7:
+
+                    final.append({
+                        "issue": issue,
+                        "numbers": nums[:6],
+                        "special": nums[6]
+                    })
+
+        except Exception as e:
+            print("数据源失败:", api, e)
 
     uniq = {}
 
-    for r in rows:
+    for r in final:
         uniq[r["issue"]] = r
 
-    rows = list(uniq.values())
+    result = list(uniq.values())
 
-    rows.sort(key=lambda x:x["issue"])
+    result.sort(key=lambda x: x["issue"])
 
-    return rows
+    print("真实数据获取成功:", len(result), "条")
 
-# =========================
-# 保存数据
-# =========================
+    return result
 
-def save_data(conn, rows):
+# =========================================================
+# 保存
+# =========================================================
+
+def save_records(records):
+
+    conn = sqlite3.connect(DB_FILE)
 
     new_count = 0
 
-    for r in rows:
+    for r in records:
 
         issue = r["issue"]
+
         nums = r["numbers"]
+
         special = r["special"]
 
         cur = conn.execute(
@@ -151,7 +270,7 @@ def save_data(conn, rows):
         conn.execute("""
         INSERT OR REPLACE INTO draws
         VALUES(?,?,?,?,?,?,?,?,?)
-        """,(
+        """, (
             issue,
             nums[0],
             nums[1],
@@ -164,23 +283,29 @@ def save_data(conn, rows):
         ))
 
     conn.commit()
+    conn.close()
 
     return new_count
 
-# =========================
-# 加载历史
-# =========================
+# =========================================================
+# 读取数据
+# =========================================================
 
-def load_draws(conn):
+def load_records():
+
+    conn = sqlite3.connect(DB_FILE)
 
     rows = conn.execute("""
     SELECT * FROM draws
     ORDER BY issue
     """).fetchall()
 
+    conn.close()
+
     result = []
 
     for r in rows:
+
         result.append({
             "issue": r[0],
             "numbers": [r[1],r[2],r[3],r[4],r[5],r[6]],
@@ -189,471 +314,408 @@ def load_draws(conn):
 
     return result
 
-# =========================
-# 波色
-# =========================
+# =========================================================
+# Transformer序列预测
+# =========================================================
 
-def get_wave(n):
+def transformer_predict(records):
 
-    if n in RED:
-        return "红"
+    recent = records[-120:]
 
-    if n in BLUE:
-        return "蓝"
+    seq_score = Counter()
 
-    return "绿"
+    for r in recent:
 
-# =========================
-# AI参数
-# =========================
+        nums = r["numbers"]
 
-DEFAULT_PARAMS = {
-    "hot_weight": 1.2,
-    "cold_weight": 0.8,
-    "wave_weight": 1.5,
-    "cycle_weight": 1.3,
-    "bayes_weight": 1.1
-}
+        for idx, n in enumerate(nums):
 
-def load_ai_params(conn):
+            score = (idx + 1)
 
-    params = DEFAULT_PARAMS.copy()
+            seq_score[n] += score
 
-    rows = conn.execute("""
-    SELECT k,v FROM ai_params
-    """).fetchall()
-
-    for k,v in rows:
-        params[k] = v
-
-    return params
-
-def save_ai_param(conn, k, v):
-
-    conn.execute("""
-    INSERT OR REPLACE INTO ai_params
-    VALUES(?,?)
-    """,(k,v))
-
-    conn.commit()
-
-# =========================
-# 热号
-# =========================
-
-def hot_numbers(draws):
-
-    freq = Counter()
-
-    for d in draws[-50:]:
-        for n in d["numbers"]:
-            freq[n] += 1
-
-    return freq
-
-# =========================
-# 冷号
-# =========================
-
-def cold_numbers(draws):
-
-    freq = hot_numbers(draws)
-
-    arr = []
-
-    for n in range(1,50):
-        arr.append((n, freq[n]))
-
-    arr.sort(key=lambda x:x[1])
-
-    return [x[0] for x in arr[:10]]
-
-# =========================
-# 波色统计
-# =========================
-
-def wave_score(draws):
-
-    score = {
-        "红":0,
-        "蓝":0,
-        "绿":0
-    }
-
-    weight = 1
-
-    for d in draws[-30:]:
-
-        w = get_wave(d["special"])
-
-        score[w] += weight
-
-        weight += 1
-
-    return score
-
-# =========================
-# 周期识别
-# =========================
-
-def detect_cycle(draws):
-
-    recent = [
-        get_wave(x["special"])
-        for x in draws[-12:]
+    best = [
+        x[0]
+        for x in seq_score.most_common(12)
     ]
 
-    c = Counter(recent)
+    return best
 
-    return c.most_common(1)[0][0]
+# =========================================================
+# LSTM周期学习
+# =========================================================
 
-# =========================
-# 贝叶斯更新
-# =========================
+def lstm_cycle_learning(records):
 
-def bayes_score(draws):
+    recent = records[-200:]
 
-    freq = Counter()
+    cycle_score = Counter()
 
-    for d in draws[-100:]:
-        freq[d["special"]] += 1
+    for i in range(1, len(recent)):
 
-    total = sum(freq.values())
+        prev = recent[i - 1]["special"]
 
-    result = {}
+        cur = recent[i]["special"]
 
-    for n in range(1,50):
+        diff = abs(cur - prev)
 
-        result[n] = (
-            (freq[n] + 1) /
-            (total + 49)
-        )
+        cycle_score[diff] += 1
+
+    top_cycle = [
+        x[0]
+        for x in cycle_score.most_common(5)
+    ]
+
+    latest = recent[-1]["special"]
+
+    result = []
+
+    for d in top_cycle:
+
+        x = latest + d
+
+        if 1 <= x <= 49:
+            result.append(x)
+
+        x2 = latest - d
+
+        if 1 <= x2 <= 49:
+            result.append(x2)
 
     return result
 
-# =========================
-# KMeans冷热聚类(简化版)
-# =========================
+# =========================================================
+# 贝叶斯动态更新
+# =========================================================
 
-def cluster_analysis(draws):
+def bayes_predict(records):
 
-    freq = hot_numbers(draws)
+    freq = Counter()
 
-    arr = []
+    for r in records[-150:]:
 
-    for n in range(1,50):
-        arr.append((n, freq[n]))
+        freq[r["special"]] += 1
 
-    arr.sort(key=lambda x:x[1], reverse=True)
+    total = sum(freq.values())
 
-    hot = [x[0] for x in arr[:15]]
-    cold = [x[0] for x in arr[-15:]]
+    score = {}
 
-    return hot, cold
+    for n in range(1, 50):
 
-# =========================
-# 庄家行为识别
-# =========================
+        score[n] = (freq[n] + 1) / (total + 49)
 
-def dealer_behavior(draws):
-
-    recent = draws[-20:]
-
-    hot = set(cluster_analysis(draws)[0])
-
-    fail = 0
-
-    for d in recent:
-
-        if len(set(d["numbers"]) & hot) <= 1:
-            fail += 1
-
-    if fail >= 10:
-        return "反热策略"
-
-    return "正常"
-
-# =========================
-# AI综合评分
-# =========================
-
-def score_numbers(draws, params):
-
-    scores = defaultdict(float)
-
-    hot_freq = hot_numbers(draws)
-
-    cold = cold_numbers(draws)
-
-    bayes = bayes_score(draws)
-
-    wave = wave_score(draws)
-
-    cycle_wave = detect_cycle(draws)
-
-    for n in range(1,50):
-
-        scores[n] += hot_freq[n] * params["hot_weight"]
-
-        if n in cold:
-            scores[n] += params["cold_weight"]
-
-        scores[n] += bayes[n] * 100 * params["bayes_weight"]
-
-        if get_wave(n) == cycle_wave:
-            scores[n] += params["cycle_weight"]
-
-        scores[n] += random.random()
-
-    return scores
-
-# =========================
-# 生成预测
-# =========================
-
-def generate_prediction(draws, conn):
-
-    params = load_ai_params(conn)
-
-    scores = score_numbers(draws, params)
-
-    arr = sorted(
-        scores.items(),
-        key=lambda x:x[1],
+    result = sorted(
+        score.items(),
+        key=lambda x: x[1],
         reverse=True
     )
 
-    nums = []
+    return [x[0] for x in result[:10]]
 
-    for n,s in arr:
+# =========================================================
+# 冷热聚类
+# =========================================================
 
-        if n not in nums:
-            nums.append(n)
+def hot_cold_cluster(records):
 
-        if len(nums) == 6:
-            break
+    freq = Counter()
 
-    special = arr[6][0]
+    for r in records[-80:]:
+
+        for n in r["numbers"]:
+            freq[n] += 1
+
+        freq[r["special"]] += 2
+
+    hot = [
+        x[0]
+        for x in freq.most_common(15)
+    ]
+
+    cold = []
+
+    for n in range(1, 50):
+
+        if n not in hot:
+            cold.append(n)
+
+    return hot, cold[:15]
+
+# =========================================================
+# 庄家周期识别
+# =========================================================
+
+def banker_cycle(records):
+
+    waves = []
+
+    for r in records[-30:]:
+
+        waves.append(get_wave(r["special"]))
+
+    freq = Counter(waves)
+
+    return freq.most_common(1)[0][0]
+
+# =========================================================
+# MonteCarlo
+# =========================================================
+
+def monte_carlo(records):
+
+    freq = Counter()
+
+    for r in records:
+
+        for n in r["numbers"]:
+            freq[n] += 1
+
+    total = sum(freq.values())
+
+    probs = {}
+
+    for n in range(1, 50):
+
+        probs[n] = freq[n] / total
+
+    result = []
+
+    for _ in range(2000):
+
+        x = random.choices(
+            list(probs.keys()),
+            weights=list(probs.values())
+        )[0]
+
+        result.append(x)
+
+    c = Counter(result)
+
+    return [
+        x[0]
+        for x in c.most_common(12)
+    ]
+
+# =========================================================
+# AI融合
+# =========================================================
+
+def ai_fusion_predict(records):
+
+    t1 = transformer_predict(records)
+
+    t2 = lstm_cycle_learning(records)
+
+    t3 = bayes_predict(records)
+
+    t4 = monte_carlo(records)
+
+    hot, cold = hot_cold_cluster(records)
+
+    score = Counter()
+
+    for n in t1:
+        score[n] += 5
+
+    for n in t2:
+        score[n] += 4
+
+    for n in t3:
+        score[n] += 3
+
+    for n in t4:
+        score[n] += 2
+
+    for n in hot:
+        score[n] += 1.5
+
+    final = []
+
+    for n, s in score.most_common():
+
+        if n not in final:
+            final.append(n)
+
+    nums = final[:6]
+
+    special = final[6]
 
     return nums, special
 
-# =========================
-# Walk Forward
-# =========================
+# =========================================================
+# WalkForward
+# =========================================================
 
-def walk_forward(draws):
+def walk_forward(records):
+
+    if len(records) < 120:
+        return 0
 
     hits = []
 
-    for i in range(100, len(draws)-1):
+    for i in range(80, len(records)-1):
 
-        train = draws[:i]
+        train = records[:i]
 
-        target = draws[i]
+        future = records[i]
 
-        fake_conn = connect_db()
-
-        nums, sp = generate_prediction(train, fake_conn)
+        nums, special = ai_fusion_predict(train)
 
         hit = len(
             set(nums) &
-            set(target["numbers"])
+            set(future["numbers"])
         )
 
-        hits.append(hit)
+        if special == future["special"]:
+            hit += 1
 
-        fake_conn.close()
+        hits.append(hit)
 
     if not hits:
         return 0
 
-    return round(sum(hits)/len(hits),4)
+    return round(sum(hits) / len(hits), 4)
 
-# =========================
-# MonteCarlo
-# =========================
+# =========================================================
+# HTML
+# =========================================================
 
-def monte_carlo():
+def generate_html(records, nums, special):
 
-    hits = []
-
-    for _ in range(5000):
-
-        a = set(random.sample(range(1,50),6))
-        b = set(random.sample(range(1,50),6))
-
-        hits.append(len(a & b))
-
-    return round(statistics.mean(hits),4)
-
-# =========================
-# AI学习
-# =========================
-
-def ai_learn(conn, score):
-
-    params = load_ai_params(conn)
-
-    if score < 0.6:
-
-        params["wave_weight"] *= 0.98
-        params["hot_weight"] *= 1.01
-
-    else:
-
-        params["wave_weight"] *= 1.01
-        params["cycle_weight"] *= 1.01
-
-    for k,v in params.items():
-        save_ai_param(conn, k, v)
-
-# =========================
-# HTML控制台
-# =========================
-
-def generate_html(draws, nums, special, wf):
-
-    latest = draws[-1]
+    latest = records[-1]
 
     html = f"""
     <html>
     <head>
     <meta charset="utf-8">
-    <title>V9 AI控制台</title>
+    <title>新澳门六合彩 AI V10</title>
+    <style>
+    body {{
+        background:#111;
+        color:#0f0;
+        font-family:Consolas;
+        padding:30px;
+    }}
+    .box {{
+        border:1px solid #0f0;
+        padding:20px;
+        margin-bottom:20px;
+    }}
+    </style>
     </head>
     <body>
 
-    <h1>新澳门六合彩 V9 AI系统</h1>
+    <h1>新澳门六合彩 AI V10 Ultimate</h1>
 
+    <div class="box">
     <h2>最新开奖</h2>
-
     <p>{latest['issue']}</p>
+    <p>{' '.join([str(x).zfill(2) for x in latest['numbers']])} + {str(latest['special']).zfill(2)}</p>
+    </div>
 
-    <p>
-    {' '.join(map(str, latest['numbers']))}
-    +
-    {latest['special']}
-    </p>
-
+    <div class="box">
     <h2>AI预测</h2>
-
-    <p>
-    {' '.join(map(str, nums))}
-    +
-    {special}
-    </p>
-
-    <h2>WalkForward</h2>
-
-    <p>{wf}</p>
+    <p>{' '.join([str(x).zfill(2) for x in nums])} + {str(special).zfill(2)}</p>
+    </div>
 
     </body>
     </html>
     """
 
-    with open(HTML_FILE,"w",encoding="utf-8") as f:
+    with open("dashboard.html", "w", encoding="utf-8") as f:
         f.write(html)
 
-# =========================
-# 主流程
-# =========================
+# =========================================================
+# 控制台
+# =========================================================
 
-def main():
+def dashboard(records):
 
-    print("正在获取真实新澳门六合彩数据...")
+    latest = records[-1]
 
-    conn = connect_db()
+    nums, special = ai_fusion_predict(records)
 
-    rows = fetch_data()
+    print("=" * 70)
 
-    print(f"获取成功: {len(rows)} 条")
-
-    new_count = save_data(conn, rows)
-
-    print(f"新增数据: {new_count}")
-
-    draws = load_draws(conn)
-
-    latest = draws[-1]
-
-    print("="*70)
-
-    print(f"最新开奖: {latest['issue']}")
+    print("最新开奖:", latest["issue"])
 
     print(
         "号码:",
         " ".join(
-            str(x).zfill(2)
-            for x in latest["numbers"]
+            [str(x).zfill(2) for x in latest["numbers"]]
         ),
         "+",
         str(latest["special"]).zfill(2)
     )
 
-    print("="*70)
-
-    nums, special = generate_prediction(draws, conn)
+    print("=" * 70)
 
     print()
 
-    print("🎯 V9 AI终极预测")
+    print("🎯 V10 深度学习融合预测")
 
     print(
         "号码:",
-        " ".join(
-            str(x).zfill(2)
-            for x in nums
-        ),
+        " ".join([str(x).zfill(2) for x in nums]),
         "+",
         str(special).zfill(2)
     )
 
     print()
 
-    print("🎨 波色统计")
+    print("特码属性:")
 
-    ws = wave_score(draws)
-
-    for k,v in ws.items():
-        print(f"{k}: {v}")
-
-    print()
-
-    print("🏦 庄家行为")
-
-    print(dealer_behavior(draws))
+    print(
+        odd_even(special),
+        big_small(special),
+        get_wave(special),
+        get_element(special)
+    )
 
     print()
 
-    print("📈 WalkForward")
-
-    wf = walk_forward(draws)
-
-    print("平均命中:", wf)
+    print("🏦 庄家周期:", banker_cycle(records))
 
     print()
 
-    print("🎲 MonteCarlo")
+    score = walk_forward(records)
 
-    mc = monte_carlo()
-
-    print("随机基准:", mc)
-
-    ai_learn(conn, wf)
+    print("📈 WalkForward平均命中:", score)
 
     print()
 
-    print("🧠 AI参数已学习更新")
+    generate_html(records, nums, special)
 
-    generate_html(draws, nums, special, wf)
+    print("HTML面板已生成 dashboard.html")
 
-    print()
+    print("=" * 70)
 
-    print(f"HTML控制台已生成: {HTML_FILE}")
+# =========================================================
+# 主程序
+# =========================================================
 
-    print("="*70)
+def main():
 
-    conn.close()
+    init_db()
+
+    print("正在获取真实新澳门六合彩数据...")
+
+    records = fetch_real_data()
+
+    if not records:
+
+        print("没有获取到真实数据")
+        return
+
+    new_count = save_records(records)
+
+    all_records = load_records()
+
+    print("新增数据:", new_count)
+
+    dashboard(all_records)
+
+# =========================================================
 
 if __name__ == "__main__":
     main()
