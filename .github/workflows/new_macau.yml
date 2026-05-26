@@ -23,7 +23,7 @@ jobs:
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          pip install numpy lightgbm xgboost catboost
+          pip install numpy scikit-learn lightgbm xgboost catboost
 
       - name: 运行同步、回测、调优与预测
         run: python new_macau.py sync --with-backtest --auto-tune
