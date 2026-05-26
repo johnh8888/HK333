@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测系统 (老澳门/香港/新澳门) - 保留 sync/show 子命令
-# 使用方式: python sdxmacau.py sync --lottery 老澳门彩 --order 3 --min-ig 0.01 --max-ece 0.5 --backtest 30
+# 三彩种属性预测 (老澳门/香港/新澳门) - V6 完整版，支持 sync/show 子命令
 
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ except ImportError:
 # ========== 配置 ==========
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# 数据库文件名映射
 DB_FILES = {
     "老澳门彩": "old_macau.db",
     "香港彩": "hk_macau.db",
@@ -99,7 +97,6 @@ def fetch_json_url(url: str, timeout: int = 20):
         return json.loads(raw)
 
 def parse_response(payload, lottery_name: str):
-    """通用解析：提取指定彩种的历史记录"""
     records = []
     lottery_data = payload.get("lottery_data", [])
     target = next((l for l in lottery_data if l.get("name") == lottery_name), None)
