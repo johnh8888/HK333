@@ -1,120 +1,64 @@
-name: 新澳门六合彩 AI 预测系统
+name: 新澳门六合彩AI预测
 
 on:
   schedule:
-    # 北京时间 09:00 / 21:00
-    - cron: "0 1,13 * * *"
-
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
   ai-predict:
-
     runs-on: ubuntu-latest
-
     timeout-minutes: 15
 
     steps:
-
-      # =====================================================
-      # 拉取仓库
-      # =====================================================
-
-      - name: 检出代码
+      - name: 检出仓库
         uses: actions/checkout@v4
 
-
-      # =====================================================
-      # Python
-      # =====================================================
-
-      - name: 设置 Python
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-
-      # =====================================================
-      # 下载历史数据库
-      # =====================================================
-
-      - name: 下载历史数据库
+      - name: 恢复数据库
         uses: actions/download-artifact@v4
         with:
           name: new-macau-db
           path: .
         continue-on-error: true
 
-
-      # =====================================================
-      # 查看文件
-      # =====================================================
-
-      - name: 查看目录
-        run: ls -lah
-
-
-      # =====================================================
-      # 执行 AI 预测（自动重试）
-      # =====================================================
-
-      - name: 执行 AI 预测
+      - name: 安装依赖
         run: |
+          pip install requests
 
+      - name: 执行 AI 同步预测
+        run: |
           success=0
 
           for i in 1 2 3
           do
-
-            echo "==============================="
             echo "第 $i 次执行预测..."
-            echo "==============================="
 
-            python new_macau.py sync
+            python new_macau.py \
+              --color-window 10 \
+              --color-method weighted \
+              sync \
+              --with-backtest \
+              --auto-tune
 
             if [ $? -eq 0 ]; then
-
               success=1
-
               echo "预测成功"
-
               break
-
             fi
 
             echo "预测失败，10秒后重试..."
-
             sleep 10
-
           done
 
           if [ $success -ne 1 ]; then
-
             echo "连续失败，任务终止"
-
             exit 1
-
           fi
-
-
-      # =====================================================
-      # 显示最终预测
-      # =====================================================
-
-      - name: 显示 AI 预测结果
-        run: |
-
-          echo ""
-          echo "==============================="
-          echo "最终预测结果"
-          echo "==============================="
-
-          python new_macau.py show
-
-
-      # =====================================================
-      # 上传数据库
-      # =====================================================
 
       - name: 上传数据库
         uses: actions/upload-artifact@v4
