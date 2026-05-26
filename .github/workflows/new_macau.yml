@@ -7,123 +7,118 @@ on:
 
   workflow_dispatch:
 
-concurrency:
-  group: new-macau-ai-predict
-  cancel-in-progress: true
-
 jobs:
-  predict:
+  ai-predict:
+
     runs-on: ubuntu-latest
 
     timeout-minutes: 15
 
     steps:
 
-      # 拉取仓库代码
+      # =====================================================
+      # 拉取仓库
+      # =====================================================
+
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # 安装 Python
+
+      # =====================================================
+      # Python
+      # =====================================================
+
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
+
+      # =====================================================
       # 下载历史数据库
-      - name: 下载数据库
+      # =====================================================
+
+      - name: 下载历史数据库
         uses: actions/download-artifact@v4
         with:
-          name: macau-db
+          name: new-macau-db
           path: .
         continue-on-error: true
 
-      # 初始化数据库
-      - name: 初始化数据库
-        run: |
-          if [ ! -f new_macau.db ]; then
-            echo "创建数据库"
-            touch new_macau.db
-          fi
 
-      # 显示数据库状态
-      - name: 检查数据库
-        run: |
-          ls -lh
-          echo "数据库检查完成"
+      # =====================================================
+      # 查看文件
+      # =====================================================
 
-      # 执行 AI 预测（失败自动重试）
+      - name: 查看目录
+        run: ls -lah
+
+
+      # =====================================================
+      # 执行 AI 预测（自动重试）
+      # =====================================================
+
       - name: 执行 AI 预测
         run: |
+
           success=0
 
           for i in 1 2 3
           do
-            echo "第 $i 次执行预测..."
 
-            python new_macau.py sync 
-              --with-backtest 
-              --auto-tune 
-              --color-window 10 
-              --color-method weighted
+            echo "==============================="
+            echo "第 $i 次执行预测..."
+            echo "==============================="
+
+            python new_macau.py sync
 
             if [ $? -eq 0 ]; then
+
               success=1
+
               echo "预测成功"
+
               break
+
             fi
 
             echo "预测失败，10秒后重试..."
+
             sleep 10
+
           done
 
           if [ $success -ne 1 ]; then
+
             echo "连续失败，任务终止"
+
             exit 1
+
           fi
 
-      # 生成预测日志
-      - name: 保存预测日志
+
+      # =====================================================
+      # 显示最终预测
+      # =====================================================
+
+      - name: 显示 AI 预测结果
         run: |
-          mkdir -p logs
 
-          LOG_FILE="logs/$(date +%F_%H-%M-%S).txt"
+          echo ""
+          echo "==============================="
+          echo "最终预测结果"
+          echo "==============================="
 
-          echo "====== 新澳门六合彩 AI 预测日志 ======" > $LOG_FILE
-          echo "" >> $LOG_FILE
+          python new_macau.py show
 
-          python new_macau.py show >> $LOG_FILE
 
-          echo "" >> $LOG_FILE
-          echo "日志生成完成"
-
-      # 数据库备份
-      - name: 备份数据库
-        run: |
-          mkdir -p backup
-
-          cp new_macau.db backup/new_macau_$(date +%F_%H-%M-%S).db
-
+      # =====================================================
       # 上传数据库
+      # =====================================================
+
       - name: 上传数据库
         uses: actions/upload-artifact@v4
         with:
-          name: macau-db
+          name: new-macau-db
           path: new_macau.db
-          retention-days: 365
-
-      # 上传数据库备份
-      - name: 上传数据库备份
-        uses: actions/upload-artifact@v4
-        with:
-          name: macau-db-backup
-          path: backup/
-          retention-days: 90
-
-      # 上传日志
-      - name: 上传预测日志
-        uses: actions/upload-artifact@v4
-        with:
-          name: macau-logs
-          path: logs/
-          retention-days: 90
+          retention-days: 7
