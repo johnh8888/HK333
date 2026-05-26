@@ -1,4 +1,4 @@
-name: 老澳门属性预测V4
+name: 老澳门属性预测 V6
 
 on:
   schedule:
@@ -13,22 +13,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: 安装依赖
         run: pip install numpy
+
       - name: 运行预测
-        run: python sdxmacau.py sync --order 2 --min-ig 0.05 --max-ece 0.1
+        run: python sdxmacau.py sync --order 2 --min-ig 0.1 --max-ece 0.1 --backtest 30
+
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add sdxmacau.db
+          git add sdxmacau_v6.db
           git commit -m "自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "无变化"
           git push
+
       - name: 备份数据库
         uses: actions/upload-artifact@v4
         with:
           name: sdxmacau-db-backup
-          path: sdxmacau.db
+          path: sdxmacau_v6.db
