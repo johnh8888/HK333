@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 (老澳门/香港/新澳门) - 修正版，默认回测10期
+# 三彩种属性预测 (老澳门/香港/新澳门) - 无子命令版，直接运行
 
 from __future__ import annotations
 
@@ -838,109 +838,87 @@ class PredictionSystemV6:
         color_second_acc = color_second_correct / total
         return acc, avg_brier, color_second_acc
 
-# ========== 仪表盘 ==========
-def print_dashboard(conn, lottery_name, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=10):
-    seqs = {
-        "color": load_sequence(conn, get_color, limit=500),
-        "size": load_sequence(conn, get_big_small, limit=500),
-        "odd_even": load_sequence(conn, get_odd_even, limit=500)
-    }
-    if len(seqs["color"]) < order + 10:
-        print("历史数据不足，请先同步数据。")
-        return
-    latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
-    if latest:
-        nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
-        print(f"最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
-        attrs = {
-            "色波": get_color(latest["special_number"]),
-            "大小": get_big_small(latest["special_number"]),
-            "单双": get_odd_even(latest["special_number"]),
+# ========== 处理单个彩种 ==========
+def process_lottery(lottery_name: str, args):
+    db_path = str(SCRIPT_DIR / DB_FILES[lottery_name])
+    print(f"\n{'='*60}\n处理彩种: {lottery_name}\n数据库: {db_path}\n{'='*60}")
+    conn = connect_db(db_path)
+    try:
+        init_db(conn)
+        records, source, url = fetch_online_records(lottery_name)
+        total, ins, upd = sync_from_records(conn, records, source)
+        print(f"同步完成: 总计 {total}, 新增 {ins}, 更新 {upd}, 来源 {source} ({url})")
+
+        seqs = {
+            "color": load_sequence(conn, get_color, limit=500),
+            "size": load_sequence(conn, get_big_small, limit=500),
+            "odd_even": load_sequence(conn, get_odd_even, limit=500)
         }
-        print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
+        if len(seqs["color"]) < args.order + 10:
+            print("历史数据不足，跳过预测")
+            return
 
-    system = PredictionSystemV6(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece)
-    system.train_all(seqs)
-    recents = {name: seq[-order:] for name, seq in seqs.items()}
-    pred = system.predict_all(recents, seqs)
+        latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
+        if latest:
+            nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
+            print(f"最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
+            attrs = {
+                "色波": get_color(latest["special_number"]),
+                "大小": get_big_small(latest["special_number"]),
+                "单双": get_odd_even(latest["special_number"]),
+            }
+            print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    print(f"\n🔮 下一期属性预测 {lottery_name} (阶数={order})")
-    for name, data in pred.items():
-        if name == "meta":
-            continue
-        print(f"\n{name}:")
-        for s, p in sorted(data["probs"].items(), key=lambda x: -x[1]):
-            marker = " ✓" if s == data["best_state"] else ""
-            print(f"   {s}: {p*100:.1f}%{marker}")
-    meta = pred["meta"]
-    print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}")
-    print(f"   原因: {meta['reason']}")
-    print(f"   平均归一化信息增益: {meta['avg_norm_ig']:.4f}")
-    print(f"   平均校准误差 ECE: {meta['avg_ece']:.4f}")
+        system = PredictionSystemV6(order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece)
+        system.train_all(seqs)
+        recents = {name: seq[-args.order:] for name, seq in seqs.items()}
+        pred = system.predict_all(recents, seqs)
 
-    print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
-    acc, avg_brier, color_second_acc = system.walk_forward_backtest(seqs, test_len=backtest_len)
-    for name in acc:
-        print(f"   {name} 准确率: {acc[name]*100:.1f}%  平均Brier: {avg_brier[name]:.4f}")
-    print(f"   波色二中一准确率: {color_second_acc*100:.1f}%")
-    if any(acc.values()):
-        print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
-        print(f"   平均Brier: {np.mean(list(avg_brier.values())):.4f} (越小越好)")
-    else:
-        print("   未出手，无数据")
+        print(f"\n🔮 下一期属性预测 {lottery_name} (阶数={args.order})")
+        for name, data in pred.items():
+            if name == "meta":
+                continue
+            print(f"\n{name}:")
+            for s, p in sorted(data["probs"].items(), key=lambda x: -x[1]):
+                marker = " ✓" if s == data["best_state"] else ""
+                print(f"   {s}: {p*100:.1f}%{marker}")
+        meta = pred["meta"]
+        print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}")
+        print(f"   原因: {meta['reason']}")
+        print(f"   平均归一化信息增益: {meta['avg_norm_ig']:.4f}")
+        print(f"   平均校准误差 ECE: {meta['avg_ece']:.4f}")
 
-# ========== 命令行 ==========
-def cmd_sync(args):
-    if args.lottery:
-        lotteries = [args.lottery]
-    else:
-        lotteries = ["老澳门彩", "香港彩", "新澳门彩"]
-    for lottery in lotteries:
-        db_path = str(SCRIPT_DIR / DB_FILES[lottery])
-        print(f"\n{'='*60}\n处理彩种: {lottery}\n数据库: {db_path}\n{'='*60}")
-        conn = connect_db(db_path)
-        try:
-            init_db(conn)
-            records, source, url = fetch_online_records(lottery)
-            total, ins, upd = sync_from_records(conn, records, source)
-            print(f"同步完成: 总计 {total}, 新增 {ins}, 更新 {upd}, 来源 {source} ({url})")
-            print_dashboard(conn, lottery, order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece, backtest_len=args.backtest)
-        except Exception as e:
-            print(f"错误: {e}")
-        finally:
-            conn.close()
+        print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {args.backtest} 期):")
+        acc, avg_brier, color_second_acc = system.walk_forward_backtest(seqs, test_len=args.backtest)
+        for name in acc:
+            print(f"   {name} 准确率: {acc[name]*100:.1f}%  平均Brier: {avg_brier[name]:.4f}")
+        print(f"   波色二中一准确率: {color_second_acc*100:.1f}%")
+        if any(acc.values()):
+            print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
+            print(f"   平均Brier: {np.mean(list(avg_brier.values())):.4f} (越小越好)")
+        else:
+            print("   未出手，无数据")
+    except Exception as e:
+        print(f"处理 {lottery_name} 时出错: {e}")
+    finally:
+        conn.close()
 
-def cmd_show(args):
-    if args.lottery:
-        lotteries = [args.lottery]
-    else:
-        lotteries = ["老澳门彩", "香港彩", "新澳门彩"]
-    for lottery in lotteries:
-        db_path = str(SCRIPT_DIR / DB_FILES[lottery])
-        print(f"\n{'='*60}\n彩种: {lottery}\n{'='*60}")
-        conn = connect_db(db_path)
-        try:
-            print_dashboard(conn, lottery, order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece, backtest_len=args.backtest)
-        except Exception as e:
-            print(f"错误: {e}")
-        finally:
-            conn.close()
-
+# ========== 主函数 ==========
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 (老澳门/香港/新澳门) - 默认回测10期")
+    p = argparse.ArgumentParser(description="三彩种属性预测 (老澳门/香港/新澳门) - 无子命令版")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"],
                    help="指定单个彩种，不指定则处理全部三个")
     p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
     p.add_argument("--min-ig", type=float, default=0.01, help="最小归一化信息增益阈值 (默认0.01)")
     p.add_argument("--max-ece", type=float, default=0.5, help="最大校准误差阈值 (默认0.5)")
     p.add_argument("--backtest", type=int, default=10, help="回测最近期数 (默认10)")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    sp_sync = sub.add_parser("sync")
-    sp_sync.set_defaults(func=cmd_sync)
-    sp_show = sub.add_parser("show")
-    sp_show.set_defaults(func=cmd_show)
     args = p.parse_args()
-    args.func(args)
+
+    if args.lottery:
+        process_lottery(args.lottery, args)
+    else:
+        for lottery in ["老澳门彩", "香港彩", "新澳门彩"]:
+            process_lottery(lottery, args)
 
 if __name__ == "__main__":
     ssl._create_default_https_context = ssl._create_unverified_context
