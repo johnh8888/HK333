@@ -13,42 +13,24 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.request import Request, urlopen
 
-# =========================================================
-# 基础配置
-# =========================================================
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "new_macau_v3.db")
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "new_macau.db")
 
 API_URL = "https://marksix6.net/index.php?api=1"
 
 ALL_NUMBERS = list(range(1, 50))
 
-DYNAMIC_WINDOWS = [10, 30, 60, 80, 100]
-
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
     "hot_v1": "热号策略",
     "cold_rebound_v1": "冷号回补",
-    "momentum_v1": "动量策略",
+    "momentum_v1": "近期动量",
     "ensemble_v2": "集成投票",
 }
 
 STRATEGY_IDS = list(STRATEGY_LABELS.keys())
 
-AI_STATE = {
-    "market_cycle": "normal",
-    "risk_level": 1.0,
-    "current_window": 30,
-    "last_hits": [],
-}
-
-MARKOV_CHAIN = {
-    "红": {"红": 0, "蓝": 0, "绿": 0},
-    "蓝": {"红": 0, "蓝": 0, "绿": 0},
-    "绿": {"红": 0, "蓝": 0, "绿": 0},
-}
 
 # =========================================================
 # 波色
@@ -248,12 +230,10 @@ def fetch_new_macau():
 
 
 # =========================================================
-# 数据库保存
+# 保存数据
 # =========================================================
 
 def upsert_draw(conn, r: DrawRecord):
-
-    now = datetime.now(timezone.utc).isoformat()
 
     exists = conn.execute(
 
@@ -262,6 +242,8 @@ def upsert_draw(conn, r: DrawRecord):
         (r.issue_no,)
 
     ).fetchone()
+
+    now = datetime.now(timezone.utc).isoformat()
 
     if exists:
 
@@ -313,7 +295,7 @@ def upsert_draw(conn, r: DrawRecord):
 
 
 # =========================================================
-# 基础统计
+# 统计
 # =========================================================
 
 def _normalize(score_map):
@@ -339,13 +321,7 @@ def _normalize(score_map):
 
 def _freq_map(draws):
 
-    freq = {
-
-        n: 0.0
-
-        for n in ALL_NUMBERS
-
-    }
+    freq = {n: 0.0 for n in ALL_NUMBERS}
 
     for draw in draws:
 
@@ -358,13 +334,7 @@ def _freq_map(draws):
 
 def _momentum_map(draws):
 
-    m = {
-
-        n: 0.0
-
-        for n in ALL_NUMBERS
-
-    }
+    m = {n: 0.0 for n in ALL_NUMBERS}
 
     for i, draw in enumerate(draws):
 
@@ -402,211 +372,17 @@ def _omission_map(draws):
     return omission
 
 
-def _pair_affinity_map(draws):
-
-    pair = {
-
-        n: 0.0
-
-        for n in ALL_NUMBERS
-
-    }
-
-    for draw in draws:
-
-        for n in draw:
-
-            pair[n] += 1
-
-    return pair
-
-
 # =========================================================
-# AI动态窗口
-# =========================================================
-
-def choose_best_window(draws):
-
-    best_window = 30
-
-    best_score = -99999
-
-    for w in DYNAMIC_WINDOWS:
-
-        if len(draws) < w + 20:
-            continue
-
-        sample = draws[:w]
-
-        freq = _freq_map(sample)
-
-        omission = _omission_map(sample)
-
-        momentum = _momentum_map(sample)
-
-        pair = _pair_affinity_map(sample)
-
-        total_score = (
-
-            max(freq.values()) * 0.35 +
-
-            max(omission.values()) * 0.25 +
-
-            max(momentum.values()) * 0.25 +
-
-            max(pair.values()) * 0.15
-
-        )
-
-        if w == 10:
-            total_score *= 1.08
-
-        if w == 30:
-            total_score *= 1.05
-
-        if total_score > best_score:
-
-            best_score = total_score
-
-            best_window = w
-
-    AI_STATE["current_window"] = best_window
-
-    return best_window
-
-
-# =========================================================
-# 动态权重
-# =========================================================
-
-def dynamic_weights(draws):
-
-    recent = draws[:30]
-
-    freq = _freq_map(recent)
-
-    omission = _omission_map(recent)
-
-    momentum = _momentum_map(recent)
-
-    heat = max(freq.values())
-
-    omit = max(omission.values())
-
-    mom = max(momentum.values())
-
-    if heat > 6:
-
-        AI_STATE["market_cycle"] = "hot"
-
-        return 0.60, 0.15, 0.25
-
-    if omit > 25:
-
-        AI_STATE["market_cycle"] = "cold"
-
-        return 0.15, 0.65, 0.20
-
-    if mom > 2.5:
-
-        AI_STATE["market_cycle"] = "momentum"
-
-        return 0.25, 0.15, 0.60
-
-    AI_STATE["market_cycle"] = "normal"
-
-    return 0.45, 0.30, 0.25
-
-
-# =========================================================
-# 风险控制
-# =========================================================
-
-def risk_control(scores):
-
-    fails = AI_STATE["last_hits"][-5:].count(0)
-
-    if fails >= 4:
-
-        AI_STATE["risk_level"] = 0.6
-
-        return {
-
-            k: v * 0.85
-
-            for k, v in scores.items()
-
-        }
-
-    AI_STATE["risk_level"] = 1.0
-
-    return scores
-
-
-# =========================================================
-# 马尔可夫波色
-# =========================================================
-
-def train_markov(specials):
-
-    colors = [get_color(x) for x in specials]
-
-    for i in range(len(colors) - 1):
-
-        MARKOV_CHAIN[colors[i]][colors[i + 1]] += 1
-
-
-def predict_markov_color(last_color):
-
-    data = MARKOV_CHAIN[last_color]
-
-    return max(data.items(), key=lambda x: x[1])[0]
-
-
-# =========================================================
-# 特码AI
-# =========================================================
-
-def special_ai(draws):
-
-    freq = Counter()
-
-    for d in draws[:80]:
-
-        for n in d:
-
-            freq[n] += 1
-
-    ranked = sorted(
-
-        freq.items(),
-
-        key=lambda x: x[1],
-
-        reverse=True
-
-    )
-
-    return ranked[0][0]
-
-
-# =========================================================
-# 主预测
+# 预测
 # =========================================================
 
 def generate_scores(draws):
 
-    window = choose_best_window(draws)
+    freq = _normalize(_freq_map(draws))
 
-    sample = draws[:window]
+    momentum = _normalize(_momentum_map(draws))
 
-    freq = _normalize(_freq_map(sample))
-
-    omission = _normalize(_omission_map(sample))
-
-    momentum = _normalize(_momentum_map(sample))
-
-    w_freq, w_omit, w_mom = dynamic_weights(draws)
+    omission = _normalize(_omission_map(draws))
 
     scores = {}
 
@@ -614,15 +390,13 @@ def generate_scores(draws):
 
         scores[n] = (
 
-            freq[n] * w_freq +
+            freq[n] * 0.45 +
 
-            omission[n] * w_omit +
+            momentum[n] * 0.35 +
 
-            momentum[n] * w_mom
+            omission[n] * 0.20
 
         )
-
-    scores = risk_control(scores)
 
     return scores
 
@@ -643,7 +417,7 @@ def generate_prediction(draws):
 
     picks = ranked[:6]
 
-    special = special_ai(draws)
+    special = ranked[6]
 
     return picks, special
 
@@ -682,29 +456,11 @@ def generate_predictions(conn):
 
         ORDER BY CAST(issue_no AS INTEGER) DESC
 
-        LIMIT 150
+        LIMIT 120
 
         """).fetchall()
 
     ]
-
-    specials = [
-
-        r["special_number"]
-
-        for r in conn.execute("""
-
-        SELECT special_number
-
-        FROM draws
-
-        ORDER BY CAST(issue_no AS INTEGER)
-
-        """).fetchall()
-
-    ]
-
-    train_markov(specials)
 
     for strategy in STRATEGY_IDS:
 
@@ -770,44 +526,33 @@ def generate_predictions(conn):
 # 波色预测
 # =========================================================
 
-def predict_colors(conn):
+def predict_color(specials, window=10):
 
-    specials = [
+    recent = specials[-window:]
 
-        r["special_number"]
+    scores = defaultdict(float)
 
-        for r in conn.execute("""
+    for i, num in enumerate(reversed(recent)):
 
-        SELECT special_number
+        weight = (window - i) ** 1.3
 
-        FROM draws
+        scores[get_color(num)] += weight
 
-        ORDER BY CAST(issue_no AS INTEGER)
+    ranked = sorted(
 
-        """).fetchall()
+        scores.items(),
 
-    ]
+        key=lambda x: x[1],
 
-    if len(specials) < 20:
-        return
+        reverse=True
 
-    train_markov(specials)
+    )
 
-    last_color = get_color(specials[-1])
-
-    next_color = predict_markov_color(last_color)
-
-    print()
-
-    print("🎨 AI波色预测")
-
-    print(f"上期波色: {last_color}")
-
-    print(f"下期预测: {next_color}")
+    return ranked
 
 
 # =========================================================
-# Dashboard
+# 展示
 # =========================================================
 
 def print_dashboard(conn):
@@ -830,9 +575,7 @@ def print_dashboard(conn):
 
         nums_str = " ".join(
 
-            f"{n:02d}"
-
-            for n in nums
+            f"{n:02d}" for n in nums
 
         )
 
@@ -852,17 +595,7 @@ def print_dashboard(conn):
 
     print()
 
-    print("🧠 AI状态")
-
-    print(
-
-        f"周期={AI_STATE['market_cycle']} "
-
-        f"窗口={AI_STATE['current_window']} "
-
-        f"风险={AI_STATE['risk_level']}"
-
-    )
+    print("预测:")
 
     rows = conn.execute("""
 
@@ -875,10 +608,6 @@ def print_dashboard(conn):
     LIMIT 5
 
     """).fetchall()
-
-    print()
-
-    print("📈 AI预测")
 
     for r in rows:
 
@@ -908,7 +637,33 @@ def print_dashboard(conn):
 
         )
 
-    predict_colors(conn)
+    specials = [
+
+        r["special_number"]
+
+        for r in conn.execute("""
+
+        SELECT special_number
+
+        FROM draws
+
+        ORDER BY CAST(issue_no AS INTEGER)
+
+        """).fetchall()
+
+    ]
+
+    if len(specials) >= 10:
+
+        colors = predict_color(specials)
+
+        print()
+
+        print("特码波色预测:")
+
+        for c, s in colors:
+
+            print(f"{c}: {s:.2f}")
 
 
 # =========================================================
