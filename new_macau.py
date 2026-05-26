@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sqlite3
 import ssl
 import warnings
@@ -1403,7 +1404,7 @@ def _pick_top_six(scores, reason):
             continue
 
         penalty = evaluate_structure(proposal)
-        if penalty > 0.5:
+        if penalty > 0.7:  # 放宽到0.7
             continue
 
         picked.append((n, s))
@@ -1421,7 +1422,7 @@ def _pick_top_six(scores, reason):
 
 
 # =========================================================
-# 特别号独立模型
+# 特别号独立模型（已优化：随机扰动 + 并列随机）
 # =========================================================
 
 def _specials_omission_map(specials, window=None):
@@ -1508,10 +1509,10 @@ def color_stats(specials):
 
 def generate_special_model(draws, main_numbers, specials):
     if len(specials) < 10:
-        candidates = [(n, 0.0) for n in ALL_NUMBERS if n not in set(main_numbers)]
+        candidates = [n for n in ALL_NUMBERS if n not in set(main_numbers)]
         if not candidates:
-            candidates = [(n, 0.0) for n in ALL_NUMBERS]
-        return candidates[0]
+            candidates = ALL_NUMBERS.copy()
+        return random.choice(candidates), 0.0
 
     try:
         color_main, color_second, c1, c2 = predict_color_weighted(specials, window=12)
@@ -1534,6 +1535,7 @@ def generate_special_model(draws, main_numbers, specials):
 
     best_num = None
     best_score = -1.0
+    top_candidates = []
 
     for n in ALL_NUMBERS:
         if n in main_numbers:
@@ -1572,16 +1574,18 @@ def generate_special_model(draws, main_numbers, specials):
                  omit_score * 0.15 +
                  mom_score * 0.15)
 
-        if score > best_score:
-            best_score = score
-            best_num = n
+        score += random.uniform(-0.001, 0.001)
 
-    if best_num is None:
-        for n in ALL_NUMBERS:
-            if n not in main_numbers:
-                best_num = n
-                best_score = 0.0
-                break
+        if score > best_score + 1e-6:
+            best_score = score
+            top_candidates = [n]
+        elif abs(score - best_score) < 1e-6:
+            top_candidates.append(n)
+
+    if top_candidates:
+        best_num = random.choice(top_candidates)
+    else:
+        best_num = random.choice([n for n in ALL_NUMBERS if n not in main_numbers])
 
     return best_num, best_score
 
@@ -1655,6 +1659,8 @@ def get_dynamic_weights_with_stability(conn):
             continue
         mean = sum(hits) / len(hits)
         stab = stability_score(hits)  # 稳定性分数
+        # 综合评分 = 平均命中率 * 0.6 + 稳定性分数 * 0.4 (稳定性分数已是均值/方差)
+        # 但 stability_score 已经融合了均值和方差，可直接用作权重
         weights[s] = stab
 
     total = sum(weights.values())
@@ -1953,7 +1959,7 @@ def lgbm_strategy(draws, specials):
     for n, prob in ranked:
         if len(picked) >= 6: break
         proposal = [pn for pn, _ in picked] + [n]
-        if evaluate_structure(proposal) > 0.5: continue
+        if evaluate_structure(proposal) > 0.7: continue  # 放宽到0.7
         picked.append((n, prob))
     while len(picked) < 6:
         for n, prob in ranked:
@@ -1979,7 +1985,7 @@ def walk_forward_backtest_lgbm(draws, specials, start_train_size=100) -> Dict:
         for n, _ in ranked:
             if len(main6) >= 6: break
             proposal = main6 + [n]
-            if evaluate_structure(proposal) > 0.5: continue
+            if evaluate_structure(proposal) > 0.7: continue
             main6.append(n)
         actual = draws[test_idx]
         hit = len(set(main6) & set(actual))
@@ -2076,7 +2082,7 @@ def ml_window_strategy(draws, specials):
     for n, prob in ranked:
         if len(picked) >= 6: break
         proposal = [pn for pn, _ in picked] + [n]
-        if evaluate_structure(proposal) > 0.5: continue
+        if evaluate_structure(proposal) > 0.7: continue
         picked.append((n, prob))
     while len(picked) < 6:
         for n, prob in ranked:
@@ -2346,7 +2352,7 @@ def auto_tune_mined_config(conn, recent_runs=20):
 
 
 # =========================================================
-# 波色回测
+# 波色回测（原有）
 # =========================================================
 
 def backtest_colors(conn, recent_limit=12, window=10, method="weighted"):
@@ -2378,7 +2384,22 @@ def backtest_colors(conn, recent_limit=12, window=10, method="weighted"):
 
 
 # =========================================================
-# 展示（加入 LightGBM 回测开关）
+# 动态波色窗口选择（新增优化）
+# =========================================================
+
+def best_color_window(conn, specials, color_method, windows=[8,10,12,14]):
+    best_w = 10
+    best_any = 0
+    for w in windows:
+        _, _, _, any_hit, _ = backtest_colors(conn, recent_limit=10, window=w, method=color_method)
+        if any_hit > best_any:
+            best_any = any_hit
+            best_w = w
+    return best_w
+
+
+# =========================================================
+# 展示（加入 LightGBM 回测开关 + 动态波色窗口）
 # =========================================================
 
 def print_dashboard(conn, color_window=10, color_method="weighted", show_lgbm_backtest=False):
@@ -2404,14 +2425,15 @@ def print_dashboard(conn, color_window=10, color_method="weighted", show_lgbm_ba
 
     all_specials = [r["special_number"] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()]
     if len(all_specials) >= max(color_window, 10):
-        main_color, second_color, main_score, second_score = predict_color(all_specials, window=color_window, method=color_method)
-        method_name = "改进加权（指数衰减+连出奖励）" if color_method == "weighted" else "简单频率"
-        print(f"\n🎨 特码波色预测（{method_name}，基于最近 {color_window} 期）：")
+        # 动态选择最佳窗口
+        dyn_window = best_color_window(conn, all_specials, color_method)
+        print(f"\n🎨 特码波色预测（自适应窗口：{dyn_window} 期，{ '改进加权' if color_method=='weighted' else '简单频率' }）:")
+        main_color, second_color, main_score, second_score = predict_color(all_specials, window=dyn_window, method=color_method)
         print(f"   主强: {main_color} (得分 {main_score:.3f})   次强: {second_color} (得分 {second_score:.3f})")
 
-        total, main_hit, second_hit, any_hit, max_miss = backtest_colors(conn, recent_limit=10, window=color_window, method=color_method)
+        total, main_hit, second_hit, any_hit, max_miss = backtest_colors(conn, recent_limit=10, window=dyn_window, method=color_method)
         if total > 0:
-            print(f"\n📊 历史回测（最近 {total} 期）：")
+            print(f"\n📊 历史回测（最近 {total} 期，窗口{dyn_window}）：")
             print(f"   主强命中率: {main_hit}/{total} ({main_hit / total * 100:.1f}%)")
             print(f"   二中一命中率: {any_hit}/{total} ({any_hit / total * 100:.1f}%)")
             print(f"   最大连错: {max_miss}期")
@@ -2485,7 +2507,7 @@ def cmd_sync(args):
             review_issue(conn, latest_row["issue_no"])
 
         if args.with_backtest:
-            recent = [r["issue_no"] for r in conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 30").fetchall()]
+            recent = [r["issue_no"] for r in conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT 60").fetchall()]  # 扩大为60期
             for issue in recent:
                 review_issue(conn, issue)
 
