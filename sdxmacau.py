@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 (老澳门/香港/新澳门) - V6 完整版，支持 sync/show 子命令
+# 三彩种属性预测 (老澳门/香港/新澳门) - 修正版，默认回测10期
 
 from __future__ import annotations
 
@@ -927,13 +927,13 @@ def cmd_show(args):
             conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 (老澳门/香港/新澳门) - V6 完整版")
+    p = argparse.ArgumentParser(description="三彩种属性预测 (老澳门/香港/新澳门) - 默认回测10期")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"],
                    help="指定单个彩种，不指定则处理全部三个")
     p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
     p.add_argument("--min-ig", type=float, default=0.01, help="最小归一化信息增益阈值 (默认0.01)")
     p.add_argument("--max-ece", type=float, default=0.5, help="最大校准误差阈值 (默认0.5)")
-    p.add_argument("--backtest", type=int, default=30, help="回测最近期数 (默认30)")
+    p.add_argument("--backtest", type=int, default=10, help="回测最近期数 (默认10)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp_sync = sub.add_parser("sync")
     sp_sync.set_defaults(func=cmd_sync)
