@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 V6 (可回测版，默认10期)
+# 老澳门六合彩属性时序预测系统 V6 (支持波色二中一回测)
 
 from __future__ import annotations
 
@@ -585,7 +585,7 @@ class AnomalyFilter:
             return True
         return False
 
-# ========== 集成引擎 V6 (可回测版) ==========
+# ========== 集成引擎 V6 ==========
 class AttributeEngineV6:
     def __init__(self, name: str, order: int = 2, alpha_smooth: float = 1.0,
                  use_hmm: bool = True, hmm_states: int = 3, reg_factor: float = 0.05):
@@ -704,10 +704,9 @@ class AttributeEngineV6:
     def reset_sprt(self):
         self.sprt.reset()
 
-# ========== 系统集成 V6 (可回测版) ==========
+# ========== 系统集成 V6 (支持波色二中一回测) ==========
 class PredictionSystemV6:
     def __init__(self, order: int = 2, min_norm_ig: float = 0.01, max_ece: float = 0.5):
-        # 降低信息增益阈值，提高ECE容忍度，确保回测能出手
         self.order = order
         self.min_norm_ig = min_norm_ig
         self.max_ece = max_ece
@@ -726,7 +725,6 @@ class PredictionSystemV6:
     def train_all(self, seqs: Dict[str, List[str]]):
         for name, seq in seqs.items():
             self.engines[name].train(seq)
-            # 使用最近200期计算信息增益，避免远古数据稀释信号
             recent_seq = seq[-200:] if len(seq) > 200 else seq
             self.norm_igs[name] = normalized_information_gain(recent_seq, order=self.order)
 
@@ -738,7 +736,8 @@ class PredictionSystemV6:
                 "probs": probs,
                 "model_probs": model_probs,
                 "max_prob": max(probs.values()),
-                "best_state": max(probs.items(), key=lambda x: x[1])[0]
+                "best_state": max(probs.items(), key=lambda x: x[1])[0],
+                "second_state": sorted(probs.items(), key=lambda x: -x[1])[1][0] if len(probs) >= 2 else None
             }
         skip = False
         reasons = []
@@ -782,7 +781,7 @@ class PredictionSystemV6:
                 loss = -math.log(prob_actual)
                 engine.model_weight_mgr.update_loss(model_name, loss)
             engine.update_calibration(probs, actuals[name])
-            best_state = max(probs.items(), key=lambda x: x[1])[0]
+            best_state = predictions[name]["best_state"]
             max_prob = probs[best_state]
             correct = (best_state == actuals[name])
             y = {s: 1 if s == actuals[name] else 0 for s in engine.states}
@@ -799,22 +798,24 @@ class PredictionSystemV6:
         return {name: np.mean(list(metrics["logloss"])) if metrics["logloss"] else 0.0
                 for name, metrics in self.performance.items()}
 
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 30) -> Tuple[Dict[str, float], Dict[str, float]]:
+    def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 10) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+        """
+        返回: (准确率, 平均Brier, 波色二中一准确率)
+        """
         total = 0
         correct = {name: 0 for name in self.engines}
         brier_accum = {name: 0.0 for name in self.engines}
-        logloss_accum = {name: 0.0 for name in self.engines}
+        color_second_correct = 0  # 波色二中一命中次数
         min_len = self.order + 10
         for idx in range(min_len, len(seqs["color"]) - 1):
             if idx < len(seqs["color"]) - test_len:
                 continue
-            # 每个回测点重新创建系统，保证无未来泄漏
             system = PredictionSystemV6(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece)
             train_seqs = {name: seq[:idx] for name, seq in seqs.items()}
             system.train_all(train_seqs)
             recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx]
                        for name in self.engines}
-            pred = system.predict_all(recents, train_seqs)  # 使用训练集序列检测状态
+            pred = system.predict_all(recents, train_seqs)
             actuals = {name: seqs[name][idx] for name in self.engines}
             should_act = pred["meta"]["should_act"]
             if should_act:
@@ -825,14 +826,17 @@ class PredictionSystemV6:
                     probs = pred[name]["probs"]
                     brier = sum((probs.get(s,0) - y[s])**2 for s in system.engines[name].states)
                     brier_accum[name] += brier
-                    logloss = -math.log(probs.get(actuals[name], 1e-10))
-                    logloss_accum[name] += logloss
+                # 波色二中一统计
+                color_pred = pred["color"]
+                if color_pred["best_state"] == actuals["color"] or color_pred["second_state"] == actuals["color"]:
+                    color_second_correct += 1
                 total += 1
         if total == 0:
-            return {name: 0.0 for name in self.engines}, {name: 0.0 for name in self.engines}
+            return {name: 0.0 for name in self.engines}, {name: 0.0 for name in self.engines}, 0.0
         acc = {name: correct[name]/total for name in self.engines}
         avg_brier = {name: brier_accum[name]/total for name in self.engines}
-        return acc, avg_brier
+        color_second_acc = color_second_correct / total
+        return acc, avg_brier, color_second_acc
 
 # ========== 仪表盘 ==========
 def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=10):
@@ -875,9 +879,10 @@ def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=1
     print(f"   平均校准误差 ECE: {meta['avg_ece']:.4f}")
 
     print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
-    acc, avg_brier = system.walk_forward_backtest(seqs, test_len=backtest_len)
+    acc, avg_brier, color_second_acc = system.walk_forward_backtest(seqs, test_len=backtest_len)
     for name in acc:
         print(f"   {name} 准确率: {acc[name]*100:.1f}%  平均Brier: {avg_brier[name]:.4f}")
+    print(f"   波色二中一准确率: {color_second_acc*100:.1f}%")
     if any(acc.values()):
         print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
         print(f"   平均Brier: {np.mean(list(avg_brier.values())):.4f} (越小越好)")
@@ -906,7 +911,7 @@ def cmd_show(args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6 (可回测版)")
+    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6 (支持波色二中一回测)")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
     p.add_argument("--min-ig", type=float, default=0.01, help="最小归一化信息增益阈值 (默认0.01)")
