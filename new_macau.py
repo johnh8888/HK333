@@ -1537,10 +1537,11 @@ def generate_special_model(draws, main_numbers, specials):
     best_score = -1.0
     top_candidates = []
 
-    for n in ALL_NUMBERS:
-        if n in main_numbers:
-            continue
+    # ★ 关键：将候选号码随机打乱
+    candidates_pool = [n for n in ALL_NUMBERS if n not in main_numbers]
+    random.shuffle(candidates_pool)
 
+    for n in candidates_pool:
         c = get_color(n)
         if c == color_main:
             color_score = c1
@@ -1574,7 +1575,7 @@ def generate_special_model(draws, main_numbers, specials):
                  omit_score * 0.15 +
                  mom_score * 0.15)
 
-        score += random.uniform(-0.001, 0.001)
+        score += random.uniform(-0.005, 0.005)   # 稍微加大随机扰动
 
         if score > best_score + 1e-6:
             best_score = score
@@ -1585,7 +1586,7 @@ def generate_special_model(draws, main_numbers, specials):
     if top_candidates:
         best_num = random.choice(top_candidates)
     else:
-        best_num = random.choice([n for n in ALL_NUMBERS if n not in main_numbers])
+        best_num = random.choice(candidates_pool)
 
     return best_num, best_score
 
@@ -2452,9 +2453,9 @@ def print_dashboard(conn, color_window=10, color_method="weighted", show_lgbm_ba
 
         final_attr = predict_final_attribute(all_specials, color_window)
         print("\n🔥 AI融合终极预测：")
-        print(f"   波色: {final_attr['波色'][0]} / {final_attr['波色'][1]}")
-        print(f"   大小: {final_attr['大小'][0]} / {final_attr['大小'][1]}")
-        print(f"   单双: {final_attr['单双'][0]} / {final_attr['单双'][1]}")
+        print(f"   波色: {final_attr['波色'][0]}")
+        print(f"   大小: {final_attr['大小'][0]}")
+        print(f"   单双: {final_attr['单双'][0]}")
         print(f"   综合置信度: {final_attr['综合置信度']:.3f}")
 
     else:
