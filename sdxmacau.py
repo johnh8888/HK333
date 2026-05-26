@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 V5
-# 无泄漏回测 + 动态模型融合 + 市场状态识别
+# 老澳门六合彩属性时序预测系统 V6
+# 包含: 无泄漏回测, Brier/LogLoss评估, Hurst指数, SPRT动态有效性检验
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from urllib.request import Request, urlopen
 
-# 依赖检查
 try:
     import numpy as np
 except ImportError:
@@ -27,7 +26,7 @@ except ImportError:
 
 # ========== 配置 ==========
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "sdxmacau_v5.db")
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "sdxmacau_v6.db")
 
 THIRD_PARTY_URLS = [
     "https://marksix6.net/index.php?api=1",
@@ -155,16 +154,42 @@ def load_sequence(conn, attr_func, limit: int = 500) -> List[str]:
 def dynamic_weights(n: int, decay: float = 0.95) -> List[float]:
     return [decay ** (n - 1 - i) for i in range(n)]
 
-# ========== 工具函数 ==========
-def log_loss(p: float, y: int) -> float:
-    """p 是预测为正类的概率，y ∈ {0,1}"""
-    p = np.clip(p, 1e-15, 1-1e-15)
-    return - (y * math.log(p) + (1-y) * math.log(1-p))
-
+# ========== 指标评估 ==========
 def brier_score(p: float, y: int) -> float:
+    """p 是预测为正类的概率，y ∈ {0,1}"""
     return (p - y) ** 2
 
-# ========== 1. 动态统计趋势延续概率 (同上) ==========
+def log_loss(p: float, y: int) -> float:
+    p = np.clip(p, 1e-15, 1 - 1e-15)
+    return - (y * math.log(p) + (1 - y) * math.log(1 - p))
+
+# ========== 工具函数 ==========
+def entropy(probs: List[float]) -> float:
+    return -sum(p * math.log(p) for p in probs if p > 0)
+
+def normalized_information_gain(seq: List[str], order: int = 1) -> float:
+    if len(seq) < order + 1:
+        return 0.0
+    unconditional = Counter(seq)
+    total = len(seq)
+    h_y = entropy([unconditional[s]/total for s in set(seq)])
+    if h_y == 0:
+        return 0.0
+    contexts = defaultdict(list)
+    for i in range(len(seq)-order):
+        context = tuple(seq[i:i+order])
+        nxt = seq[i+order]
+        contexts[context].append(nxt)
+    cond_entropy = 0.0
+    for context, nxt_list in contexts.items():
+        cnt = Counter(nxt_list)
+        p_context = len(nxt_list) / (len(seq)-order)
+        probs = [cnt[s]/len(nxt_list) for s in set(seq)]
+        cond_entropy += p_context * entropy(probs)
+    ig = h_y - cond_entropy
+    return ig / h_y
+
+# ========== 1. 动态统计趋势延续 ==========
 class StreakStats:
     def __init__(self, states: List[str]):
         self.states = states
@@ -196,36 +221,7 @@ class StreakStats:
         total_p = sum(probs.values())
         return {s: p/total_p for s, p in probs.items()} if total_p>0 else {s:1/K for s in self.states}
 
-# ========== 2. 信息增益计算与归一化 ==========
-def entropy(probs: List[float]) -> float:
-    return -sum(p * math.log(p) for p in probs if p > 0)
-
-def normalized_information_gain(seq: List[str], order: int = 1) -> float:
-    """返回归一化信息增益 (IG / H(Y))"""
-    if len(seq) < order + 1:
-        return 0.0
-    # 无条件分布 H(Y)
-    unconditional = Counter(seq)
-    total = len(seq)
-    h_y = entropy([unconditional[s]/total for s in set(seq)])
-    if h_y == 0:
-        return 0.0
-    # 条件熵 H(Y|X)
-    contexts = defaultdict(list)
-    for i in range(len(seq)-order):
-        context = tuple(seq[i:i+order])
-        nxt = seq[i+order]
-        contexts[context].append(nxt)
-    cond_entropy = 0.0
-    for context, nxt_list in contexts.items():
-        cnt = Counter(nxt_list)
-        p_context = len(nxt_list) / (len(seq)-order)
-        probs = [cnt[s]/len(nxt_list) for s in set(seq)]
-        cond_entropy += p_context * entropy(probs)
-    ig = h_y - cond_entropy
-    return ig / h_y   # 归一化
-
-# ========== 3. HMM 带正则化和 Early Stopping ==========
+# ========== 2. HMM 带正则化和 Early Stopping ==========
 class DiscreteHMM:
     def __init__(self, n_states: int, n_obs: int, states_list: List[str],
                  reg_factor: float = 0.05, early_stop_eps: float = 1e-4):
@@ -233,9 +229,9 @@ class DiscreteHMM:
         self.n_obs = n_obs
         self.states_list = states_list
         self.obs_to_idx = {s:i for i,s in enumerate(states_list)}
-        self.reg_factor = reg_factor   # transition regularization
+        self.reg_factor = reg_factor
         self.early_stop_eps = early_stop_eps
-        # 随机初始化参数
+        # 随机初始化
         self.pi = np.random.dirichlet(np.ones(n_states))
         self.A = np.random.dirichlet(np.ones(n_states), size=n_states)
         self.B = np.random.dirichlet(np.ones(n_obs), size=n_states)
@@ -251,7 +247,6 @@ class DiscreteHMM:
             for t in range(1, T):
                 alpha[t] = np.sum(alpha[t-1][:, None] * self.A * self.B[:, obs_idx[t]], axis=0)
             log_lik = np.log(np.sum(alpha[-1]))
-            # early stopping
             if it > 0 and abs(log_lik - prev_log_lik) < self.early_stop_eps:
                 break
             prev_log_lik = log_lik
@@ -267,15 +262,11 @@ class DiscreteHMM:
             for t in range(T-1):
                 denom = np.sum(alpha[t][:, None] * self.A * self.B[:, obs_idx[t+1]] * beta[t+1])
                 xi[t] = (alpha[t][:, None] * self.A * self.B[:, obs_idx[t+1]] * beta[t+1]) / denom
-            # update parameters
             self.pi = gamma[0]
             self.A = np.sum(xi, axis=0) / np.sum(gamma[:-1], axis=0)[:, None]
-            # 正则化：与均匀分布平滑
             uniform = np.ones_like(self.A) / self.n_states
             self.A = (1 - self.reg_factor) * self.A + self.reg_factor * uniform
-            # 重新归一化行
             self.A = self.A / self.A.sum(axis=1, keepdims=True)
-            # B 矩阵更新
             self.B = np.zeros_like(self.B)
             for k in range(self.n_states):
                 for t in range(T):
@@ -293,7 +284,7 @@ class DiscreteHMM:
         probs = probs / probs.sum()
         return {self.states_list[i]: probs[i] for i in range(self.n_obs)}
 
-# ========== 4. 概率校准（保序回归 + 大窗口） ==========
+# ========== 3. 概率校准（保序回归 + 大窗口） ==========
 class ProbabilityCalibrator:
     def __init__(self, window_size: int = 300):
         self.window_size = window_size
@@ -305,22 +296,18 @@ class ProbabilityCalibrator:
         self.outcomes.append(1 if outcome else 0)
 
     def _isotonic_regression(self, x, y):
-        """简单的 PAV 算法实现保序回归，返回单调非降函数值（对x去重后的映射）"""
-        # 将数据按 x 排序
         pairs = sorted(zip(x, y))
         xs = [p[0] for p in pairs]
         ys = [p[1] for p in pairs]
-        # PAV
         blocks = []
         for i in range(len(xs)):
-            blocks.append([xs[i], ys[i], 1])  # [x_sum, y_sum, count]
+            blocks.append([xs[i], ys[i], 1])
             while len(blocks) > 1 and blocks[-2][1]/blocks[-2][2] > blocks[-1][1]/blocks[-1][2]:
                 prev = blocks.pop()
                 cur = blocks[-1]
                 cur[0] += prev[0]
                 cur[1] += prev[1]
                 cur[2] += prev[2]
-        # 生成单调序列
         fitted = []
         for block in blocks:
             mean = block[1] / block[2]
@@ -330,18 +317,12 @@ class ProbabilityCalibrator:
     def calibrate(self, prob: float) -> float:
         if len(self.preds) < 10:
             return prob
-        # 使用最近的数据进行保序回归
         preds_arr = list(self.preds)
         outcomes_arr = list(self.outcomes)
-        # 降采样或直接用全部（窗口内最多300）
         fitted = self._isotonic_regression(preds_arr, outcomes_arr)
-        # 为每个预测值找到最近的校准值（简单方式：按值排序插值）
-        # 这里我们用分箱平均的简化，但更准确：对预测值排序后，映射到 fitted 值
-        # 由于 isotonic 输出与输入顺序一致，我们可以构建一个插值函数
         sorted_idx = np.argsort(preds_arr)
         sorted_preds = [preds_arr[i] for i in sorted_idx]
         sorted_fitted = [fitted[i] for i in sorted_idx]
-        # 使用 numpy 的 interp
         cal = np.interp(prob, sorted_preds, sorted_fitted)
         return float(cal)
 
@@ -361,7 +342,7 @@ class ProbabilityCalibrator:
             ece += abs(acc - conf) * (len(bin_)/len(self.preds))
         return ece
 
-# ========== 5. 动态阈值状态机 ==========
+# ========== 4. 动态阈值状态机 ==========
 class DynamicStateMachine:
     def __init__(self, window: int = 30, n_std: float = 2.0):
         self.window = window
@@ -372,7 +353,6 @@ class DynamicStateMachine:
     def analyze(self, seq: List[str]) -> Dict[str, Any]:
         if len(seq) < 10:
             return {"state": "unknown", "confidence": 0.0}
-        # 计算转移矩阵
         states = sorted(set(seq))
         if len(states) < 2:
             return {"state": "trend", "confidence": 1.0}
@@ -385,7 +365,6 @@ class DynamicStateMachine:
             mat[cur, nxt] += 1
         row_sums = mat.sum(axis=1, keepdims=True)
         mat = np.divide(mat, row_sums, where=row_sums!=0)
-        # 计算 KL 散度（与均匀分布）
         uniform = np.full(K, 1/K)
         kl_avg = 0.0
         for i in range(K):
@@ -394,10 +373,8 @@ class DynamicStateMachine:
                 kl = np.sum(row * np.log(row / uniform))
                 kl_avg += kl
         kl_avg /= K
-        # 奇异值
         u, s, vh = np.linalg.svd(mat)
         max_sv = s[0] if len(s)>0 else 0.0
-        # 动态阈值
         self.history_kl.append(kl_avg)
         self.history_sv.append(max_sv)
         if len(self.history_kl) >= 5:
@@ -417,7 +394,6 @@ class DynamicStateMachine:
                 state = "oscillation"
                 confidence = 0.6
         else:
-            # 初始时使用保守阈值
             if kl_avg > 0.5 and max_sv > 1.2:
                 state = "trend"
                 confidence = 0.7
@@ -458,9 +434,8 @@ class DynamicStateMachine:
             probs = {s: v/total for s, v in probs.items()}
         return probs
 
-# ========== 6. 市场状态检测 (Regime Detection) ==========
+# ========== 5. 市场状态检测 (Hurst, Runs, Ljung-Box) ==========
 def hurst_exponent(ts: List[float], max_lag: int = 20) -> float:
-    """计算 Hurst 指数，粗略估计趋势性"""
     n = len(ts)
     if n < max_lag+1:
         return 0.5
@@ -477,11 +452,9 @@ def hurst_exponent(ts: List[float], max_lag: int = 20) -> float:
     return hurst
 
 def runs_test(seq: List[str]) -> float:
-    """游程检验，返回p值近似，判断是否随机"""
     n = len(seq)
     if n < 10:
         return 0.5
-    # 转换为二元序列（0/1）
     states = sorted(set(seq))
     if len(states) != 2:
         return 0.5
@@ -501,7 +474,6 @@ def runs_test(seq: List[str]) -> float:
     return p_value
 
 def ljung_box_test(seq: List[float], max_lag: int = 10) -> float:
-    """Ljung-Box Q 统计量，返回 p-value，检验自相关性"""
     n = len(seq)
     if n < max_lag + 2:
         return 0.5
@@ -512,7 +484,7 @@ def ljung_box_test(seq: List[float], max_lag: int = 10) -> float:
     for k in range(1, max_lag+1):
         q += acf[k]**2 / (n - k)
     q = n * (n+2) * q
-    p_value = 1 - 0.5 * (1 + math.erf(q / math.sqrt(2)))  # 近似
+    p_value = 1 - 0.5 * (1 + math.erf(q / math.sqrt(2)))
     return p_value
 
 class RegimeDetector:
@@ -524,10 +496,8 @@ class RegimeDetector:
         self.lb_p_thresh = lb_p_thresh
 
     def detect(self, seq: List[str], value_func: callable) -> Dict[str, Any]:
-        """value_func: 将状态映射为数值（例如 红->0, 蓝->1, 绿->2）"""
         if len(seq) < 30:
             return {"predictable": False, "reason": "数据不足"}
-        # 转换为数值序列
         vals = [value_func(s) for s in seq]
         hurst = hurst_exponent(vals, max_lag=min(20, len(seq)//4))
         runs_p = runs_test(seq)
@@ -550,6 +520,49 @@ class RegimeDetector:
             "lb_p": lb_p
         }
 
+# ========== 6. 顺序概率比检验 (SPRT) ==========
+class SPRT:
+    """检验模型是否优于随机猜测（针对二分类问题，但可扩展到多分类）"""
+    def __init__(self, alpha: float = 0.05, beta: float = 0.05,
+                 p0: float = 0.5, p1: float = 0.55):
+        """
+        p0: 零假设下的成功概率（随机）
+        p1: 备择假设下的成功概率（有效）
+        alpha: 第一类错误（误拒真）
+        beta: 第二类错误（误纳伪）
+        """
+        self.p0 = p0
+        self.p1 = p1
+        # 计算阈值
+        self.A = math.log(beta / (1 - alpha))
+        self.B = math.log((1 - beta) / alpha)
+        self.log_lik_ratio = 0.0
+        self.decision = None   # None: 继续, True: 接受H1 (模型有效), False: 接受H0 (无效)
+
+    def update(self, correct: bool):
+        """根据一次预测是否正确更新似然比"""
+        if correct:
+            lr = math.log(self.p1 / self.p0)
+        else:
+            lr = math.log((1 - self.p1) / (1 - self.p0))
+        self.log_lik_ratio += lr
+        if self.log_lik_ratio >= self.B:
+            self.decision = True   # 接受 H1，模型有效
+        elif self.log_lik_ratio <= self.A:
+            self.decision = False  # 接受 H0，模型无效
+        else:
+            self.decision = None
+
+    def reset(self):
+        self.log_lik_ratio = 0.0
+        self.decision = None
+
+    def is_effective(self) -> bool:
+        return self.decision is True
+
+    def is_ineffective(self) -> bool:
+        return self.decision is False
+
 # ========== 7. 动态模型加权 ==========
 class ModelWeightManager:
     def __init__(self, models: List[str], loss_window: int = 50):
@@ -560,9 +573,6 @@ class ModelWeightManager:
 
     def update_loss(self, model: str, loss: float):
         self.losses[model].append(loss)
-        # 更新权重 (softmax of negative recent average loss)
-        recent_loss = np.mean(self.losses[model]) if self.losses[model] else 0.0
-        # 使用指数加权移动平均
         exp_losses = {}
         for m in self.models:
             mean_loss = np.mean(self.losses[m]) if self.losses[m] else 0.0
@@ -582,20 +592,17 @@ class AnomalyFilter:
         self.extreme_streak = 0
 
     def check(self, probs: Dict[str, float]) -> bool:
-        """返回是否应该暂停预测"""
         maxp = max(probs.values())
-        # 极度偏态（某一状态概率过高）
         if maxp > self.bias_threshold:
             self.extreme_streak += 1
         else:
             self.extreme_streak = 0
         if self.extreme_streak >= self.consecutive_extreme_threshold:
             return True
-        # 其他异常检测可以扩展
         return False
 
-# ========== 9. 集成引擎 V5 ==========
-class AttributeEngineV5:
+# ========== 9. 集成引擎 V6 ==========
+class AttributeEngineV6:
     def __init__(self, name: str, order: int = 2, alpha_smooth: float = 1.0,
                  use_hmm: bool = True, hmm_states: int = 3, reg_factor: float = 0.05):
         self.name = name
@@ -606,7 +613,6 @@ class AttributeEngineV5:
         self.hmm = None
         if use_hmm:
             self.hmm = DiscreteHMM(hmm_states, len(self.states), self.states, reg_factor=reg_factor)
-        # 马尔可夫模型
         self.markov_counts = defaultdict(lambda: defaultdict(float))
         self.markov_total = defaultdict(float)
         self.streak_stats = StreakStats(self.states)
@@ -615,12 +621,11 @@ class AttributeEngineV5:
         self.regime_detector = RegimeDetector()
         self.model_weight_mgr = ModelWeightManager(["markov", "streak", "hmm"], loss_window=50)
         self.anomaly_filter = AnomalyFilter()
-        # 历史记录用于计算损失
-        self.recent_preds = deque(maxlen=100)   # (model_name, prob_dict, actual_state)
+        # SPRT 检验 (每个属性独立)
+        self.sprt = SPRT(p0=1/len(self.states), p1=1/len(self.states) + 0.1)
 
     def train(self, seq: List[str]):
         weights = dynamic_weights(len(seq))
-        # 马尔可夫
         for i in range(len(seq) - self.order):
             state = tuple(seq[i:i+self.order])
             nxt = seq[i+self.order]
@@ -664,13 +669,10 @@ class AttributeEngineV5:
             return {s: 1/len(self.states) for s in self.states}
 
     def predict_proba(self, recent: List[str]) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """返回 (融合概率, 各模型概率)"""
-        # 各模型概率
         markov_p = self._markov_probs(recent)
         streak_p = self._streak_probs(recent)
         hmm_p = self._hmm_probs(recent)
         model_probs = {"markov": markov_p, "streak": streak_p, "hmm": hmm_p}
-        # 动态权重
         weights = self.model_weight_mgr.get_weights()
         fused = {}
         for s in self.states:
@@ -680,9 +682,7 @@ class AttributeEngineV5:
         total = sum(fused.values())
         if total > 0:
             fused = {s: p/total for s, p in fused.items()}
-        # 状态机调整
         fused = self.state_machine.adjust_probs(fused, recent)
-        # 校准
         calibrated = {}
         for s, p in fused.items():
             cal = self.calibrator.calibrate(p)
@@ -694,28 +694,29 @@ class AttributeEngineV5:
             calibrated = fused
         return calibrated, model_probs
 
-    def update_feedback(self, predicted_probs: Dict[str, float], actual: str):
-        """更新校准器、模型权重等，但不使用未来信息"""
-        # 计算每个模型的损失
-        # 需要知道每个模型对这一期的预测概率
-        # 由于我们没有存储每个模型单独的预测，可以在 predict_proba 时保存历史
-        # 简化：我们只更新校准器和损失（使用融合概率的单一损失来调整权重？）
-        # 正确做法：在调用 predict_proba 时返回各模型概率并存储
-        # 这里留一个接口，期望外部传入各模型概率
-        # 为避免复杂，我们只更新校准器，模型权重将在外部调用时提供各模型概率
-        # 实际使用时，在系统层面记录模型概率并更新权重管理器
-        max_state = max(predicted_probs.items(), key=lambda x: x[1])[0]
-        is_correct = (max_state == actual)
-        max_prob = predicted_probs[max_state]
-        self.calibrator.update(max_prob, is_correct)
-
-    def update_model_losses(self, model_probs: Dict[str, Dict[str, float]], actual: str):
-        """传入各模型在这一期的预测概率字典，更新损失"""
+    def update_feedback(self, model_probs: Dict[str, Dict[str, float]], actual: str):
+        """更新模型损失、校准器、SPRT"""
+        # 更新模型权重损失
         for model_name, probs in model_probs.items():
-            # 计算对数损失：取实际状态的负对数概率
             prob_actual = probs.get(actual, 1e-10)
             loss = -math.log(prob_actual)
             self.model_weight_mgr.update_loss(model_name, loss)
+        # 更新校准器（使用融合概率的主预测）
+        # 为简化，我们使用融合概率中最大概率对应的类别作为预测，并取得该概率
+        # 实际应该融合后的概率分布来更新校准器，这里取主预测的概率
+        # 更新校准器
+        fused_probs = self.predict_proba(recent=[])  # 无法直接获得，需要重构
+        # 由于 update_feedback 被调用时，我们已知融合概率（外部传入），但为了不重复计算，这里要求外部传入融合概率
+        # 修改接口：在外部调用时传入 fused_probs
+        pass  # 将在系统层处理
+
+    def update_calibration(self, fused_probs: Dict[str, float], actual: str):
+        max_state = max(fused_probs.items(), key=lambda x: x[1])[0]
+        max_prob = fused_probs[max_state]
+        correct = (max_state == actual)
+        self.calibrator.update(max_prob, correct)
+        # 更新 SPRT
+        self.sprt.update(correct)
 
     def get_calibration_error(self) -> float:
         return self.calibrator.expected_calibration_error()
@@ -724,23 +725,38 @@ class AttributeEngineV5:
         return self.anomaly_filter.check(probs)
 
     def detect_regime(self, seq: List[str]) -> Dict[str, Any]:
-        # 将状态映射为数值（简单按顺序）
         value_map = {s: i for i, s in enumerate(self.states)}
         def mapper(s): return value_map[s]
         return self.regime_detector.detect(seq, mapper)
 
-# ========== 10. 系统集成 V5 ==========
-class PredictionSystemV5:
+    def is_model_effective(self) -> bool:
+        """SPRT 判断模型是否有效"""
+        return self.sprt.is_effective()
+
+    def is_model_ineffective(self) -> bool:
+        return self.sprt.is_ineffective()
+
+    def reset_sprt(self):
+        self.sprt.reset()
+
+# ========== 10. 系统集成 V6 ==========
+class PredictionSystemV6:
     def __init__(self, order: int = 2, min_norm_ig: float = 0.1, max_ece: float = 0.1):
         self.order = order
         self.min_norm_ig = min_norm_ig
         self.max_ece = max_ece
         self.engines = {
-            "color": AttributeEngineV5("color", order),
-            "size": AttributeEngineV5("size", order),
-            "odd_even": AttributeEngineV5("odd_even", order)
+            "color": AttributeEngineV6("color", order),
+            "size": AttributeEngineV6("size", order),
+            "odd_even": AttributeEngineV6("odd_even", order)
         }
         self.norm_igs = {}
+        # 评估指标历史
+        self.performance = {
+            "color": {"brier": deque(maxlen=100), "logloss": deque(maxlen=100)},
+            "size": {"brier": deque(maxlen=100), "logloss": deque(maxlen=100)},
+            "odd_even": {"brier": deque(maxlen=100), "logloss": deque(maxlen=100)}
+        }
 
     def train_all(self, seqs: Dict[str, List[str]]):
         for name, seq in seqs.items():
@@ -757,17 +773,23 @@ class PredictionSystemV5:
                 "max_prob": max(probs.values()),
                 "best_state": max(probs.items(), key=lambda x: x[1])[0]
             }
-        # 检查异常和可预测性
+        # 检查可预测性、异常、SPRT 有效性
         skip = False
         reasons = []
         for name, engine in self.engines.items():
+            # 市场状态检测
             regime = engine.detect_regime(recents[name])
             if not regime["predictable"]:
                 skip = True
                 reasons.append(f"{name}: {regime['reason']}")
+            # 异常偏态
             if engine.check_anomaly(results[name]["probs"]):
                 skip = True
                 reasons.append(f"{name}: 异常偏态")
+            # SPRT 检验模型有效性
+            if engine.is_model_ineffective():
+                skip = True
+                reasons.append(f"{name}: SPRT 判定模型无效")
         if skip:
             results["meta"] = {
                 "should_act": False,
@@ -790,32 +812,56 @@ class PredictionSystemV5:
         return results
 
     def update_feedback_all(self, actuals: Dict[str, str], predictions: Dict[str, Any]):
-        """传入本期实际结果和预测结果（包含各模型概率）用于在线学习"""
+        """更新每个引擎的校准器、SPRT 和性能指标"""
         for name, engine in self.engines.items():
             probs = predictions[name]["probs"]
             model_probs = predictions[name]["model_probs"]
-            engine.update_feedback(probs, actuals[name])
-            engine.update_model_losses(model_probs, actuals[name])
+            # 更新模型损失（用于动态权重）
+            for model_name, mprobs in model_probs.items():
+                prob_actual = mprobs.get(actuals[name], 1e-10)
+                loss = -math.log(prob_actual)
+                engine.model_weight_mgr.update_loss(model_name, loss)
+            # 更新校准器和 SPRT
+            best_state = max(probs.items(), key=lambda x: x[1])[0]
+            max_prob = probs[best_state]
+            correct = (best_state == actuals[name])
+            engine.calibrator.update(max_prob, correct)
+            engine.sprt.update(correct)
+            # 记录 Brier Score 和 Log Loss
+            # 对于多分类，Brier 定义为 1 - sum(p_i^2) 或针对实际类别的平方误差，这里使用简单版本：只考虑预测概率与实际类别
+            # 实际类别编码为 one-hot，Brier Score = sum_i (p_i - y_i)^2
+            # 简化：我们只计算实际类别对应的预测概率的平方误差，更严格的应计算所有类别的和
+            # 多分类 Brier Score: sum_i (p_i - y_i)^2
+            y = {s: 1 if s == actuals[name] else 0 for s in engine.states}
+            brier = sum((probs.get(s,0) - y[s])**2 for s in engine.states)
+            logloss = -math.log(probs.get(actuals[name], 1e-10))
+            self.performance[name]["brier"].append(brier)
+            self.performance[name]["logloss"].append(logloss)
 
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 30) -> Dict[str, float]:
-        """完全无泄漏回测：每一步重新初始化系统"""
+    def get_average_brier(self) -> Dict[str, float]:
+        return {name: np.mean(list(metrics["brier"])) if metrics["brier"] else 0.0
+                for name, metrics in self.performance.items()}
+
+    def get_average_logloss(self) -> Dict[str, float]:
+        return {name: np.mean(list(metrics["logloss"])) if metrics["logloss"] else 0.0
+                for name, metrics in self.performance.items()}
+
+    def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 30) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """返回 (准确率, 平均Brier Score)"""
         total = 0
         correct = {name: 0 for name in self.engines}
-        # 从最早的可预测点开始
+        brier_accum = {name: 0.0 for name in self.engines}
+        logloss_accum = {name: 0.0 for name in self.engines}
         min_len = self.order + 10
         for idx in range(min_len, len(seqs["color"]) - 1):
             if idx < len(seqs["color"]) - test_len:
-                continue   # 只测试最后 test_len 期
-            # 重新创建系统（完全独立）
-            system = PredictionSystemV5(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece)
+                continue
+            # 全新系统，无泄漏
+            system = PredictionSystemV6(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece)
             train_seqs = {name: seq[:idx] for name, seq in seqs.items()}
             system.train_all(train_seqs)
-            recents = {}
-            for name in self.engines:
-                if idx >= self.order:
-                    recents[name] = seqs[name][idx-self.order:idx]
-                else:
-                    recents[name] = seqs[name][:idx]
+            recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx]
+                       for name in self.engines}
             pred = system.predict_all(recents)
             actuals = {name: seqs[name][idx] for name in self.engines}
             should_act = pred["meta"]["should_act"]
@@ -823,11 +869,19 @@ class PredictionSystemV5:
                 for name in self.engines:
                     if pred[name]["best_state"] == actuals[name]:
                         correct[name] += 1
+                    # 计算 Brier Score
+                    y = {s: 1 if s == actuals[name] else 0 for s in system.engines[name].states}
+                    probs = pred[name]["probs"]
+                    brier = sum((probs.get(s,0) - y[s])**2 for s in system.engines[name].states)
+                    brier_accum[name] += brier
+                    logloss = -math.log(probs.get(actuals[name], 1e-10))
+                    logloss_accum[name] += logloss
                 total += 1
-        # 如果没有出手次数，准确率无意义
         if total == 0:
-            return {name: 0.0 for name in self.engines}
-        return {name: correct[name]/total for name in self.engines}
+            return {name: 0.0 for name in self.engines}, {name: 0.0 for name in self.engines}
+        acc = {name: correct[name]/total for name in self.engines}
+        avg_brier = {name: brier_accum[name]/total for name in self.engines}
+        return acc, avg_brier
 
 # ========== 仪表盘 ==========
 def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30):
@@ -839,7 +893,6 @@ def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30
     if len(seqs["color"]) < order + 10:
         print("历史数据不足，请先同步数据。")
         return
-    # 最新开奖
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
@@ -851,13 +904,12 @@ def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    # 训练完整系统用于下一期预测
-    system = PredictionSystemV5(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece)
+    system = PredictionSystemV6(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece)
     system.train_all(seqs)
     recents = {name: seq[-order:] for name, seq in seqs.items()}
     pred = system.predict_all(recents)
 
-    print(f"\n🔮 下一期属性预测 V5 (阶数={order})")
+    print(f"\n🔮 下一期属性预测 V6 (阶数={order})")
     for name, data in pred.items():
         if name == "meta":
             continue
@@ -871,15 +923,16 @@ def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30
     print(f"   平均归一化信息增益: {meta['avg_norm_ig']:.4f}")
     print(f"   平均校准误差 ECE: {meta['avg_ece']:.4f}")
 
-    # 回测
+    # 回测与评估
     print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
-    acc = system.walk_forward_backtest(seqs, test_len=backtest_len)
-    for name, a in acc.items():
-        print(f"   {name} 准确率: {a*100:.1f}%")
+    acc, avg_brier = system.walk_forward_backtest(seqs, test_len=backtest_len)
+    for name in acc:
+        print(f"   {name} 准确率: {acc[name]*100:.1f}%  平均Brier: {avg_brier[name]:.4f}")
     if any(acc.values()):
         print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
+        print(f"   平均Brier: {np.mean(list(avg_brier.values())):.4f} (越小越好)")
     else:
-        print("   未出手，无准确率数据")
+        print("   未出手，无数据")
 
 # ========== 命令行 ==========
 def cmd_sync(args):
@@ -903,7 +956,7 @@ def cmd_show(args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V5")
+    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--order", type=int, default=2, help="马尔可夫阶数")
     p.add_argument("--min-ig", type=float, default=0.1, help="最小归一化信息增益阈值")
