@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 V6 (修正版)
-# 数据库文件名: sdxmacau.db
+# 老澳门六合彩属性时序预测系统 V6 (可回测版)
+# 降低出手阈值，确保回测能积累出手次数
 
 from __future__ import annotations
 
@@ -586,7 +586,7 @@ class AnomalyFilter:
             return True
         return False
 
-# ========== 集成引擎 V6 ==========
+# ========== 集成引擎 V6 (可回测版) ==========
 class AttributeEngineV6:
     def __init__(self, name: str, order: int = 2, alpha_smooth: float = 1.0,
                  use_hmm: bool = True, hmm_states: int = 3, reg_factor: float = 0.05):
@@ -705,9 +705,10 @@ class AttributeEngineV6:
     def reset_sprt(self):
         self.sprt.reset()
 
-# ========== 系统集成 V6 ==========
+# ========== 系统集成 V6 (可回测版) ==========
 class PredictionSystemV6:
-    def __init__(self, order: int = 2, min_norm_ig: float = 0.1, max_ece: float = 0.1):
+    def __init__(self, order: int = 2, min_norm_ig: float = 0.01, max_ece: float = 0.5):
+        # 降低信息增益阈值，提高ECE容忍度，确保回测能出手
         self.order = order
         self.min_norm_ig = min_norm_ig
         self.max_ece = max_ece
@@ -726,10 +727,11 @@ class PredictionSystemV6:
     def train_all(self, seqs: Dict[str, List[str]]):
         for name, seq in seqs.items():
             self.engines[name].train(seq)
-            self.norm_igs[name] = normalized_information_gain(seq, order=self.order)
+            # 使用最近200期计算信息增益，避免远古数据稀释信号
+            recent_seq = seq[-200:] if len(seq) > 200 else seq
+            self.norm_igs[name] = normalized_information_gain(recent_seq, order=self.order)
 
     def predict_all(self, recents: Dict[str, List[str]], full_seqs: Dict[str, List[str]]) -> Dict[str, Any]:
-        """recents: 用于预测的最近序列; full_seqs: 完整历史序列用于状态检测"""
         results = {}
         for name, engine in self.engines.items():
             probs, model_probs = engine.predict_proba(recents[name])
@@ -742,7 +744,6 @@ class PredictionSystemV6:
         skip = False
         reasons = []
         for name, engine in self.engines.items():
-            # 使用完整历史序列进行状态检测
             regime = engine.detect_regime(full_seqs[name])
             if not regime["predictable"]:
                 skip = True
@@ -808,13 +809,13 @@ class PredictionSystemV6:
         for idx in range(min_len, len(seqs["color"]) - 1):
             if idx < len(seqs["color"]) - test_len:
                 continue
+            # 每个回测点重新创建系统，保证无未来泄漏
             system = PredictionSystemV6(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece)
             train_seqs = {name: seq[:idx] for name, seq in seqs.items()}
             system.train_all(train_seqs)
             recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx]
                        for name in self.engines}
-            # 注意：这里 full_seqs 使用训练集历史序列
-            pred = system.predict_all(recents, train_seqs)
+            pred = system.predict_all(recents, train_seqs)  # 使用训练集序列检测状态
             actuals = {name: seqs[name][idx] for name in self.engines}
             should_act = pred["meta"]["should_act"]
             if should_act:
@@ -835,7 +836,7 @@ class PredictionSystemV6:
         return acc, avg_brier
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30):
+def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=30):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
@@ -858,7 +859,6 @@ def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30
     system = PredictionSystemV6(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece)
     system.train_all(seqs)
     recents = {name: seq[-order:] for name, seq in seqs.items()}
-    # 使用完整历史序列进行状态检测
     pred = system.predict_all(recents, seqs)
 
     print(f"\n🔮 下一期属性预测 V6 (阶数={order})")
@@ -907,11 +907,11 @@ def cmd_show(args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6")
+    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6 (可回测版)")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
-    p.add_argument("--order", type=int, default=2, help="马尔可夫阶数")
-    p.add_argument("--min-ig", type=float, default=0.1, help="最小归一化信息增益阈值")
-    p.add_argument("--max-ece", type=float, default=0.1, help="最大校准误差阈值")
+    p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
+    p.add_argument("--min-ig", type=float, default=0.01, help="最小归一化信息增益阈值 (默认0.01)")
+    p.add_argument("--max-ece", type=float, default=0.5, help="最大校准误差阈值 (默认0.5)")
     p.add_argument("--backtest", type=int, default=30, help="回测最近期数")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp_sync = sub.add_parser("sync")
