@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩预测工具（功能同新澳门，保留原有数据库名称）
-
+# 老澳门六合彩预测工具
 from __future__ import annotations
 
 import argparse
@@ -794,9 +793,9 @@ def _parse_marksix6_response(payload):
     hk_data = next(
         (
             l for l in lottery_data
-            if l.get("name") in ["新澳门彩", "老澳门彩"]
+            if l.get("name") in [ "老澳门彩"]
         ),
-        None
+        无
     )
 
     if not hk_data:
@@ -810,7 +809,7 @@ def _parse_marksix6_response(payload):
     except Exception:
         latest_open_time = datetime.now()
 
-    for idx, item in enumerate(hk_data.get("history", [])):
+    for idx, item in enumerate(hk_data.get("history"， [])):
         try:
             parts = item.split("期：")
 
