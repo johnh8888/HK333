@@ -1,17 +1,17 @@
-name: 新澳门六合彩AI预测
+name: 新澳门六合彩预测系统
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 13,1 * * *"
   workflow_dispatch:
 
 jobs:
-  ai-predict:
+  predict:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: 检出仓库
+      - name: 检出代码
         uses: actions/checkout@v4
 
       - name: 安装 Python
@@ -19,31 +19,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 恢复数据库
+      - name: 下载数据库
         uses: actions/download-artifact@v4
         with:
-          name: new-macau-db
+          name: macau-db
           path: .
         continue-on-error: true
 
-      - name: 安装依赖
+      - name: 执行预测
         run: |
-          pip install requests
 
-      - name: 执行 AI 同步预测
-        run: |
           success=0
 
           for i in 1 2 3
           do
             echo "第 $i 次执行预测..."
 
-            python new_macau.py \
-              --color-window 10 \
-              --color-method weighted \
-              sync \
+            python new_macau.py sync \
               --with-backtest \
-              --auto-tune
+              --auto-tune \
+              --color-window 10 \
+              --color-method weighted
 
             if [ $? -eq 0 ]; then
               success=1
@@ -63,6 +59,6 @@ jobs:
       - name: 上传数据库
         uses: actions/upload-artifact@v4
         with:
-          name: new-macau-db
-          path: new_macau.db
+          name: macau-db
+          path: macau.db
           retention-days: 7
