@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 V6
+# 老澳门六合彩属性时序预测系统 V6 (修正版)
 # 数据库文件名: sdxmacau.db
 
 from __future__ import annotations
@@ -728,7 +728,8 @@ class PredictionSystemV6:
             self.engines[name].train(seq)
             self.norm_igs[name] = normalized_information_gain(seq, order=self.order)
 
-    def predict_all(self, recents: Dict[str, List[str]]) -> Dict[str, Any]:
+    def predict_all(self, recents: Dict[str, List[str]], full_seqs: Dict[str, List[str]]) -> Dict[str, Any]:
+        """recents: 用于预测的最近序列; full_seqs: 完整历史序列用于状态检测"""
         results = {}
         for name, engine in self.engines.items():
             probs, model_probs = engine.predict_proba(recents[name])
@@ -741,7 +742,8 @@ class PredictionSystemV6:
         skip = False
         reasons = []
         for name, engine in self.engines.items():
-            regime = engine.detect_regime(recents[name])
+            # 使用完整历史序列进行状态检测
+            regime = engine.detect_regime(full_seqs[name])
             if not regime["predictable"]:
                 skip = True
                 reasons.append(f"{name}: {regime['reason']}")
@@ -811,7 +813,8 @@ class PredictionSystemV6:
             system.train_all(train_seqs)
             recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx]
                        for name in self.engines}
-            pred = system.predict_all(recents)
+            # 注意：这里 full_seqs 使用训练集历史序列
+            pred = system.predict_all(recents, train_seqs)
             actuals = {name: seqs[name][idx] for name in self.engines}
             should_act = pred["meta"]["should_act"]
             if should_act:
@@ -855,7 +858,8 @@ def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30
     system = PredictionSystemV6(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece)
     system.train_all(seqs)
     recents = {name: seq[-order:] for name, seq in seqs.items()}
-    pred = system.predict_all(recents)
+    # 使用完整历史序列进行状态检测
+    pred = system.predict_all(recents, seqs)
 
     print(f"\n🔮 下一期属性预测 V6 (阶数={order})")
     for name, data in pred.items():
