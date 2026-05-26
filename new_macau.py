@@ -189,115 +189,87 @@ def special_attributes(num: int) -> Dict[str, str]:
 
 
 # =========================================================
-# 波色预测 (已升级)
+# 波色预测（三模型集成，连出奖励减半，指数平滑）
 # =========================================================
 
 def predict_color_weighted(
     specials: List[int],
     window: int = 12
 ) -> Tuple[str, str, float, float]:
-
+    """
+    三模型集成：
+    - 模型A: 改进加权（衰减、连出奖励降低、极热压制）
+    - 模型B: 马尔可夫转移矩阵
+    - 模型C: 简单频率统计
+    投票决定主强，平局时用模型A得分仲裁。
+    """
     if not specials:
         return "绿", "红", 0.0, 0.0
 
     recent = specials[-window:]
 
-    scores = defaultdict(float)
-
-    total_weight = 0.0
-
+    # ---- 模型A: 改进加权 ----
+    scores_a = defaultdict(float)
+    total_w = 0.0
     for i, num in enumerate(reversed(recent)):
-
-        weight = (window - i) ** 1.72
-
+        w = (window - i) ** 1.5          # 更平滑
         color = get_color(num)
-
-        scores[color] += weight
-
-        total_weight += weight
-
-        # 连波强化
+        scores_a[color] += w
+        total_w += w
         if i > 0:
-
-            prev_index = len(recent) - i
-
-            if 0 <= prev_index < len(recent):
-
-                prev_color = get_color(recent[prev_index])
-
-                if color == prev_color:
-                    scores[color] += weight * 0.68
-
-    # 波色震荡识别
-    seq = [get_color(x) for x in recent[-8:]]
-
-    color_switch = 0
-
-    for i in range(1, len(seq)):
-        if seq[i] != seq[i - 1]:
-            color_switch += 1
-
-    if color_switch >= 6:
-
-        last = seq[-1]
-
-        remain = ["红", "蓝", "绿"]
-
-        remain.remove(last)
-
-        for c in remain:
-            scores[c] += total_weight * 0.12
+            prev_idx = len(recent) - i
+            if 0 <= prev_idx < len(recent):
+                if color == get_color(recent[prev_idx]):
+                    scores_a[color] += w * 0.3   # 连出奖励从0.68降到0.3
 
     # 长期缺失补偿
-    miss_map = {
-        "红": 0,
-        "蓝": 0,
-        "绿": 0
-    }
-
+    miss_map = {"红":0,"蓝":0,"绿":0}
     for idx, n in enumerate(reversed(recent)):
-
         c = get_color(n)
-
-        if miss_map[c] == 0:
-            miss_map[c] = idx + 1
-
+        if miss_map[c] == 0: miss_map[c] = idx+1
     for c in miss_map:
-
         if miss_map[c] >= 5:
-            scores[c] += miss_map[c] * 0.9
+            scores_a[c] += miss_map[c] * 0.7
 
-    # 极热压制
-    for c in ["红", "蓝", "绿"]:
-
-        ratio = safe_div(scores[c], total_weight)
-
-        if ratio > 0.72:
-
-            for other in ["红", "蓝", "绿"]:
-
+    # 极热压制（阈值提高到0.75）
+    for c in ["红","蓝","绿"]:
+        ratio = safe_div(scores_a[c], total_w)
+        if ratio > 0.75:
+            for other in ["红","蓝","绿"]:
                 if other != c:
-                    scores[other] += total_weight * 0.15
+                    scores_a[other] += total_w * 0.1
 
-    sorted_colors = sorted(
-        scores.items(),
-        key=lambda x: (-x[1], x[0])
-    )
+    sorted_a = sorted(scores_a.items(), key=lambda x: x[1], reverse=True)
+    main_a = sorted_a[0][0]
 
-    main_color = sorted_colors[0][0]
+    # ---- 模型B: 马尔可夫 ----
+    main_b, probs_b = predict_color_markov(specials)
+    if not probs_b:
+        main_b = main_a
 
-    second_color = sorted_colors[1][0]
+    # ---- 模型C: 简单频率 ----
+    freq = Counter(get_color(n) for n in recent)
+    main_c = freq.most_common(1)[0][0]
 
-    main_score = safe_div(sorted_colors[0][1], total_weight)
+    # ---- 投票集成 ----
+    votes = Counter([main_a, main_b, main_c])
+    top_voted = votes.most_common()
+    if len(top_voted) == 1 or top_voted[0][1] > top_voted[1][1]:
+        main_color = top_voted[0][0]
+    else:
+        # 平局，用模型A得分仲裁
+        best_score = -1
+        main_color = "绿"
+        for color in [c for c,_ in top_voted]:
+            if scores_a[color] > best_score:
+                best_score = scores_a[color]
+                main_color = color
 
-    second_score = safe_div(sorted_colors[1][1], total_weight)
+    main_score = safe_div(scores_a[main_color], total_w)
+    second_color = sorted_a[1][0] if len(sorted_a) > 1 else "红"
+    second_score = safe_div(scores_a[second_color], total_w)
 
-    return (
-        main_color,
-        second_color,
-        main_score,
-        second_score
-    )
+    return main_color, second_color, main_score, second_score
 
 
 def predict_color(
@@ -1305,9 +1277,7 @@ def build_multi_window_features(draws):
             result[n]["omit"] += omit[n] * weight
             result[n]["momentum"] += mom[n] * weight
 
-    return result
-
-
+    return result    
 # =========================================================
 # 结构评估（高级规则系统，用于排除组合）
 # =========================================================
@@ -2101,9 +2071,7 @@ def ml_window_strategy(draws, specials):
 # =========================================================
 
 def _default_mined_config():
-    return {"window": 80.0, "w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05, "special_bonus": 0.10}
-
-
+    return {"window": 80.0, "w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05, "special_bonus": 0.10}    
 # =========================================================
 # 策略调度（包含新增策略）
 # =========================================================
@@ -2400,7 +2368,7 @@ def best_color_window(conn, specials, color_method, windows=[8,10,12,14]):
 
 
 # =========================================================
-# 展示（加入 LightGBM 回测开关 + 动态波色窗口）
+# 展示（加入 LightGBM 回测开关 + 动态波色窗口 + 集成纠错）
 # =========================================================
 
 def print_dashboard(conn, color_window=10, color_method="weighted", show_lgbm_backtest=False):
@@ -2429,7 +2397,15 @@ def print_dashboard(conn, color_window=10, color_method="weighted", show_lgbm_ba
         # 动态选择最佳窗口
         dyn_window = best_color_window(conn, all_specials, color_method)
         print(f"\n🎨 特码波色预测（自适应窗口：{dyn_window} 期，{ '改进加权' if color_method=='weighted' else '简单频率' }）:")
-        main_color, second_color, main_score, second_score = predict_color(all_specials, window=dyn_window, method=color_method)
+
+        # 检查近期命中率，若过低则自动切换为集成投票模式（内部已包含集成逻辑）
+        _, mh, _, ah, _ = backtest_colors(conn, recent_limit=8, window=dyn_window, method=color_method)
+        if mh/8 < 0.25 and color_method == "weighted":
+            print("⚠️ 近期加权模型主强命中率低于25%，自动切换为三模型集成投票")
+            main_color, second_color, main_score, second_score = predict_color_weighted(all_specials, dyn_window)
+        else:
+            main_color, second_color, main_score, second_score = predict_color(all_specials, dyn_window, color_method)
+
         print(f"   主强: {main_color} (得分 {main_score:.3f})   次强: {second_color} (得分 {second_score:.3f})")
 
         total, main_hit, second_hit, any_hit, max_miss = backtest_colors(conn, recent_limit=10, window=dyn_window, method=color_method)
