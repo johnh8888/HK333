@@ -1,32 +1,24 @@
-name: 新澳门六合彩预测系统
+name: AI Lottery Predictor
 
 on:
-  schedule:
-    - cron: "0 13,1 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: 下载数据库
-        uses: actions/download-artifact@v4
-        with:
-          name: macau-db
-          path: .
-        continue-on-error: true
-
-      - name: 执行预测
+      - name: Run Predictor
         run: |
 
           success=0
@@ -35,11 +27,7 @@ jobs:
           do
             echo "第 $i 次执行预测..."
 
-            python new_macau.py sync \
-              --with-backtest \
-              --auto-tune \
-              --color-window 10 \
-              --color-method weighted
+            python new_macau.py sync
 
             if [ $? -eq 0 ]; then
               success=1
@@ -55,10 +43,3 @@ jobs:
             echo "连续失败，任务终止"
             exit 1
           fi
-
-      - name: 上传数据库
-        uses: actions/upload-artifact@v4
-        with:
-          name: macau-db
-          path: macau.db
-          retention-days: 7
