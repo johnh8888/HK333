@@ -1,6 +1,6 @@
 name: 老澳门六合彩自动预测
 
-于:
+on:
   schedule:
     # 每天北京时间 22:05 运行（开奖时间 21:30 之后）
     - cron: '5 14 * * *'
@@ -25,13 +25,17 @@ jobs:
           pip install --upgrade pip
           pip install numpy scikit-learn lightgbm xgboost catboost
 
-- name: 运行同步、回测、调优与预测
-  run: python macau.py sync --with-backtest --auto-tune
+      - name: 运行同步、回测、调优与预测
+        run: python macau.py sync --with-backtest --auto-tune
 
-- name: 提交数据库更新
-  run: |
-    git add macau.db
-    git commit -m "🤖 老澳门六合彩自动更新 ..."
+      - name: 提交数据库更新
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add macau.db
+          git commit -m "🤖 老澳门六合彩自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "无变化"
+          git push
+
       - name: 保存数据库备份
         uses: actions/upload-artifact@v4
         with:
