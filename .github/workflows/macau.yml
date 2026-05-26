@@ -25,6 +25,11 @@ jobs:
           pip install --upgrade pip
           pip install numpy scikit-learn lightgbm xgboost catboost
 
+      - name: 修复全角标点符号（防止语法错误）
+        run: |
+          # 替换常见全角符号为半角
+          sed -i 's/，/,/g; s/。/. /g; s/；/;/g; s/：/:/g; s/！/!/g; s/？/?/g; s/（/(/g; s/）/)/g; s/【/[/g; s/】/]/g; s/“/"/g; s/”/"/g; s/‘/'"'"'/g; s/’/'"'"'/g' macau.py
+
       - name: 运行同步、回测、调优与预测
         run: python macau.py sync --with-backtest --auto-tune
 
