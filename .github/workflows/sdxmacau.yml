@@ -28,7 +28,7 @@ jobs:
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
-          git config.user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add sdxmacau.db
           git commit -m "自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "无变化"
           git push
