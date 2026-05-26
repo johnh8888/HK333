@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 V6 (可回测版)
-# 降低出手阈值，确保回测能积累出手次数
+# 老澳门六合彩属性时序预测系统 V6 (可回测版，默认10期)
 
 from __future__ import annotations
 
@@ -836,7 +835,7 @@ class PredictionSystemV6:
         return acc, avg_brier
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=30):
+def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=10):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
@@ -912,7 +911,7 @@ def main():
     p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
     p.add_argument("--min-ig", type=float, default=0.01, help="最小归一化信息增益阈值 (默认0.01)")
     p.add_argument("--max-ece", type=float, default=0.5, help="最大校准误差阈值 (默认0.5)")
-    p.add_argument("--backtest", type=int, default=30, help="回测最近期数")
+    p.add_argument("--backtest", type=int, default=10, help="回测最近期数 (默认10)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp_sync = sub.add_parser("sync")
     sp_sync.set_defaults(func=cmd_sync)
