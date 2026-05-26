@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # 老澳门六合彩属性时序预测系统 V6
-# 包含: 无泄漏回测, Brier/LogLoss评估, Hurst指数, SPRT动态有效性检验
+# 数据库文件名: sdxmacau.db
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ except ImportError:
 
 # ========== 配置 ==========
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "sdxmacau_v6.db")
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "sdxmacau.db")   # 保持原名
 
 THIRD_PARTY_URLS = [
     "https://marksix6.net/index.php?api=1",
@@ -54,7 +54,7 @@ def get_big_small(num: int) -> str:
 def get_odd_even(num: int) -> str:
     return "单" if num % 2 else "双"
 
-# ========== 数据层（与之前相同） ==========
+# ========== 数据层 ==========
 @dataclass
 class DrawRecord:
     issue_no: str
@@ -156,14 +156,12 @@ def dynamic_weights(n: int, decay: float = 0.95) -> List[float]:
 
 # ========== 指标评估 ==========
 def brier_score(p: float, y: int) -> float:
-    """p 是预测为正类的概率，y ∈ {0,1}"""
     return (p - y) ** 2
 
 def log_loss(p: float, y: int) -> float:
     p = np.clip(p, 1e-15, 1 - 1e-15)
     return - (y * math.log(p) + (1 - y) * math.log(1 - p))
 
-# ========== 工具函数 ==========
 def entropy(probs: List[float]) -> float:
     return -sum(p * math.log(p) for p in probs if p > 0)
 
@@ -189,7 +187,7 @@ def normalized_information_gain(seq: List[str], order: int = 1) -> float:
     ig = h_y - cond_entropy
     return ig / h_y
 
-# ========== 1. 动态统计趋势延续 ==========
+# ========== 动态统计趋势延续 ==========
 class StreakStats:
     def __init__(self, states: List[str]):
         self.states = states
@@ -221,7 +219,7 @@ class StreakStats:
         total_p = sum(probs.values())
         return {s: p/total_p for s, p in probs.items()} if total_p>0 else {s:1/K for s in self.states}
 
-# ========== 2. HMM 带正则化和 Early Stopping ==========
+# ========== HMM 带正则化和 Early Stopping ==========
 class DiscreteHMM:
     def __init__(self, n_states: int, n_obs: int, states_list: List[str],
                  reg_factor: float = 0.05, early_stop_eps: float = 1e-4):
@@ -231,7 +229,6 @@ class DiscreteHMM:
         self.obs_to_idx = {s:i for i,s in enumerate(states_list)}
         self.reg_factor = reg_factor
         self.early_stop_eps = early_stop_eps
-        # 随机初始化
         self.pi = np.random.dirichlet(np.ones(n_states))
         self.A = np.random.dirichlet(np.ones(n_states), size=n_states)
         self.B = np.random.dirichlet(np.ones(n_obs), size=n_states)
@@ -241,7 +238,6 @@ class DiscreteHMM:
         T = len(obs_idx)
         prev_log_lik = -np.inf
         for it in range(max_iter):
-            # forward
             alpha = np.zeros((T, self.n_states))
             alpha[0] = self.pi * self.B[:, obs_idx[0]]
             for t in range(1, T):
@@ -250,12 +246,10 @@ class DiscreteHMM:
             if it > 0 and abs(log_lik - prev_log_lik) < self.early_stop_eps:
                 break
             prev_log_lik = log_lik
-            # backward
             beta = np.zeros((T, self.n_states))
             beta[-1] = 1
             for t in range(T-2, -1, -1):
                 beta[t] = np.sum(self.A * self.B[:, obs_idx[t+1]] * beta[t+1], axis=1)
-            # gamma, xi
             gamma = alpha * beta
             gamma /= gamma.sum(axis=1, keepdims=True)
             xi = np.zeros((T-1, self.n_states, self.n_states))
@@ -284,7 +278,7 @@ class DiscreteHMM:
         probs = probs / probs.sum()
         return {self.states_list[i]: probs[i] for i in range(self.n_obs)}
 
-# ========== 3. 概率校准（保序回归 + 大窗口） ==========
+# ========== 概率校准（保序回归 + 大窗口） ==========
 class ProbabilityCalibrator:
     def __init__(self, window_size: int = 300):
         self.window_size = window_size
@@ -342,7 +336,7 @@ class ProbabilityCalibrator:
             ece += abs(acc - conf) * (len(bin_)/len(self.preds))
         return ece
 
-# ========== 4. 动态阈值状态机 ==========
+# ========== 动态阈值状态机 ==========
 class DynamicStateMachine:
     def __init__(self, window: int = 30, n_std: float = 2.0):
         self.window = window
@@ -434,7 +428,7 @@ class DynamicStateMachine:
             probs = {s: v/total for s, v in probs.items()}
         return probs
 
-# ========== 5. 市场状态检测 (Hurst, Runs, Ljung-Box) ==========
+# ========== 市场状态检测 (Hurst, Runs, Ljung-Box) ==========
 def hurst_exponent(ts: List[float], max_lag: int = 20) -> float:
     n = len(ts)
     if n < max_lag+1:
@@ -520,36 +514,27 @@ class RegimeDetector:
             "lb_p": lb_p
         }
 
-# ========== 6. 顺序概率比检验 (SPRT) ==========
+# ========== 顺序概率比检验 (SPRT) ==========
 class SPRT:
-    """检验模型是否优于随机猜测（针对二分类问题，但可扩展到多分类）"""
     def __init__(self, alpha: float = 0.05, beta: float = 0.05,
                  p0: float = 0.5, p1: float = 0.55):
-        """
-        p0: 零假设下的成功概率（随机）
-        p1: 备择假设下的成功概率（有效）
-        alpha: 第一类错误（误拒真）
-        beta: 第二类错误（误纳伪）
-        """
         self.p0 = p0
         self.p1 = p1
-        # 计算阈值
         self.A = math.log(beta / (1 - alpha))
         self.B = math.log((1 - beta) / alpha)
         self.log_lik_ratio = 0.0
-        self.decision = None   # None: 继续, True: 接受H1 (模型有效), False: 接受H0 (无效)
+        self.decision = None
 
     def update(self, correct: bool):
-        """根据一次预测是否正确更新似然比"""
         if correct:
             lr = math.log(self.p1 / self.p0)
         else:
             lr = math.log((1 - self.p1) / (1 - self.p0))
         self.log_lik_ratio += lr
         if self.log_lik_ratio >= self.B:
-            self.decision = True   # 接受 H1，模型有效
+            self.decision = True
         elif self.log_lik_ratio <= self.A:
-            self.decision = False  # 接受 H0，模型无效
+            self.decision = False
         else:
             self.decision = None
 
@@ -563,7 +548,7 @@ class SPRT:
     def is_ineffective(self) -> bool:
         return self.decision is False
 
-# ========== 7. 动态模型加权 ==========
+# ========== 动态模型加权 ==========
 class ModelWeightManager:
     def __init__(self, models: List[str], loss_window: int = 50):
         self.models = models
@@ -584,7 +569,7 @@ class ModelWeightManager:
     def get_weights(self) -> Dict[str, float]:
         return self.weights
 
-# ========== 8. 异常状态过滤 ==========
+# ========== 异常状态过滤 ==========
 class AnomalyFilter:
     def __init__(self, consecutive_extreme_threshold: int = 3, bias_threshold: float = 0.8):
         self.consecutive_extreme_threshold = consecutive_extreme_threshold
@@ -601,7 +586,7 @@ class AnomalyFilter:
             return True
         return False
 
-# ========== 9. 集成引擎 V6 ==========
+# ========== 集成引擎 V6 ==========
 class AttributeEngineV6:
     def __init__(self, name: str, order: int = 2, alpha_smooth: float = 1.0,
                  use_hmm: bool = True, hmm_states: int = 3, reg_factor: float = 0.05):
@@ -621,7 +606,6 @@ class AttributeEngineV6:
         self.regime_detector = RegimeDetector()
         self.model_weight_mgr = ModelWeightManager(["markov", "streak", "hmm"], loss_window=50)
         self.anomaly_filter = AnomalyFilter()
-        # SPRT 检验 (每个属性独立)
         self.sprt = SPRT(p0=1/len(self.states), p1=1/len(self.states) + 0.1)
 
     def train(self, seq: List[str]):
@@ -694,28 +678,11 @@ class AttributeEngineV6:
             calibrated = fused
         return calibrated, model_probs
 
-    def update_feedback(self, model_probs: Dict[str, Dict[str, float]], actual: str):
-        """更新模型损失、校准器、SPRT"""
-        # 更新模型权重损失
-        for model_name, probs in model_probs.items():
-            prob_actual = probs.get(actual, 1e-10)
-            loss = -math.log(prob_actual)
-            self.model_weight_mgr.update_loss(model_name, loss)
-        # 更新校准器（使用融合概率的主预测）
-        # 为简化，我们使用融合概率中最大概率对应的类别作为预测，并取得该概率
-        # 实际应该融合后的概率分布来更新校准器，这里取主预测的概率
-        # 更新校准器
-        fused_probs = self.predict_proba(recent=[])  # 无法直接获得，需要重构
-        # 由于 update_feedback 被调用时，我们已知融合概率（外部传入），但为了不重复计算，这里要求外部传入融合概率
-        # 修改接口：在外部调用时传入 fused_probs
-        pass  # 将在系统层处理
-
     def update_calibration(self, fused_probs: Dict[str, float], actual: str):
         max_state = max(fused_probs.items(), key=lambda x: x[1])[0]
         max_prob = fused_probs[max_state]
         correct = (max_state == actual)
         self.calibrator.update(max_prob, correct)
-        # 更新 SPRT
         self.sprt.update(correct)
 
     def get_calibration_error(self) -> float:
@@ -730,7 +697,6 @@ class AttributeEngineV6:
         return self.regime_detector.detect(seq, mapper)
 
     def is_model_effective(self) -> bool:
-        """SPRT 判断模型是否有效"""
         return self.sprt.is_effective()
 
     def is_model_ineffective(self) -> bool:
@@ -739,7 +705,7 @@ class AttributeEngineV6:
     def reset_sprt(self):
         self.sprt.reset()
 
-# ========== 10. 系统集成 V6 ==========
+# ========== 系统集成 V6 ==========
 class PredictionSystemV6:
     def __init__(self, order: int = 2, min_norm_ig: float = 0.1, max_ece: float = 0.1):
         self.order = order
@@ -751,7 +717,6 @@ class PredictionSystemV6:
             "odd_even": AttributeEngineV6("odd_even", order)
         }
         self.norm_igs = {}
-        # 评估指标历史
         self.performance = {
             "color": {"brier": deque(maxlen=100), "logloss": deque(maxlen=100)},
             "size": {"brier": deque(maxlen=100), "logloss": deque(maxlen=100)},
@@ -773,20 +738,16 @@ class PredictionSystemV6:
                 "max_prob": max(probs.values()),
                 "best_state": max(probs.items(), key=lambda x: x[1])[0]
             }
-        # 检查可预测性、异常、SPRT 有效性
         skip = False
         reasons = []
         for name, engine in self.engines.items():
-            # 市场状态检测
             regime = engine.detect_regime(recents[name])
             if not regime["predictable"]:
                 skip = True
                 reasons.append(f"{name}: {regime['reason']}")
-            # 异常偏态
             if engine.check_anomaly(results[name]["probs"]):
                 skip = True
                 reasons.append(f"{name}: 异常偏态")
-            # SPRT 检验模型有效性
             if engine.is_model_ineffective():
                 skip = True
                 reasons.append(f"{name}: SPRT 判定模型无效")
@@ -798,7 +759,6 @@ class PredictionSystemV6:
                 "avg_ece": np.mean([e.get_calibration_error() for e in self.engines.values()])
             }
             return results
-        # 元决策：信息增益和校准误差
         avg_norm_ig = np.mean(list(self.norm_igs.values()))
         avg_ece = np.mean([e.get_calibration_error() for e in self.engines.values()])
         should_act = (avg_norm_ig >= self.min_norm_ig and avg_ece <= self.max_ece)
@@ -812,26 +772,17 @@ class PredictionSystemV6:
         return results
 
     def update_feedback_all(self, actuals: Dict[str, str], predictions: Dict[str, Any]):
-        """更新每个引擎的校准器、SPRT 和性能指标"""
         for name, engine in self.engines.items():
             probs = predictions[name]["probs"]
             model_probs = predictions[name]["model_probs"]
-            # 更新模型损失（用于动态权重）
             for model_name, mprobs in model_probs.items():
                 prob_actual = mprobs.get(actuals[name], 1e-10)
                 loss = -math.log(prob_actual)
                 engine.model_weight_mgr.update_loss(model_name, loss)
-            # 更新校准器和 SPRT
+            engine.update_calibration(probs, actuals[name])
             best_state = max(probs.items(), key=lambda x: x[1])[0]
             max_prob = probs[best_state]
             correct = (best_state == actuals[name])
-            engine.calibrator.update(max_prob, correct)
-            engine.sprt.update(correct)
-            # 记录 Brier Score 和 Log Loss
-            # 对于多分类，Brier 定义为 1 - sum(p_i^2) 或针对实际类别的平方误差，这里使用简单版本：只考虑预测概率与实际类别
-            # 实际类别编码为 one-hot，Brier Score = sum_i (p_i - y_i)^2
-            # 简化：我们只计算实际类别对应的预测概率的平方误差，更严格的应计算所有类别的和
-            # 多分类 Brier Score: sum_i (p_i - y_i)^2
             y = {s: 1 if s == actuals[name] else 0 for s in engine.states}
             brier = sum((probs.get(s,0) - y[s])**2 for s in engine.states)
             logloss = -math.log(probs.get(actuals[name], 1e-10))
@@ -847,7 +798,6 @@ class PredictionSystemV6:
                 for name, metrics in self.performance.items()}
 
     def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 30) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """返回 (准确率, 平均Brier Score)"""
         total = 0
         correct = {name: 0 for name in self.engines}
         brier_accum = {name: 0.0 for name in self.engines}
@@ -856,7 +806,6 @@ class PredictionSystemV6:
         for idx in range(min_len, len(seqs["color"]) - 1):
             if idx < len(seqs["color"]) - test_len:
                 continue
-            # 全新系统，无泄漏
             system = PredictionSystemV6(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece)
             train_seqs = {name: seq[:idx] for name, seq in seqs.items()}
             system.train_all(train_seqs)
@@ -869,7 +818,6 @@ class PredictionSystemV6:
                 for name in self.engines:
                     if pred[name]["best_state"] == actuals[name]:
                         correct[name] += 1
-                    # 计算 Brier Score
                     y = {s: 1 if s == actuals[name] else 0 for s in system.engines[name].states}
                     probs = pred[name]["probs"]
                     brier = sum((probs.get(s,0) - y[s])**2 for s in system.engines[name].states)
@@ -923,7 +871,6 @@ def print_dashboard(conn, order=2, min_norm_ig=0.1, max_ece=0.1, backtest_len=30
     print(f"   平均归一化信息增益: {meta['avg_norm_ig']:.4f}")
     print(f"   平均校准误差 ECE: {meta['avg_ece']:.4f}")
 
-    # 回测与评估
     print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
     acc, avg_brier = system.walk_forward_backtest(seqs, test_len=backtest_len)
     for name in acc:
