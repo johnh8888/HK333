@@ -2,7 +2,6 @@ name: 老澳门六合彩自动预测
 
 on:
   schedule:
-    # 每天北京时间 22:05 运行（开奖时间 21:30 之后）
     - cron: '5 14 * * *'
   workflow_dispatch:
 
@@ -20,12 +19,20 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: 测试 API 连通性
+        run: |
+          echo "测试主 API:"
+          curl -s -L -H "User-Agent: Mozilla/5.0" "https://marksix6.net/index.php?api=1" | head -c 500 || echo "主 API 失败"
+          echo ""
+          echo "测试备用 API:"
+          curl -s -L -H "User-Agent: Mozilla/5.0" "https://marksix6.net/api/lottery_api.php" | head -c 500 || echo "备用 API 失败"
+
       - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install numpy scikit-learn lightgbm xgboost catboost
 
-      - name: 自动修复脚本中的中英文混用问题（可选，防止残留全角符号）
+      - name: 自动修复脚本中的中英文混用问题（可选）
         run: |
           sed -i 's/，/,/g; s/。/. /g; s/；/;/g; s/：/:/g; s/！/!/g; s/？/?/g; s/（/(/g; s/）/)/g; s/【/[/g; s/】/]/g; s/“/"/g; s/”/"/g; s/‘/'"'"'/g; s/’/'"'"'/g' macau.py
           sed -i 's/\b在\b/in/g; s/\b如果\b/if/g; s/\b否则\b/else/g; s/\b并且\b/and/g; s/\b或者\b/or/g; s/\b真\b/True/g; s/\b假\b/False/g; s/\b空\b/None/g; s/\b无\b/None/g' macau.py
