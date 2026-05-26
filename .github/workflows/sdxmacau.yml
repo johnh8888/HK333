@@ -2,7 +2,6 @@ name: 三彩种属性预测
 
 on:
   schedule:
-    # 每天北京时间 22:30 运行（可根据实际开奖时间调整）
     - cron: '30 14 * * *'
   workflow_dispatch:
 
@@ -23,8 +22,8 @@ jobs:
       - name: 安装依赖
         run: pip install numpy
 
-      - name: 运行预测（三个彩种，回测10期）
-        run: python sdxmacau.py --order 3 --min-ig 0.01 --max-ece 0.5 --backtest 10
+      - name: 运行预测
+        run: python sdxmacau.py --order 3 --min-ig 0.01 --backtest 100
 
       - name: 提交数据库更新
         run: |
