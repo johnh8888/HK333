@@ -197,22 +197,22 @@ def predict_color_weighted(
     window: int = 12
 ) -> Tuple[str, str, float, float]:
     """
-    三模型集成：
-    - 模型A: 改进加权（衰减、连出奖励降低、极热压制）
-    - 模型B: 马尔可夫转移矩阵
-    - 模型C: 简单频率统计
-    投票决定主强，平局时用模型A得分仲裁。
+    三模型概率加权融合：
+    - 模型A: 改进加权得分 -> 归一化为概率
+    - 模型B: 马尔可夫转移概率
+    - 模型C: 简单频率比例
+    最终概率 = 0.5*A + 0.25*B + 0.25*C
     """
     if not specials:
         return "绿", "红", 0.0, 0.0
 
     recent = specials[-window:]
 
-    # ---- 模型A: 改进加权 ----
+    # ---- 模型A: 改进加权得分 ----
     scores_a = defaultdict(float)
     total_w = 0.0
     for i, num in enumerate(reversed(recent)):
-        w = (window - i) ** 1.5          # 更平滑
+        w = (window - i) ** 1.5
         color = get_color(num)
         scores_a[color] += w
         total_w += w
@@ -220,7 +220,7 @@ def predict_color_weighted(
             prev_idx = len(recent) - i
             if 0 <= prev_idx < len(recent):
                 if color == get_color(recent[prev_idx]):
-                    scores_a[color] += w * 0.3   # 连出奖励从0.68降到0.3
+                    scores_a[color] += w * 0.3
 
     # 长期缺失补偿
     miss_map = {"红":0,"蓝":0,"绿":0}
@@ -231,7 +231,7 @@ def predict_color_weighted(
         if miss_map[c] >= 5:
             scores_a[c] += miss_map[c] * 0.7
 
-    # 极热压制（阈值提高到0.75）
+    # 极热压制
     for c in ["红","蓝","绿"]:
         ratio = safe_div(scores_a[c], total_w)
         if ratio > 0.75:
@@ -239,35 +239,41 @@ def predict_color_weighted(
                 if other != c:
                     scores_a[other] += total_w * 0.1
 
-    sorted_a = sorted(scores_a.items(), key=lambda x: x[1], reverse=True)
-    main_a = sorted_a[0][0]
+    # 将模型A得分转化为概率（softmax）
+    max_score = max(scores_a.values())
+    exp_scores = {c: math.exp(scores_a[c] - max_score) for c in scores_a}
+    sum_exp = sum(exp_scores.values())
+    prob_a = {c: exp_scores[c]/sum_exp for c in exp_scores}
 
-    # ---- 模型B: 马尔可夫 ----
-    main_b, probs_b = predict_color_markov(specials)
-    if not probs_b:
-        main_b = main_a
+    # ---- 模型B: 马尔可夫转移概率 ----
+    _, prob_b_dict = predict_color_markov(specials)
+    if not prob_b_dict:
+        prob_b_dict = {"红":1/3, "蓝":1/3, "绿":1/3}
 
-    # ---- 模型C: 简单频率 ----
+    # ---- 模型C: 简单频率比例 ----
     freq = Counter(get_color(n) for n in recent)
-    main_c = freq.most_common(1)[0][0]
+    total_freq = len(recent)
+    prob_c = {
+        "红": freq["红"]/total_freq,
+        "蓝": freq["蓝"]/total_freq,
+        "绿": freq["绿"]/total_freq
+    }
 
-    # ---- 投票集成 ----
-    votes = Counter([main_a, main_b, main_c])
-    top_voted = votes.most_common()
-    if len(top_voted) == 1 or top_voted[0][1] > top_voted[1][1]:
-        main_color = top_voted[0][0]
-    else:
-        # 平局，用模型A得分仲裁
-        best_score = -1
-        main_color = "绿"
-        for color in [c for c,_ in top_voted]:
-            if scores_a[color] > best_score:
-                best_score = scores_a[color]
-                main_color = color
+    # ---- 加权融合概率 ----
+    final_prob = {}
+    for c in ["红","蓝","绿"]:
+        final_prob[c] = (prob_a[c] * 0.5 +
+                         prob_b_dict.get(c, 1/3) * 0.25 +
+                         prob_c[c] * 0.25)
 
-    main_score = safe_div(scores_a[main_color], total_w)
-    second_color = sorted_a[1][0] if len(sorted_a) > 1 else "红"
-    second_score = safe_div(scores_a[second_color], total_w)
+    # 按融合概率排序
+    sorted_final = sorted(final_prob.items(), key=lambda x: x[1], reverse=True)
+    main_color = sorted_final[0][0]
+    second_color = sorted_final[1][0]
+
+    # 主强得分用融合概率（0~1之间）
+    main_score = final_prob[main_color]
+    second_score = final_prob[second_color]
 
     return main_color, second_color, main_score, second_score
 
@@ -1277,7 +1283,7 @@ def build_multi_window_features(draws):
             result[n]["omit"] += omit[n] * weight
             result[n]["momentum"] += mom[n] * weight
 
-    return result    
+    return result 
 # =========================================================
 # 结构评估（高级规则系统，用于排除组合）
 # =========================================================
@@ -1545,7 +1551,7 @@ def generate_special_model(draws, main_numbers, specials):
                  omit_score * 0.15 +
                  mom_score * 0.15)
 
-        score += random.uniform(-0.005, 0.005)   # 稍微加大随机扰动
+        score += random.uniform(-0.03, 0.03)   # 稍微加大随机扰动
 
         if score > best_score + 1e-6:
             best_score = score
@@ -2356,90 +2362,16 @@ def backtest_colors(conn, recent_limit=12, window=10, method="weighted"):
 # 动态波色窗口选择（新增优化）
 # =========================================================
 
-def predict_color_weighted(
-    specials: List[int],
-    window: int = 12
-) -> Tuple[str, str, float, float]:
-    """
-    三模型概率加权融合：
-    - 模型A: 改进加权得分 -> 归一化为概率
-    - 模型B: 马尔可夫转移概率
-    - 模型C: 简单频率比例
-    最终概率 = 0.5*A + 0.25*B + 0.25*C
-    """
-    if not specials:
-        return "绿", "红", 0.0, 0.0
-
-    recent = specials[-window:]
-
-    # ---- 模型A: 改进加权得分 ----
-    scores_a = defaultdict(float)
-    total_w = 0.0
-    for i, num in enumerate(reversed(recent)):
-        w = (window - i) ** 1.5
-        color = get_color(num)
-        scores_a[color] += w
-        total_w += w
-        if i > 0:
-            prev_idx = len(recent) - i
-            if 0 <= prev_idx < len(recent):
-                if color == get_color(recent[prev_idx]):
-                    scores_a[color] += w * 0.3
-
-    # 长期缺失补偿
-    miss_map = {"红":0,"蓝":0,"绿":0}
-    for idx, n in enumerate(reversed(recent)):
-        c = get_color(n)
-        if miss_map[c] == 0: miss_map[c] = idx+1
-    for c in miss_map:
-        if miss_map[c] >= 5:
-            scores_a[c] += miss_map[c] * 0.7
-
-    # 极热压制
-    for c in ["红","蓝","绿"]:
-        ratio = safe_div(scores_a[c], total_w)
-        if ratio > 0.75:
-            for other in ["红","蓝","绿"]:
-                if other != c:
-                    scores_a[other] += total_w * 0.1
-
-    # 将模型A得分转化为概率（softmax）
-    max_score = max(scores_a.values())
-    exp_scores = {c: math.exp(scores_a[c] - max_score) for c in scores_a}
-    sum_exp = sum(exp_scores.values())
-    prob_a = {c: exp_scores[c]/sum_exp for c in exp_scores}
-
-    # ---- 模型B: 马尔可夫转移概率 ----
-    _, prob_b_dict = predict_color_markov(specials)
-    if not prob_b_dict:
-        prob_b_dict = {"红":1/3, "蓝":1/3, "绿":1/3}
-
-    # ---- 模型C: 简单频率比例 ----
-    freq = Counter(get_color(n) for n in recent)
-    total_freq = len(recent)
-    prob_c = {
-        "红": freq["红"]/total_freq,
-        "蓝": freq["蓝"]/total_freq,
-        "绿": freq["绿"]/total_freq
-    }
-
-    # ---- 加权融合概率 ----
-    final_prob = {}
-    for c in ["红","蓝","绿"]:
-        final_prob[c] = (prob_a[c] * 0.5 +
-                         prob_b_dict.get(c, 1/3) * 0.25 +
-                         prob_c[c] * 0.25)
-
-    # 按融合概率排序
-    sorted_final = sorted(final_prob.items(), key=lambda x: x[1], reverse=True)
-    main_color = sorted_final[0][0]
-    second_color = sorted_final[1][0]
-
-    # 主强得分用融合概率（0~1之间）
-    main_score = final_prob[main_color]
-    second_score = final_prob[second_color]
-
-    return main_color, second_color, main_score, second_score
+def best_color_window(conn, specials, color_method, windows=[8,10,12,14]):
+    """根据近10期主强命中率选择最佳窗口"""
+    best_w = 10
+    best_hit = -1
+    for w in windows:
+        _, mh, _, _, _ = backtest_colors(conn, recent_limit=10, window=w, method=color_method)
+        if mh > best_hit:
+            best_hit = mh
+            best_w = w
+    return best_w
 
 
 # =========================================================
