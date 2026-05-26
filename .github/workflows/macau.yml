@@ -32,7 +32,7 @@ jobs:
           pip install --upgrade pip
           pip install numpy scikit-learn lightgbm xgboost catboost
 
-      - name: 自动修复脚本中的中英文混用问题（可选）
+      - name: 自动修复脚本（防止全角符号等）
         run: |
           sed -i 's/，/,/g; s/。/. /g; s/；/;/g; s/：/:/g; s/！/!/g; s/？/?/g; s/（/(/g; s/）/)/g; s/【/[/g; s/】/]/g; s/“/"/g; s/”/"/g; s/‘/'"'"'/g; s/’/'"'"'/g' macau.py
           sed -i 's/\b在\b/in/g; s/\b如果\b/if/g; s/\b否则\b/else/g; s/\b并且\b/and/g; s/\b或者\b/or/g; s/\b真\b/True/g; s/\b假\b/False/g; s/\b空\b/None/g; s/\b无\b/None/g' macau.py
