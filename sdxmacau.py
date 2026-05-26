@@ -26,7 +26,7 @@ except ImportError:
 
 # ========== 配置 ==========
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "sdxmacau.db")   # 保持原名
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "sdxmacau.db")
 
 THIRD_PARTY_URLS = [
     "https://marksix6.net/index.php?api=1",
