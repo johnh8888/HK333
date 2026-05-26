@@ -23,12 +23,12 @@ jobs:
         run: pip install numpy
 
       - name: 运行预测
-        run: python sdxmacau.py sync --order 2 --min-ig 0.1 --max-ece 0.1 --backtest 30
+        run: python sdxmacau.py sync
 
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config.user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add sdxmacau.db
           git commit -m "自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "无变化"
           git push
