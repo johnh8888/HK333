@@ -2,8 +2,8 @@ name: 三彩种属性预测
 
 on:
   schedule:
-    # 每天北京时间 23:00 (UTC 15:00) 运行，可根据实际开奖时间调整
-    - cron: '0 15 * * *'
+    # 每天北京时间 22:30 运行（可根据实际开奖时间调整）
+    - cron: '30 14 * * *'
   workflow_dispatch:
 
 permissions:
