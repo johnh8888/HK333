@@ -1,45 +1,40 @@
-name: AI Lottery Predictor
+name: 新澳门六合彩自动预测
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 15 * * *'   # 根据新澳门实际开奖时间调整（建议香港时间晚上8-9点左右开奖）
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Run Predictor
+      - name: 安装依赖（如果未来有需要）
+        run: pip install -r requirements.txt || echo "No requirements.txt, skipping"
+
+      - name: 运行同步、回测、调优与预测
+        run: python new_macau.py sync --with-backtest --auto-tune
+
+      - name: 提交数据库更新
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add xinmacau.db
+          git commit -m "🤖 新澳门六合彩自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
+          git push
 
-          success=0
-
-          for i in 1 2 3
-          do
-            echo "第 $i 次执行预测..."
-
-            python new_macau.py sync
-
-            if [ $? -eq 0 ]; then
-              success=1
-              echo "预测成功"
-              break
-            fi
-
-            echo "预测失败，10秒后重试..."
-            sleep 10
-          done
-
-          if [ $success -ne 1 ]; then
-            echo "连续失败，任务终止"
-            exit 1
-          fi
+      - name: 保存 Artifact（数据库备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinmacau-db-backup
+          path: xinmacau.db
