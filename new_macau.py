@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import argparse
@@ -8,7 +6,7 @@ import json
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.request import Request, urlopen
@@ -17,7 +15,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "new_macau.db")
 
-API_URL = "https://marksix6.net/index.php?api=1"
+OFFICIAL_URL_DEFAULT = "https://marksix6.net/index.php?api=1"
+
+THIRD_PARTY_URLS_DEFAULT: List[str] = [
+    "https://marksix6.net/index.php?api=1"
+]
+
+MINED_CONFIG_KEY = "mined_strategy_config_v1"
 
 ALL_NUMBERS = list(range(1, 50))
 
@@ -27,18 +31,33 @@ STRATEGY_LABELS = {
     "cold_rebound_v1": "冷号回补",
     "momentum_v1": "近期动量",
     "ensemble_v2": "集成投票",
+    "pattern_mined_v1": "规律挖掘",
 }
 
-STRATEGY_IDS = list(STRATEGY_LABELS.keys())
-
+STRATEGY_IDS = [
+    "balanced_v1",
+    "hot_v1",
+    "cold_rebound_v1",
+    "momentum_v1",
+    "ensemble_v2",
+    "pattern_mined_v1",
+]
 
 # =========================================================
 # 波色
 # =========================================================
 
-RED = {1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}
-BLUE = {3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}
-GREEN = {5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
+RED = {
+    1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46
+}
+
+BLUE = {
+    3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48
+}
+
+GREEN = {
+    5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49
+}
 
 
 def get_color(num: int) -> str:
@@ -53,15 +72,76 @@ def get_color(num: int) -> str:
 
 
 # =========================================================
+# 属性
+# =========================================================
+
+def special_attributes(num: int) -> Dict[str, str]:
+
+    odd_even = "单" if num % 2 else "双"
+
+    big_small = "大" if num >= 25 else "小"
+
+    tens, ones = divmod(num, 10)
+
+    total = tens + ones
+
+    total_odd_even = "单" if total % 2 else "双"
+
+    total_big_small = "大" if total >= 7 else "小"
+
+    tail_big_small = "大" if ones >= 5 else "小"
+
+    color = get_color(num)
+
+    if ones in (1, 6):
+        element = "水"
+
+    elif ones in (2, 7):
+        element = "火"
+
+    elif ones in (3, 8):
+        element = "木"
+
+    elif ones in (4, 9):
+        element = "金"
+
+    else:
+        element = "土"
+
+    return {
+        "单双": odd_even,
+        "大小": big_small,
+        "合单双": total_odd_even,
+        "合大小": total_big_small,
+        "尾大小": tail_big_small,
+        "色波": color,
+        "五行": element
+    }
+
+
+# =========================================================
 # 数据结构
 # =========================================================
 
 @dataclass
 class DrawRecord:
+
     issue_no: str
+
     draw_date: str
+
     numbers: List[int]
+
     special_number: int
+
+
+# =========================================================
+# 时间
+# =========================================================
+
+def utc_now() -> str:
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 # =========================================================
@@ -85,13 +165,17 @@ def init_db(conn):
 
         issue_no TEXT PRIMARY KEY,
 
-        draw_date TEXT,
+        draw_date TEXT NOT NULL,
 
-        numbers_json TEXT,
+        numbers_json TEXT NOT NULL,
 
-        special_number INTEGER,
+        special_number INTEGER NOT NULL,
 
-        created_at TEXT
+        source TEXT,
+
+        created_at TEXT NOT NULL,
+
+        updated_at TEXT NOT NULL
 
     );
 
@@ -99,13 +183,21 @@ def init_db(conn):
 
         id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-        issue_no TEXT,
+        issue_no TEXT NOT NULL,
 
-        strategy TEXT,
+        strategy TEXT NOT NULL,
+
+        status TEXT NOT NULL DEFAULT 'PENDING',
 
         hit_count INTEGER,
 
-        created_at TEXT
+        hit_rate REAL,
+
+        special_hit INTEGER,
+
+        created_at TEXT NOT NULL,
+
+        reviewed_at TEXT
 
     );
 
@@ -113,13 +205,17 @@ def init_db(conn):
 
         id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-        run_id INTEGER,
+        run_id INTEGER NOT NULL,
 
-        number INTEGER,
+        pick_type TEXT NOT NULL DEFAULT 'MAIN',
 
-        rank_no INTEGER,
+        number INTEGER NOT NULL,
 
-        score REAL
+        rank INTEGER NOT NULL,
+
+        score REAL NOT NULL,
+
+        reason TEXT NOT NULL
 
     );
 
@@ -136,7 +232,7 @@ def fetch_new_macau():
 
     req = Request(
 
-        API_URL,
+        OFFICIAL_URL_DEFAULT,
 
         headers={
 
@@ -172,7 +268,13 @@ def fetch_new_macau():
 
     latest_issue = str(target["expect"])
 
-    latest_nums = [int(x) for x in target["openCode"].split(",")]
+    latest_nums = [
+
+        int(x)
+
+        for x in target["openCode"].split(",")
+
+    ]
 
     latest_date = target.get("openTime", "")[:10]
 
@@ -202,7 +304,13 @@ def fetch_new_macau():
 
             issue_no = parts[0].strip()
 
-            nums = [int(x) for x in parts[1].split(",")]
+            nums = [
+
+                int(x)
+
+                for x in parts[1].split(",")
+
+            ]
 
             if len(nums) != 7:
                 continue
@@ -233,17 +341,17 @@ def fetch_new_macau():
 # 保存数据
 # =========================================================
 
-def upsert_draw(conn, r: DrawRecord):
+def upsert_draw(conn, record, source):
+
+    now = utc_now()
 
     exists = conn.execute(
 
         "SELECT 1 FROM draws WHERE issue_no=?",
 
-        (r.issue_no,)
+        (record.issue_no,)
 
     ).fetchone()
-
-    now = datetime.now(timezone.utc).isoformat()
 
     if exists:
 
@@ -253,19 +361,25 @@ def upsert_draw(conn, r: DrawRecord):
 
         SET draw_date=?,
             numbers_json=?,
-            special_number=?
+            special_number=?,
+            source=?,
+            updated_at=?
 
         WHERE issue_no=?
 
         """, (
 
-            r.draw_date,
+            record.draw_date,
 
-            json.dumps(r.numbers),
+            json.dumps(record.numbers),
 
-            r.special_number,
+            record.special_number,
 
-            r.issue_no
+            source,
+
+            now,
+
+            record.issue_no
 
         ))
 
@@ -275,17 +389,21 @@ def upsert_draw(conn, r: DrawRecord):
 
     INSERT INTO draws
 
-    VALUES (?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
 
     """, (
 
-        r.issue_no,
+        record.issue_no,
 
-        r.draw_date,
+        record.draw_date,
 
-        json.dumps(r.numbers),
+        json.dumps(record.numbers),
 
-        r.special_number,
+        record.special_number,
+
+        source,
+
+        now,
 
         now
 
@@ -295,8 +413,50 @@ def upsert_draw(conn, r: DrawRecord):
 
 
 # =========================================================
-# 统计
+# 同步
 # =========================================================
+
+def sync_from_records(conn, records, source):
+
+    ins = 0
+
+    upd = 0
+
+    for r in records:
+
+        res = upsert_draw(conn, r, source)
+
+        if res == "inserted":
+            ins += 1
+        else:
+            upd += 1
+
+    conn.commit()
+
+    return len(records), ins, upd
+
+
+# =========================================================
+# 工具
+# =========================================================
+
+def next_issue(issue_no):
+
+    digits = ''.join(
+
+        ch for ch in issue_no
+
+        if ch.isdigit()
+
+    )
+
+    if not digits:
+        return issue_no
+
+    num = int(digits) + 1
+
+    return f"{num:0{len(digits)}d}"
+
 
 def _normalize(score_map):
 
@@ -373,7 +533,7 @@ def _omission_map(draws):
 
 
 # =========================================================
-# 预测
+# 评分
 # =========================================================
 
 def generate_scores(draws):
@@ -401,6 +561,10 @@ def generate_scores(draws):
     return scores
 
 
+# =========================================================
+# 策略
+# =========================================================
+
 def generate_prediction(draws):
 
     scores = generate_scores(draws)
@@ -419,7 +583,7 @@ def generate_prediction(draws):
 
     special = ranked[6]
 
-    return picks, special
+    return picks, special, scores
 
 
 # =========================================================
@@ -440,9 +604,9 @@ def generate_predictions(conn):
 
     """).fetchone()
 
-    latest_issue = int(row["issue_no"])
+    latest_issue = row["issue_no"]
 
-    next_issue = str(latest_issue + 1)
+    target_issue = next_issue(latest_issue)
 
     draws = [
 
@@ -464,31 +628,34 @@ def generate_predictions(conn):
 
     for strategy in STRATEGY_IDS:
 
+        now = utc_now()
+
         cur = conn.execute("""
 
         INSERT INTO prediction_runs(
 
             issue_no,
             strategy,
+            status,
             created_at
 
         )
 
-        VALUES (?, ?, ?)
+        VALUES (?, ?, 'PENDING', ?)
 
         """, (
 
-            next_issue,
+            target_issue,
 
             strategy,
 
-            datetime.now(timezone.utc).isoformat()
+            now
 
         ))
 
         run_id = cur.lastrowid
 
-        picks, special = generate_prediction(draws)
+        picks, special, scores = generate_prediction(draws)
 
         for rank, (num, score) in enumerate(picks, start=1):
 
@@ -497,13 +664,15 @@ def generate_predictions(conn):
             INSERT INTO prediction_picks(
 
                 run_id,
+                pick_type,
                 number,
-                rank_no,
-                score
+                rank,
+                score,
+                reason
 
             )
 
-            VALUES (?, ?, ?, ?)
+            VALUES (?, 'MAIN', ?, ?, ?, ?)
 
             """, (
 
@@ -513,30 +682,69 @@ def generate_predictions(conn):
 
                 rank,
 
-                score
+                score,
+
+                strategy
 
             ))
 
+        conn.execute("""
+
+        INSERT INTO prediction_picks(
+
+            run_id,
+            pick_type,
+            number,
+            rank,
+            score,
+            reason
+
+        )
+
+        VALUES (?, 'SPECIAL', ?, 1, ?, '特别号')
+
+        """, (
+
+            run_id,
+
+            special[0],
+
+            special[1]
+
+        ))
+
     conn.commit()
 
-    return next_issue
+    return target_issue
 
 
 # =========================================================
 # 波色预测
 # =========================================================
 
-def predict_color(specials, window=10):
+def predict_color_weighted(
+
+    specials,
+
+    window=10
+
+):
 
     recent = specials[-window:]
 
     scores = defaultdict(float)
 
+    total_weight = 0.0
+
     for i, num in enumerate(reversed(recent)):
 
-        weight = (window - i) ** 1.3
+        weight = (window - i) ** 1.4
 
-        scores[get_color(num)] += weight
+        color = get_color(num)
+
+        scores[color] += weight
+
+        total_weight += weight
 
     ranked = sorted(
 
@@ -548,7 +756,88 @@ def predict_color(specials, window=10):
 
     )
 
-    return ranked
+    main_color = ranked[0][0]
+
+    main_score = ranked[0][1] / total_weight
+
+    second_color = ranked[1][0]
+
+    second_score = ranked[1][1] / total_weight
+
+    return (
+
+        main_color,
+
+        second_color,
+
+        main_score,
+
+        second_score
+
+    )
+
+
+# =========================================================
+# 回测
+# =========================================================
+
+def backtest_colors(conn, recent_limit=12):
+
+    rows = conn.execute("""
+
+    SELECT special_number
+
+    FROM draws
+
+    ORDER BY CAST(issue_no AS INTEGER)
+
+    """).fetchall()
+
+    specials = [
+
+        r["special_number"]
+
+        for r in rows
+
+    ]
+
+    total = 0
+
+    hit = 0
+
+    miss = 0
+
+    max_miss = 0
+
+    for i in range(
+
+        len(specials) - recent_limit,
+
+        len(specials)
+
+    ):
+
+        train = specials[:i]
+
+        actual = get_color(specials[i])
+
+        main_color, _, _, _ = predict_color_weighted(train)
+
+        total += 1
+
+        if actual == main_color:
+
+            hit += 1
+
+            miss = 0
+
+        else:
+
+            miss += 1
+
+            max_miss = max(max_miss, miss)
+
+    return total, hit, max_miss
 
 
 # =========================================================
@@ -575,7 +864,9 @@ def print_dashboard(conn):
 
         nums_str = " ".join(
 
-            f"{n:02d}" for n in nums
+            f"{n:02d}"
+
+            for n in nums
 
         )
 
@@ -593,49 +884,107 @@ def print_dashboard(conn):
 
         )
 
-    print()
-
-    print("预测:")
-
     rows = conn.execute("""
 
     SELECT *
 
     FROM prediction_runs
 
+    WHERE status='PENDING'
+
     ORDER BY id DESC
 
-    LIMIT 5
+    LIMIT 6
 
     """).fetchall()
 
-    for r in rows:
+    if rows:
 
-        picks = conn.execute("""
+        print()
 
-        SELECT *
+        print(f"预测期号: {rows[0]['issue_no']}")
 
-        FROM prediction_picks
+        print()
 
-        WHERE run_id=?
+        for r in rows:
 
-        ORDER BY rank_no
+            picks = conn.execute("""
 
-        """, (r["id"],)).fetchall()
+            SELECT *
 
-        nums = " ".join(
+            FROM prediction_picks
 
-            f"{x['number']:02d}"
+            WHERE run_id=?
+            AND pick_type='MAIN'
 
-            for x in picks
+            ORDER BY rank
 
-        )
+            """, (r["id"],)).fetchall()
 
-        print(
+            nums = " ".join(
 
-            f"{r['strategy']} -> {nums}"
+                f"{x['number']:02d}"
 
-        )
+                for x in picks
+
+            )
+
+            special = conn.execute("""
+
+            SELECT number
+
+            FROM prediction_picks
+
+            WHERE run_id=?
+            AND pick_type='SPECIAL'
+
+            """, (r["id"],)).fetchone()
+
+            label = STRATEGY_LABELS.get(
+
+                r["strategy"],
+
+                r["strategy"]
+
+            )
+
+            print(
+
+                f"{label} : "
+
+                f"{nums} + "
+
+                f"{special['number']:02d}"
+
+            )
+
+            attrs = special_attributes(
+
+                special["number"]
+
+            )
+
+            print(
+
+                f"特码属性: "
+
+                f"{attrs['单双']}/"
+
+                f"{attrs['大小']} "
+
+                f"合{attrs['合单双']}/"
+
+                f"{attrs['合大小']} "
+
+                f"尾{attrs['尾大小']} "
+
+                f"{attrs['色波']} "
+
+                f"{attrs['五行']}"
+
+            )
+
+            print()
 
     specials = [
 
@@ -655,15 +1004,51 @@ def print_dashboard(conn):
 
     if len(specials) >= 10:
 
-        colors = predict_color(specials)
+        main_color, second_color, main_score, second_score = predict_color_weighted(
+
+            specials
+
+        )
+
+        print("🎨 波色预测")
+
+        print(
+
+            f"主强: {main_color} "
+
+            f"({main_score:.3f})"
+
+        )
+
+        print(
+
+            f"次强: {second_color} "
+
+            f"({second_score:.3f})"
+
+        )
+
+        total, hit, max_miss = backtest_colors(conn)
 
         print()
 
-        print("特码波色预测:")
+        print("📊 波色回测")
 
-        for c, s in colors:
+        print(
 
-            print(f"{c}: {s:.2f}")
+            f"命中率: "
+
+            f"{hit}/{total} "
+
+            f"({hit/total*100:.1f}%)"
+
+        )
+
+        print(
+
+            f"最大连错: {max_miss}期"
+
+        )
 
 
 # =========================================================
@@ -678,20 +1063,15 @@ def cmd_sync(args):
 
     records = fetch_new_macau()
 
-    ins = 0
+    total, ins, upd = sync_from_records(
 
-    upd = 0
+        conn,
 
-    for r in records:
+        records,
 
-        res = upsert_draw(conn, r)
+        "new_macau"
 
-        if res == "inserted":
-            ins += 1
-        else:
-            upd += 1
-
-    conn.commit()
+    )
 
     print()
 
@@ -699,13 +1079,17 @@ def cmd_sync(args):
 
         f"同步完成: "
 
-        f"新增={ins} "
+        f"total={total} "
 
-        f"更新={upd}"
+        f"new={ins} "
+
+        f"updated={upd}"
 
     )
 
     issue = generate_predictions(conn)
+
+    print()
 
     print(f"已生成预测: {issue}")
 
@@ -735,7 +1119,11 @@ def cmd_show(args):
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+
+        description="新澳门六合彩预测工具"
+
+    )
 
     parser.add_argument(
 
