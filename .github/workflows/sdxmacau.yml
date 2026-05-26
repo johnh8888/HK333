@@ -24,7 +24,7 @@ jobs:
         run: pip install numpy
 
       - name: 运行预测（三个彩种）
-        run: python sdxmacau.py --order 3 --min-conf 0.55 --temp 1.0 --backtest 30
+        run: python sdxmacau.py sync --order 3 --min-ig 0.01 --max-ece 0.5 --backtest 30
 
       - name: 提交数据库更新
         run: |
