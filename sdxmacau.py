@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 (精简版)
-# 仅保留: 1阶Markov + Streak bias + Frequency prior
-# 评估: logloss & accuracy
+# 老澳门六合彩属性预测 (3阶Markov + Streak + Frequency，精简高效版)
 
 from __future__ import annotations
 
@@ -156,34 +154,35 @@ def dynamic_weights(n: int, decay: float = 0.95) -> List[float]:
     return [decay ** (n - 1 - i) for i in range(n)]
 
 # ========== 三个核心模型 ==========
-class Markov1:
-    """1阶马尔可夫模型（拉普拉斯平滑）"""
-    def __init__(self, states: List[str], alpha: float = 1.0):
+class MarkovN:
+    """N阶马尔可夫模型（拉普拉斯平滑）"""
+    def __init__(self, order: int, states: List[str], alpha: float = 1.0):
+        self.order = order
         self.states = states
         self.alpha = alpha
         self.counts = defaultdict(Counter)
         self.total = defaultdict(int)
 
     def train(self, seq: List[str], weights: List[float]):
-        for i in range(len(seq)-1):
-            cur = seq[i]
-            nxt = seq[i+1]
-            w = weights[i+1]
-            self.counts[cur][nxt] += w
-            self.total[cur] += w
+        for i in range(len(seq) - self.order):
+            state = tuple(seq[i:i+self.order])
+            nxt = seq[i+self.order]
+            w = weights[i+self.order]
+            self.counts[state][nxt] += w
+            self.total[state] += w
 
-    def predict(self, last: str) -> Dict[str, float]:
+    def predict(self, context: Tuple[str]) -> Dict[str, float]:
         K = len(self.states)
-        total = self.total.get(last, 0)
+        total = self.total.get(context, 0)
         probs = {}
         for s in self.states:
-            cnt = self.counts[last].get(s, 0)
+            cnt = self.counts[context].get(s, 0)
             probs[s] = (cnt + self.alpha) / (total + self.alpha * K)
         sum_p = sum(probs.values())
         return {s: p/sum_p for s, p in probs.items()} if sum_p>0 else {s:1/K for s in self.states}
 
 class StreakBias:
-    """短期惯性模型：基于最近连续出现次数调整概率"""
+    """短期惯性：基于最近连续长度调整概率"""
     def __init__(self, states: List[str], alpha: float = 1.0):
         self.states = states
         self.alpha = alpha
@@ -213,7 +212,7 @@ class StreakBias:
         return {s: p/sum_p for s, p in probs.items()} if sum_p>0 else {s:1/K for s in self.states}
 
 class FrequencyPrior:
-    """长期频率先验（全局分布）"""
+    """全局频率先验"""
     def __init__(self, states: List[str]):
         self.states = states
         self.probs = {s: 1/len(states) for s in states}
@@ -229,14 +228,13 @@ class FrequencyPrior:
     def predict(self) -> Dict[str, float]:
         return self.probs.copy()
 
-# ========== Dirichlet 贝叶斯集成 ==========
+# ========== 贝叶斯集成（基于对数似然的Dirichlet权重） ==========
 class BayesianEnsemble:
-    """基于历史对数似然的 Dirichlet 后验权重"""
     def __init__(self, model_names: List[str], alpha_prior: float = 1.0):
         self.models = model_names
         self.alpha_prior = alpha_prior
-        self.log_likelihood = {m: 0.0 for m in model_names}  # 累计对数似然
-        self.counts = {m: 0 for m in model_names}            # 预测次数
+        self.log_likelihood = {m: 0.0 for m in model_names}
+        self.counts = {m: 0 for m in model_names}
 
     def update(self, model_probs: Dict[str, Dict[str, float]], actual: str):
         for m in self.models:
@@ -245,8 +243,6 @@ class BayesianEnsemble:
             self.counts[m] += 1
 
     def get_weights(self) -> Dict[str, float]:
-        # 使用指数移动平均的对数似然来防止数值下溢
-        # 实际使用每个模型的平均对数似然 exp(avg_ll)
         weights = {}
         for m in self.models:
             if self.counts[m] > 0:
@@ -254,36 +250,35 @@ class BayesianEnsemble:
                 weights[m] = math.exp(avg_ll)
             else:
                 weights[m] = 1.0
-        # Dirichlet 先验平滑
+        # Dirichlet先验平滑
         total = sum(weights.values()) + self.alpha_prior * len(self.models)
-        weights = {m: (weights[m] + self.alpha_prior) / total for m in self.models}
-        return weights
-
-    def reset(self):
-        for m in self.models:
-            self.log_likelihood[m] = 0.0
-            self.counts[m] = 0
+        return {m: (weights[m] + self.alpha_prior) / total for m in self.models}
 
 # ========== 属性预测引擎 ==========
 class AttributeEngine:
-    def __init__(self, name: str, order: int = 1, alpha: float = 1.0):
+    def __init__(self, name: str, order: int = 3, alpha: float = 1.0):
         self.name = name
         self.states = ATTRIBUTE_STATES[name]
-        self.order = order   # 仅支持1阶，保留参数兼容
-        self.markov = Markov1(self.states, alpha)
+        self.order = order
+        self.markov = MarkovN(order, self.states, alpha)
         self.streak = StreakBias(self.states, alpha)
         self.freq = FrequencyPrior(self.states)
         self.ensemble = BayesianEnsemble(["markov", "streak", "freq"], alpha_prior=1.0)
 
     def train(self, seq: List[str]):
-        # 动态权重（近期加权）
         weights = dynamic_weights(len(seq))
         self.markov.train(seq, weights)
         self.streak.update(seq)
         self.freq.train(seq)
 
     def predict_proba(self, recent: List[str]) -> Tuple[Dict[str, float], Dict[str, float]]:
-        # 获取最近状态和连续长度
+        # 获取上下文和连续长度
+        if len(recent) >= self.order:
+            context = tuple(recent[-self.order:])
+        else:
+            context = tuple(recent) if recent else tuple()
+        markov_probs = self.markov.predict(context) if context else {s:1/len(self.states) for s in self.states}
+        # 连续长度
         if recent:
             last = recent[-1]
             streak_len = 1
@@ -295,14 +290,10 @@ class AttributeEngine:
         else:
             last = None
             streak_len = 1
-
-        # 各模型预测
-        markov_probs = self.markov.predict(last) if last else {s:1/len(self.states) for s in self.states}
         streak_probs = self.streak.predict(last, streak_len) if last else {s:1/len(self.states) for s in self.states}
         freq_probs = self.freq.predict()
         model_probs = {"markov": markov_probs, "streak": streak_probs, "freq": freq_probs}
 
-        # 贝叶斯集成权重
         weights = self.ensemble.get_weights()
         fused = {}
         for s in self.states:
@@ -316,13 +307,10 @@ class AttributeEngine:
     def update_feedback(self, model_probs: Dict[str, Dict[str, float]], actual: str):
         self.ensemble.update(model_probs, actual)
 
-    def reset_ensemble(self):
-        self.ensemble.reset()
-
 # ========== 系统集成 ==========
 class PredictionSystem:
-    def __init__(self, order: int = 1, min_confidence: float = 0.55):
-        self.order = order   # 仅支持1阶
+    def __init__(self, order: int = 3, min_confidence: float = 0.55):
+        self.order = order
         self.min_confidence = min_confidence
         self.engines = {
             "color": AttributeEngine("color", order),
@@ -345,14 +333,9 @@ class PredictionSystem:
                 "best_state": max(probs.items(), key=lambda x: x[1])[0],
                 "second_state": sorted(probs.items(), key=lambda x: -x[1])[1][0] if len(probs)>=2 else None
             }
-        # 元决策：基于平均最大概率是否达到阈值
         avg_max_prob = np.mean([results[name]["max_prob"] for name in self.engines])
         should_act = avg_max_prob >= self.min_confidence
-        results["meta"] = {
-            "should_act": should_act,
-            "reason": f"avg_max_prob={avg_max_prob:.3f}",
-            "avg_max_prob": avg_max_prob
-        }
+        results["meta"] = {"should_act": should_act, "reason": f"avg_max_prob={avg_max_prob:.3f}"}
         return results
 
     def update_feedback_all(self, actuals: Dict[str, str], predictions: Dict[str, Any]):
@@ -364,25 +347,22 @@ class PredictionSystem:
         correct = {name: 0 for name in self.engines}
         logloss_sum = {name: 0.0 for name in self.engines}
         color_second_correct = 0
-        min_len = 10
+        min_len = self.order + 10
         for idx in range(min_len, len(seqs["color"]) - 1):
             if idx < len(seqs["color"]) - test_len:
                 continue
-            # 新系统，无未来泄漏
             system = PredictionSystem(order=self.order, min_confidence=self.min_confidence)
             train_seqs = {name: seq[:idx] for name, seq in seqs.items()}
             system.train_all(train_seqs)
-            recents = {name: [seqs[name][idx-1]] if idx>=1 else [] for name in self.engines}  # 1阶，只需前一状态
+            recents = {name: seqs[name][idx-self.order:idx] if idx>=self.order else seqs[name][:idx] for name in self.engines}
             pred = system.predict_all(recents)
             actuals = {name: seqs[name][idx] for name in self.engines}
-            should_act = pred["meta"]["should_act"]
-            if should_act:
+            if pred["meta"]["should_act"]:
                 for name in self.engines:
                     prob = pred[name]["probs"].get(actuals[name], 1e-10)
                     logloss_sum[name] += -math.log(prob)
                     if pred[name]["best_state"] == actuals[name]:
                         correct[name] += 1
-                # 波色二中一
                 if pred["color"]["best_state"] == actuals["color"] or pred["color"]["second_state"] == actuals["color"]:
                     color_second_correct += 1
                 total += 1
@@ -390,17 +370,16 @@ class PredictionSystem:
             return {name: 0.0 for name in self.engines}, {name: 0.0 for name in self.engines}, 0.0
         acc = {name: correct[name]/total for name in self.engines}
         avg_logloss = {name: logloss_sum[name]/total for name in self.engines}
-        color_second_acc = color_second_correct / total
-        return acc, avg_logloss, color_second_acc
+        return acc, avg_logloss, color_second_correct/total
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, order=1, min_conf=0.55, backtest_len=10):
+def print_dashboard(conn, order=3, min_conf=0.55, backtest_len=10):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
         "odd_even": load_sequence(conn, get_odd_even, limit=500)
     }
-    if len(seqs["color"]) < 10:
+    if len(seqs["color"]) < order + 10:
         print("历史数据不足，请先同步数据。")
         return
     latest = conn.execute("SELECT * FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
@@ -416,10 +395,10 @@ def print_dashboard(conn, order=1, min_conf=0.55, backtest_len=10):
 
     system = PredictionSystem(order=order, min_confidence=min_conf)
     system.train_all(seqs)
-    recents = {name: [seq[-1]] for name, seq in seqs.items()}  # 1阶，只需最后一个
+    recents = {name: seqs[name][-order:] for name in seqs}
     pred = system.predict_all(recents)
 
-    print(f"\n🔮 下一期属性预测 (1阶Markov + Streak + Frequency)")
+    print(f"\n🔮 下一期属性预测 ({order}阶Markov + Streak + Frequency)")
     for name, data in pred.items():
         if name == "meta":
             continue
@@ -464,10 +443,10 @@ def cmd_show(args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="老澳门六合彩属性预测 (精简版)")
+    p = argparse.ArgumentParser(description="老澳门六合彩属性预测 (3阶Markov精简版)")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
-    p.add_argument("--order", type=int, default=1, choices=[1], help="马尔可夫阶数 (仅支持1)")
-    p.add_argument("--min-conf", type=float, default=0.55, help="出手最小平均概率阈值")
+    p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
+    p.add_argument("--min-conf", type=float, default=0.55, help="出手阈值")
     p.add_argument("--backtest", type=int, default=10, help="回测最近期数")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp_sync = sub.add_parser("sync")
