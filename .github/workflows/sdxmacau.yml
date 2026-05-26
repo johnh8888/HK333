@@ -1,4 +1,4 @@
-name: 老澳门属性预测
+name: 老澳门属性预测V4
 
 on:
   schedule:
@@ -16,8 +16,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: 安装依赖
+        run: pip install numpy
       - name: 运行预测
-        run: python sdxmacau.py sync --order 2 --threshold 0.55
+        run: python sdxmacau.py sync --order 2 --min-ig 0.05 --max-ece 0.1
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
