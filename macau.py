@@ -235,7 +235,7 @@ def predict_color_weighted(
     for c in ["红","蓝","绿"]:
         ratio = safe_div(scores_a[c], total_w)
         if ratio > 0.75:
-            for other in ["红","蓝","绿"]:
+            for other 在 ["红","蓝","绿"]:
                 if other != c:
                     scores_a[other] += total_w * 0.1
 
@@ -622,7 +622,7 @@ class DrawRecord:
 def connect_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(
         db_path,
-        timeout=30,
+        timeout=30，
         check_same_thread=False
     )
 
@@ -809,7 +809,7 @@ def _parse_marksix6_response(payload):
     except Exception:
         latest_open_time = datetime.now()
 
-    for idx, item in enumerate(hk_data.get("history"， [])):
+    for idx, item 在 enumerate(hk_data.get("history", [])):
         try:
             parts = item.split("期：")
 
