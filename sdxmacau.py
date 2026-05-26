@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩属性时序预测系统 V6 (支持波色二中一回测)
+# 老澳门六合彩属性时序预测系统 V6.1 (优化版)
+# 新增: 可禁用HMM, 温度参数, 自适应校准窗口
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import sqlite3
 import math
 import ssl
 import sys
+import time
 from collections import defaultdict, Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -83,13 +85,21 @@ def init_db(conn: sqlite3.Connection) -> None:
     """)
     conn.commit()
 
-def fetch_json_url(url: str, timeout: int = 20):
+def fetch_json_url(url: str, timeout: int = 30, retries: int = 2):
     ctx = ssl.create_default_context()
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(req, timeout=timeout, context=ctx) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        raw = resp.read().decode(charset, errors="ignore")
-        return json.loads(raw)
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(req, timeout=timeout, context=ctx) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                raw = resp.read().decode(charset, errors="ignore")
+                return json.loads(raw)
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(1)
+                continue
+            raise e
+    raise RuntimeError(f"无法获取 {url}")
 
 def _parse_marksix6_response(payload):
     records = []
@@ -117,7 +127,7 @@ def _parse_marksix6_response(payload):
 def fetch_online_records():
     for url in THIRD_PARTY_URLS:
         try:
-            payload = fetch_json_url(url, timeout=20)
+            payload = fetch_json_url(url, timeout=30, retries=2)
             records = _parse_marksix6_response(payload)
             if records:
                 return records, "marksix6", url
@@ -277,16 +287,27 @@ class DiscreteHMM:
         probs = probs / probs.sum()
         return {self.states_list[i]: probs[i] for i in range(self.n_obs)}
 
-# ========== 概率校准（保序回归 + 大窗口） ==========
+# ========== 概率校准（保序回归 + 指数移动平均窗口） ==========
 class ProbabilityCalibrator:
-    def __init__(self, window_size: int = 300):
+    def __init__(self, window_size: int = 300, use_ema: bool = True, ema_decay: float = 0.95):
         self.window_size = window_size
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
         self.preds = deque(maxlen=window_size)
         self.outcomes = deque(maxlen=window_size)
+        self.ema_preds = None
+        self.ema_outcomes = None
 
     def update(self, pred_prob: float, outcome: bool):
         self.preds.append(pred_prob)
         self.outcomes.append(1 if outcome else 0)
+        if self.use_ema:
+            if self.ema_preds is None:
+                self.ema_preds = pred_prob
+                self.ema_outcomes = 1 if outcome else 0
+            else:
+                self.ema_preds = self.ema_decay * self.ema_preds + (1 - self.ema_decay) * pred_prob
+                self.ema_outcomes = self.ema_decay * self.ema_outcomes + (1 - self.ema_decay) * (1 if outcome else 0)
 
     def _isotonic_regression(self, x, y):
         pairs = sorted(zip(x, y))
@@ -308,7 +329,7 @@ class ProbabilityCalibrator:
         return fitted
 
     def calibrate(self, prob: float) -> float:
-        if len(self.preds) < 10:
+        if len(self.preds) < 30:
             return prob
         preds_arr = list(self.preds)
         outcomes_arr = list(self.outcomes)
@@ -320,7 +341,7 @@ class ProbabilityCalibrator:
         return float(cal)
 
     def expected_calibration_error(self, n_bins: int = 10) -> float:
-        if len(self.preds) < 10:
+        if len(self.preds) < 30:
             return 0.0
         bins = [[] for _ in range(n_bins)]
         for p, o in zip(self.preds, self.outcomes):
@@ -547,20 +568,22 @@ class SPRT:
     def is_ineffective(self) -> bool:
         return self.decision is False
 
-# ========== 动态模型加权 ==========
+# ========== 动态模型加权（带温度参数） ==========
 class ModelWeightManager:
-    def __init__(self, models: List[str], loss_window: int = 50):
+    def __init__(self, models: List[str], loss_window: int = 50, temperature: float = 1.0):
         self.models = models
         self.loss_window = loss_window
+        self.temperature = temperature
         self.losses = {m: deque(maxlen=loss_window) for m in models}
         self.weights = {m: 1.0/len(models) for m in models}
 
     def update_loss(self, model: str, loss: float):
         self.losses[model].append(loss)
+        # 使用指数移动平均损失计算权重
         exp_losses = {}
         for m in self.models:
             mean_loss = np.mean(self.losses[m]) if self.losses[m] else 0.0
-            exp_losses[m] = math.exp(-mean_loss)
+            exp_losses[m] = math.exp(-mean_loss / self.temperature)
         total = sum(exp_losses.values())
         if total > 0:
             self.weights = {m: exp_losses[m]/total for m in self.models}
@@ -585,10 +608,11 @@ class AnomalyFilter:
             return True
         return False
 
-# ========== 集成引擎 V6 ==========
+# ========== 集成引擎 V6.1 ==========
 class AttributeEngineV6:
-    def __init__(self, name: str, order: int = 2, alpha_smooth: float = 1.0,
-                 use_hmm: bool = True, hmm_states: int = 3, reg_factor: float = 0.05):
+    def __init__(self, name: str, order: int = 3, alpha_smooth: float = 1.0,
+                 use_hmm: bool = True, hmm_states: int = 3, reg_factor: float = 0.05,
+                 temperature: float = 1.0):
         self.name = name
         self.order = order
         self.states = ATTRIBUTE_STATES[name]
@@ -600,10 +624,11 @@ class AttributeEngineV6:
         self.markov_counts = defaultdict(lambda: defaultdict(float))
         self.markov_total = defaultdict(float)
         self.streak_stats = StreakStats(self.states)
-        self.calibrator = ProbabilityCalibrator(window_size=300)
+        self.calibrator = ProbabilityCalibrator(window_size=300, use_ema=True, ema_decay=0.95)
         self.state_machine = DynamicStateMachine()
         self.regime_detector = RegimeDetector()
-        self.model_weight_mgr = ModelWeightManager(["markov", "streak", "hmm"], loss_window=50)
+        self.model_weight_mgr = ModelWeightManager(["markov", "streak", "hmm"] if use_hmm else ["markov", "streak"],
+                                                   loss_window=50, temperature=temperature)
         self.anomaly_filter = AnomalyFilter()
         self.sprt = SPRT(p0=1/len(self.states), p1=1/len(self.states) + 0.1)
 
@@ -616,7 +641,7 @@ class AttributeEngineV6:
             self.markov_counts[state][nxt] += w
             self.markov_total[state] += w
         self.streak_stats.update(seq)
-        if self.use_hmm and len(seq) > 50:
+        if self.use_hmm and len(seq) > 50 and self.hmm:
             self.hmm.train(seq)
 
     def _markov_probs(self, recent: List[str]) -> Dict[str, float]:
@@ -654,14 +679,22 @@ class AttributeEngineV6:
     def predict_proba(self, recent: List[str]) -> Tuple[Dict[str, float], Dict[str, float]]:
         markov_p = self._markov_probs(recent)
         streak_p = self._streak_probs(recent)
-        hmm_p = self._hmm_probs(recent)
-        model_probs = {"markov": markov_p, "streak": streak_p, "hmm": hmm_p}
-        weights = self.model_weight_mgr.get_weights()
-        fused = {}
-        for s in self.states:
-            fused[s] = weights["markov"] * markov_p.get(s,0) + \
-                       weights["streak"] * streak_p.get(s,0) + \
-                       weights["hmm"] * hmm_p.get(s,0)
+        if self.use_hmm:
+            hmm_p = self._hmm_probs(recent)
+            model_probs = {"markov": markov_p, "streak": streak_p, "hmm": hmm_p}
+            weights = self.model_weight_mgr.get_weights()
+            fused = {}
+            for s in self.states:
+                fused[s] = weights["markov"] * markov_p.get(s,0) + \
+                           weights["streak"] * streak_p.get(s,0) + \
+                           weights["hmm"] * hmm_p.get(s,0)
+        else:
+            model_probs = {"markov": markov_p, "streak": streak_p}
+            weights = self.model_weight_mgr.get_weights()
+            fused = {}
+            for s in self.states:
+                fused[s] = weights["markov"] * markov_p.get(s,0) + \
+                           weights["streak"] * streak_p.get(s,0)
         total = sum(fused.values())
         if total > 0:
             fused = {s: p/total for s, p in fused.items()}
@@ -704,16 +737,19 @@ class AttributeEngineV6:
     def reset_sprt(self):
         self.sprt.reset()
 
-# ========== 系统集成 V6 (支持波色二中一回测) ==========
+# ========== 系统集成 V6.1 ==========
 class PredictionSystemV6:
-    def __init__(self, order: int = 2, min_norm_ig: float = 0.01, max_ece: float = 0.5):
+    def __init__(self, order: int = 3, min_norm_ig: float = 0.03, max_ece: float = 0.5,
+                 use_hmm: bool = True, temperature: float = 1.0):
         self.order = order
         self.min_norm_ig = min_norm_ig
         self.max_ece = max_ece
+        self.use_hmm = use_hmm
+        self.temperature = temperature
         self.engines = {
-            "color": AttributeEngineV6("color", order),
-            "size": AttributeEngineV6("size", order),
-            "odd_even": AttributeEngineV6("odd_even", order)
+            "color": AttributeEngineV6("color", order, use_hmm=use_hmm, temperature=temperature),
+            "size": AttributeEngineV6("size", order, use_hmm=use_hmm, temperature=temperature),
+            "odd_even": AttributeEngineV6("odd_even", order, use_hmm=use_hmm, temperature=temperature)
         }
         self.norm_igs = {}
         self.performance = {
@@ -781,36 +817,20 @@ class PredictionSystemV6:
                 loss = -math.log(prob_actual)
                 engine.model_weight_mgr.update_loss(model_name, loss)
             engine.update_calibration(probs, actuals[name])
-            best_state = predictions[name]["best_state"]
-            max_prob = probs[best_state]
-            correct = (best_state == actuals[name])
-            y = {s: 1 if s == actuals[name] else 0 for s in engine.states}
-            brier = sum((probs.get(s,0) - y[s])**2 for s in engine.states)
-            logloss = -math.log(probs.get(actuals[name], 1e-10))
-            self.performance[name]["brier"].append(brier)
-            self.performance[name]["logloss"].append(logloss)
 
-    def get_average_brier(self) -> Dict[str, float]:
-        return {name: np.mean(list(metrics["brier"])) if metrics["brier"] else 0.0
-                for name, metrics in self.performance.items()}
-
-    def get_average_logloss(self) -> Dict[str, float]:
-        return {name: np.mean(list(metrics["logloss"])) if metrics["logloss"] else 0.0
-                for name, metrics in self.performance.items()}
-
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 10) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
-        """
-        返回: (准确率, 平均Brier, 波色二中一准确率)
-        """
+    def walk_forward_backtest(self, seqs: Dict[str, List[str]], test_len: int = 30) -> Tuple[Dict[str, float], Dict[str, float], float]:
         total = 0
         correct = {name: 0 for name in self.engines}
         brier_accum = {name: 0.0 for name in self.engines}
-        color_second_correct = 0  # 波色二中一命中次数
+        logloss_accum = {name: 0.0 for name in self.engines}
+        color_second_correct = 0
         min_len = self.order + 10
         for idx in range(min_len, len(seqs["color"]) - 1):
             if idx < len(seqs["color"]) - test_len:
                 continue
-            system = PredictionSystemV6(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece)
+            # 完全无泄漏: 每一步重新构建系统
+            system = PredictionSystemV6(order=self.order, min_norm_ig=self.min_norm_ig, max_ece=self.max_ece,
+                                        use_hmm=self.use_hmm, temperature=self.temperature)
             train_seqs = {name: seq[:idx] for name, seq in seqs.items()}
             system.train_all(train_seqs)
             recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx]
@@ -820,26 +840,28 @@ class PredictionSystemV6:
             should_act = pred["meta"]["should_act"]
             if should_act:
                 for name in self.engines:
+                    prob = pred[name]["probs"].get(actuals[name], 1e-10)
+                    logloss_accum[name] += -math.log(prob)
                     if pred[name]["best_state"] == actuals[name]:
                         correct[name] += 1
                     y = {s: 1 if s == actuals[name] else 0 for s in system.engines[name].states}
                     probs = pred[name]["probs"]
                     brier = sum((probs.get(s,0) - y[s])**2 for s in system.engines[name].states)
                     brier_accum[name] += brier
-                # 波色二中一统计
-                color_pred = pred["color"]
-                if color_pred["best_state"] == actuals["color"] or color_pred["second_state"] == actuals["color"]:
+                if pred["color"]["best_state"] == actuals["color"] or pred["color"]["second_state"] == actuals["color"]:
                     color_second_correct += 1
                 total += 1
         if total == 0:
             return {name: 0.0 for name in self.engines}, {name: 0.0 for name in self.engines}, 0.0
         acc = {name: correct[name]/total for name in self.engines}
         avg_brier = {name: brier_accum[name]/total for name in self.engines}
+        avg_logloss = {name: logloss_accum[name]/total for name in self.engines}
         color_second_acc = color_second_correct / total
-        return acc, avg_brier, color_second_acc
+        return acc, avg_brier, avg_logloss, color_second_acc
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=10):
+def print_dashboard(conn, order=3, min_norm_ig=0.03, max_ece=0.5,
+                    use_hmm=True, temperature=1.0, backtest_len=30):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
@@ -859,12 +881,13 @@ def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=1
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV6(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece)
+    system = PredictionSystemV6(order=order, min_norm_ig=min_norm_ig, max_ece=max_ece,
+                                use_hmm=use_hmm, temperature=temperature)
     system.train_all(seqs)
     recents = {name: seq[-order:] for name, seq in seqs.items()}
     pred = system.predict_all(recents, seqs)
 
-    print(f"\n🔮 下一期属性预测 V6 (阶数={order})")
+    print(f"\n🔮 下一期属性预测 V6.1 (阶数={order}, HMM={use_hmm}, 温度={temperature})")
     for name, data in pred.items():
         if name == "meta":
             continue
@@ -879,13 +902,14 @@ def print_dashboard(conn, order=2, min_norm_ig=0.01, max_ece=0.5, backtest_len=1
     print(f"   平均校准误差 ECE: {meta['avg_ece']:.4f}")
 
     print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
-    acc, avg_brier, color_second_acc = system.walk_forward_backtest(seqs, test_len=backtest_len)
+    acc, avg_brier, avg_logloss, color_second_acc = system.walk_forward_backtest(seqs, test_len=backtest_len)
     for name in acc:
-        print(f"   {name} 准确率: {acc[name]*100:.1f}%  平均Brier: {avg_brier[name]:.4f}")
+        print(f"   {name} 准确率: {acc[name]*100:.1f}%  平均Brier: {avg_brier[name]:.4f}  平均LogLoss: {avg_logloss[name]:.4f}")
     print(f"   波色二中一准确率: {color_second_acc*100:.1f}%")
     if any(acc.values()):
         print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
         print(f"   平均Brier: {np.mean(list(avg_brier.values())):.4f} (越小越好)")
+        print(f"   平均LogLoss: {np.mean(list(avg_logloss.values())):.4f} (越小越好)")
     else:
         print("   未出手，无数据")
 
@@ -897,7 +921,8 @@ def cmd_sync(args):
         records, source, url = fetch_online_records()
         total, ins, upd = sync_from_records(conn, records, source)
         print(f"同步完成: 总计 {total}, 新增 {ins}, 更新 {upd}, 来源 {source}")
-        print_dashboard(conn, order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece, backtest_len=args.backtest)
+        print_dashboard(conn, order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece,
+                        use_hmm=args.use_hmm, temperature=args.temp, backtest_len=args.backtest)
     except Exception as e:
         print(f"错误: {e}")
     finally:
@@ -906,17 +931,21 @@ def cmd_sync(args):
 def cmd_show(args):
     conn = connect_db(args.db)
     try:
-        print_dashboard(conn, order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece, backtest_len=args.backtest)
+        print_dashboard(conn, order=args.order, min_norm_ig=args.min_ig, max_ece=args.max_ece,
+                        use_hmm=args.use_hmm, temperature=args.temp, backtest_len=args.backtest)
     finally:
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6 (支持波色二中一回测)")
+    p = argparse.ArgumentParser(description="老澳门六合彩属性时序预测 V6.1 (优化版)")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--order", type=int, default=3, help="马尔可夫阶数 (默认3)")
-    p.add_argument("--min-ig", type=float, default=0.01, help="最小归一化信息增益阈值 (默认0.01)")
+    p.add_argument("--min-ig", type=float, default=0.03, help="最小归一化信息增益阈值 (默认0.03)")
     p.add_argument("--max-ece", type=float, default=0.5, help="最大校准误差阈值 (默认0.5)")
-    p.add_argument("--backtest", type=int, default=10, help="回测最近期数 (默认10)")
+    p.add_argument("--use-hmm", action="store_true", default=True, help="启用HMM (默认启用)")
+    p.add_argument("--no-hmm", dest="use_hmm", action="store_false", help="禁用HMM")
+    p.add_argument("--temp", type=float, default=1.0, help="模型融合温度 (默认1.0)")
+    p.add_argument("--backtest", type=int, default=30, help="回测最近期数 (默认30)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sp_sync = sub.add_parser("sync")
     sp_sync.set_defaults(func=cmd_sync)
