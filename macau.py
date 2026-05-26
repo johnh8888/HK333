@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩预测工具（仅使用 marksix6.net 的老澳门彩数据）
+# 老澳门六合彩预测工具 - 仅使用老澳门彩数据源
 
 from __future__ import annotations
 
@@ -29,11 +29,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "macau.db")          # 老澳门数据库名
 
-# 禁用官方源（该接口返回的是香港六合彩，不是老澳门）
+# 禁用官方源（该接口返回香港六合彩，不是老澳门）
 OFFICIAL_URL_DEFAULT = ""
 
+# 第三方数据源（两个备用地址）
 THIRD_PARTY_URLS_DEFAULT: List[str] = [
-    "https://marksix6.net/index.php?api=1"
+    "https://marksix6.net/index.php?api=1",
+    "https://marksix6.net/api/lottery_api.php"
 ]
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
@@ -782,21 +784,24 @@ def set_model_state(conn, key, value):
 
 
 # =========================================================
-# 数据解析（重点修改：只取老澳门彩）
+# 数据解析（重点修改：只取老澳门彩 + 调试信息）
 # =========================================================
 
-def _parse_marksix6_response(payload):
+def _parse_marksix6_response(payload, source_url=""):
     records = []
-
     lottery_data = payload.get("lottery_data", [])
+
+    # 调试：打印所有彩种名称
+    available_names = [item.get("name") for item in lottery_data]
+    print(f"API 返回的彩种: {available_names}")
 
     # 强制只取老澳门彩
     hk_data = next(
         (l for l in lottery_data if l.get("name") == "老澳门彩"),
         None
     )
-
     if not hk_data:
+        print("未找到名称为 '老澳门彩' 的数据节点")
         return records
 
     try:
@@ -807,21 +812,24 @@ def _parse_marksix6_response(payload):
     except Exception:
         latest_open_time = datetime.now()
 
-    for idx, item in enumerate(hk_data.get("history", [])):
+    history = hk_data.get("history", [])
+    print(f"找到老澳门彩，历史记录数量: {len(history)}")
+
+    for idx, item in enumerate(history):
         try:
-            # history 元素格式为 "2026146 期：12,34,23,13,47,40,10"
+            # 格式如 "2026146 期：12,34,23,13,47,40,10"
             parts = item.split("期：")
             if len(parts) != 2:
-                continue
+                # 尝试用英文冒号分割（备用）
+                parts = item.split(":")
+                if len(parts) != 2:
+                    continue
             issue_no = parts[0].strip()
-            nums = [int(n.strip()) for n in parts[1].split(",")]
+            nums_str = parts[1]
+            nums = [int(n.strip()) for n in nums_str.split(",")]
             if len(nums) != 7:
                 continue
-
-            draw_date = (
-                latest_open_time - timedelta(days=idx)
-            ).strftime("%Y-%m-%d")
-
+            draw_date = (latest_open_time - timedelta(days=idx)).strftime("%Y-%m-%d")
             records.append(
                 DrawRecord(
                     issue_no,
@@ -830,8 +838,8 @@ def _parse_marksix6_response(payload):
                     nums[6]
                 )
             )
-
-        except Exception:
+        except Exception as e:
+            print(f"解析历史记录行 {idx} 出错: {e}, 原始内容: {item}")
             continue
 
     return records
@@ -843,7 +851,7 @@ def _parse_official_json(payload):
 
 
 # =========================================================
-# 在线同步（跳过官方源）
+# 在线同步（跳过官方源，使用多个第三方源）
 # =========================================================
 
 def fetch_online_records_with_multi_fallback(
@@ -853,24 +861,25 @@ def fetch_online_records_with_multi_fallback(
     # 官方源已被禁用（OFFICIAL_URL_DEFAULT = ""），直接使用第三方源
     for url in third_party_urls:
         try:
+            print(f"尝试从 {url} 获取数据...")
             payload = fetch_json_url(url, timeout=20)
 
             if "marksix6.net" in url:
-                records = _parse_marksix6_response(payload)
+                records = _parse_marksix6_response(payload, url)
                 source = "marksix6"
             else:
-                # 其他第三方源（如果有）使用通用解析
                 records = _parse_official_json(payload)
                 source = "third_party"
 
             if records:
+                print(f"从 {url} 成功获取 {len(records)} 条老澳门彩记录")
                 return records, source, url
-
+            else:
+                print(f"从 {url} 解析到 0 条老澳门彩记录，尝试下一个源...")
         except (HTTPError, URLError, TimeoutError) as e:
-            print(f"第三方源失败: {url} -> {e}")
-
+            print(f"从 {url} 获取失败 (网络错误): {type(e).__name__}: {e}")
         except Exception as e:
-            print(f"第三方源异常: {url} -> {e}")
+            print(f"从 {url} 获取失败 (其他异常): {type(e).__name__}: {e}")
 
     raise RuntimeError("无法获取老澳门彩数据，请检查网络或数据源")
 
