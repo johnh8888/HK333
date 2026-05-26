@@ -265,16 +265,14 @@ def predict_color(
 
 
 # =========================================================
-# 【新增】大小 & 单双 预测及回测（只显示主强）
+# 【新增补丁】大小 & 单双预测（只显示主强）
 # =========================================================
 
 def get_big_small(num: int) -> str:
     return "大" if num >= 25 else "小"
 
-
 def get_odd_even(num: int) -> str:
     return "单" if num % 2 == 1 else "双"
-
 
 def predict_big_small_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
     if not specials:
@@ -283,19 +281,18 @@ def predict_big_small_weighted(specials: List[int], window: int = 10) -> Tuple[s
     scores = defaultdict(float)
     total_weight = 0.0
     for i, num in enumerate(reversed(recent)):
-        weight = (window - i) ** 1.4
+        weight = (window - i) ** 1.5
         bs = get_big_small(num)
         scores[bs] += weight
         if i > 0:
             prev_index = len(recent) - i
             if 0 <= prev_index < len(recent) and bs == get_big_small(recent[prev_index]):
-                scores[bs] += weight * 0.35
+                scores[bs] += weight * 0.45
         total_weight += weight
     sorted_bs = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
     main = sorted_bs[0][0]
     main_score = safe_div(sorted_bs[0][1], total_weight)
     return main, "小", main_score, 0.0
-
 
 def predict_odd_even_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
     if not specials:
@@ -304,50 +301,44 @@ def predict_odd_even_weighted(specials: List[int], window: int = 10) -> Tuple[st
     scores = defaultdict(float)
     total_weight = 0.0
     for i, num in enumerate(reversed(recent)):
-        weight = (window - i) ** 1.4
+        weight = (window - i) ** 1.5
         oe = get_odd_even(num)
         scores[oe] += weight
         if i > 0:
             prev_index = len(recent) - i
             if 0 <= prev_index < len(recent) and oe == get_odd_even(recent[prev_index]):
-                scores[oe] += weight * 0.35
+                scores[oe] += weight * 0.45
         total_weight += weight
     sorted_oe = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
     main = sorted_oe[0][0]
     main_score = safe_div(sorted_oe[0][1], total_weight)
     return main, "双", main_score, 0.0
 
-
 def backtest_big_small(conn, recent_limit: int = 10, window: int = 10):
     rows = conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()
     specials = [r["special_number"] for r in rows]
-    if len(specials) < recent_limit + window:
-        return 0, 0
+    if len(specials) < recent_limit + window: return 0, 0
     total = main_hit = 0
     start_idx = len(specials) - recent_limit
     for i in range(start_idx, len(specials)):
         train = specials[:i]
         actual = get_big_small(specials[i])
         main_bs, _, _, _ = predict_big_small_weighted(train, window)
-        if main_bs == actual:
-            main_hit += 1
+        if main_bs == actual: main_hit += 1
         total += 1
     return total, main_hit
-
 
 def backtest_odd_even(conn, recent_limit: int = 10, window: int = 10):
     rows = conn.execute("SELECT special_number FROM draws ORDER BY draw_date ASC, issue_no ASC").fetchall()
     specials = [r["special_number"] for r in rows]
-    if len(specials) < recent_limit + window:
-        return 0, 0
+    if len(specials) < recent_limit + window: return 0, 0
     total = main_hit = 0
     start_idx = len(specials) - recent_limit
     for i in range(start_idx, len(specials)):
         train = specials[:i]
         actual = get_odd_even(specials[i])
         main_oe, _, _, _ = predict_odd_even_weighted(train, window)
-        if main_oe == actual:
-            main_hit += 1
+        if main_oe == actual: main_hit += 1
         total += 1
     return total, main_hit
 
@@ -1801,7 +1792,7 @@ def backtest_colors(
 
 
 # =========================================================
-# 展示
+# 展示（已追加大小和单双）
 # =========================================================
 
 def print_dashboard(
@@ -1958,14 +1949,14 @@ def print_dashboard(
 
             print(f"   最大连错: {max_miss}期")
 
-        # 大小预测（只显示主强）
+        # 新增：大小预测（只显示主强）
         main_bs, _, bs_score, _ = predict_big_small_weighted(all_specials, color_window)
         total_bs, hit_bs = backtest_big_small(conn, 10, color_window)
         print(f"\n📏 特码大小预测（基于最近 {color_window} 期）： 主强 {main_bs} ({bs_score:.3f})")
         if total_bs > 0:
             print(f"   回测（最近10期）：主强命中率 {hit_bs}/{total_bs} ({hit_bs/total_bs*100:.1f}%)")
 
-        # 单双预测（只显示主强）
+        # 新增：单双预测（只显示主强）
         main_oe, _, oe_score, _ = predict_odd_even_weighted(all_specials, color_window)
         total_oe, hit_oe = backtest_odd_even(conn, 10, color_window)
         print(f"\n🔢 特码单双预测（基于最近 {color_window} 期）： 主强 {main_oe} ({oe_score:.3f})")
