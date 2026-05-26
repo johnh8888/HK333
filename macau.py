@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 老澳门六合彩预测工具
+# 老澳门六合彩预测工具（仅使用 marksix6.net 的老澳门彩数据）
+
 from __future__ import annotations
 
 import argparse
@@ -28,9 +29,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "macau.db")          # 老澳门数据库名
 
-OFFICIAL_URL_DEFAULT = (
-    "https://bet.hkjc.com/contentserver/jcbw/cmc/last30draw.json"
-)
+# 禁用官方源（该接口返回的是香港六合彩，不是老澳门）
+OFFICIAL_URL_DEFAULT = ""
 
 THIRD_PARTY_URLS_DEFAULT: List[str] = [
     "https://marksix6.net/index.php?api=1"
@@ -235,7 +235,7 @@ def predict_color_weighted(
     for c in ["红","蓝","绿"]:
         ratio = safe_div(scores_a[c], total_w)
         if ratio > 0.75:
-            for other 在 ["红","蓝","绿"]:
+            for other in ["红","蓝","绿"]:
                 if other != c:
                     scores_a[other] += total_w * 0.1
 
@@ -622,7 +622,7 @@ class DrawRecord:
 def connect_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(
         db_path,
-        timeout=30，
+        timeout=30,
         check_same_thread=False
     )
 
@@ -782,7 +782,7 @@ def set_model_state(conn, key, value):
 
 
 # =========================================================
-# 数据解析
+# 数据解析（重点修改：只取老澳门彩）
 # =========================================================
 
 def _parse_marksix6_response(payload):
@@ -790,12 +790,10 @@ def _parse_marksix6_response(payload):
 
     lottery_data = payload.get("lottery_data", [])
 
+    # 强制只取老澳门彩
     hk_data = next(
-        (
-            l for l in lottery_data
-            if l.get("name") in [ "老澳门彩"]
-        ),
-        无
+        (l for l in lottery_data if l.get("name") == "老澳门彩"),
+        None
     )
 
     if not hk_data:
@@ -809,20 +807,14 @@ def _parse_marksix6_response(payload):
     except Exception:
         latest_open_time = datetime.now()
 
-    for idx, item 在 enumerate(hk_data.get("history", [])):
+    for idx, item in enumerate(hk_data.get("history", [])):
         try:
+            # history 元素格式为 "2026146 期：12,34,23,13,47,40,10"
             parts = item.split("期：")
-
             if len(parts) != 2:
                 continue
-
             issue_no = parts[0].strip()
-
-            nums = [
-                int(n.strip())
-                for n in parts[1].split(",")
-            ]
-
+            nums = [int(n.strip()) for n in parts[1].split(",")]
             if len(nums) != 7:
                 continue
 
@@ -846,73 +838,19 @@ def _parse_marksix6_response(payload):
 
 
 def _parse_official_json(payload):
-    records = []
-
-    for item in payload:
-        try:
-            issue_no = str(
-                item.get("drawNo")
-                or item.get("issueNo")
-            )
-
-            draw_date = str(
-                item.get("drawDate", "")
-            )[:10]
-
-            numbers = [
-                safe_int(item.get(f"no{i}"))
-                for i in range(1, 7)
-            ]
-
-            special = safe_int(
-                item.get("specialNumber")
-                or item.get("no7")
-            )
-
-            if (
-                issue_no
-                and draw_date
-                and len(numbers) == 6
-            ):
-                records.append(
-                    DrawRecord(
-                        issue_no,
-                        draw_date,
-                        numbers,
-                        special
-                    )
-                )
-
-        except Exception:
-            continue
-
-    return records
+    # 该函数保留，但因为官方源已禁用，不会被调用
+    return []
 
 
 # =========================================================
-# 在线同步
+# 在线同步（跳过官方源）
 # =========================================================
 
 def fetch_online_records_with_multi_fallback(
     official_url,
     third_party_urls
 ):
-
-    if official_url.strip():
-        try:
-            payload = fetch_json_url(
-                official_url,
-                timeout=15
-            )
-
-            records = _parse_official_json(payload)
-
-            if records:
-                return records, "official_api", official_url
-
-        except Exception as e:
-            print(f"官方源失败: {e}")
-
+    # 官方源已被禁用（OFFICIAL_URL_DEFAULT = ""），直接使用第三方源
     for url in third_party_urls:
         try:
             payload = fetch_json_url(url, timeout=20)
@@ -921,6 +859,7 @@ def fetch_online_records_with_multi_fallback(
                 records = _parse_marksix6_response(payload)
                 source = "marksix6"
             else:
+                # 其他第三方源（如果有）使用通用解析
                 records = _parse_official_json(payload)
                 source = "third_party"
 
@@ -933,7 +872,7 @@ def fetch_online_records_with_multi_fallback(
         except Exception as e:
             print(f"第三方源异常: {url} -> {e}")
 
-    raise RuntimeError("所有在线数据源均无法获取数据")
+    raise RuntimeError("无法获取老澳门彩数据，请检查网络或数据源")
 
 
 # =========================================================
@@ -2521,7 +2460,7 @@ def cmd_show(args):
 # =========================================================
 
 def main():
-    p = argparse.ArgumentParser(description="老澳门六合彩预测工具")
+    p = argparse.ArgumentParser(description="老澳门六合彩预测工具（仅使用老澳门彩数据源）")
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     p.add_argument("--official-url", default=OFFICIAL_URL_DEFAULT)
     p.add_argument("--color-window", type=int, default=10, help="波色预测窗口大小")
