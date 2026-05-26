@@ -2,7 +2,8 @@ name: 老澳门六合彩自动预测
 
 on:
   schedule:
-    - cron: '5 14 * * *'
+    # 根据实际开奖时间调整：北京时间 23:00 (UTC 15:00)
+    - cron: '0 15 * * *'
   workflow_dispatch:
 
 permissions:
@@ -19,36 +20,32 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 测试 API 连通性
-        run: |
-          echo "测试主 API:"
-          curl -s -L -H "User-Agent: Mozilla/5.0" "https://marksix6.net/index.php?api=1" | head -c 500 || echo "主 API 失败"
-          echo ""
-          echo "测试备用 API:"
-          curl -s -L -H "User-Agent: Mozilla/5.0" "https://marksix6.net/api/lottery_api.php" | head -c 500 || echo "备用 API 失败"
-
       - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install numpy scikit-learn lightgbm xgboost catboost
 
-      - name: 自动修复脚本（防止全角符号等）
-        run: |
-          sed -i 's/，/,/g; s/。/. /g; s/；/;/g; s/：/:/g; s/！/!/g; s/？/?/g; s/（/(/g; s/）/)/g; s/【/[/g; s/】/]/g; s/“/"/g; s/”/"/g; s/‘/'"'"'/g; s/’/'"'"'/g' macau.py
-          sed -i 's/\b在\b/in/g; s/\b如果\b/if/g; s/\b否则\b/else/g; s/\b并且\b/and/g; s/\b或者\b/or/g; s/\b真\b/True/g; s/\b假\b/False/g; s/\b空\b/None/g; s/\b无\b/None/g' macau.py
+      - name: 运行 old_macau.py 同步、回测、调优与预测
+        run: python old_macau.py sync --with-backtest --auto-tune
 
-      - name: 运行同步、回测、调优与预测
+      - name: 运行 macau.py 同步、回测、调优与预测
         run: python macau.py sync --with-backtest --auto-tune
 
       - name: 提交数据库更新
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add macau.db
-          git commit -m "🤖 老澳门六合彩自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "无变化"
+          git add old_macau.db macau.db
+          git commit -m "🤖 老澳门自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
           git push
 
-      - name: 保存数据库备份
+      - name: 保存 old_macau.db 备份
+        uses: actions/upload-artifact@v4
+        with:
+          name: old-macau-db-backup
+          path: old_macau.db
+
+      - name: 保存 macau.db 备份
         uses: actions/upload-artifact@v4
         with:
           name: macau-db-backup
