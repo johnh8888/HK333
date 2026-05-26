@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
 
+
 jobs:
   predict:
     runs-on: ubuntu-latest
