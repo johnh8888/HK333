@@ -2,7 +2,8 @@ name: 新澳门六合彩自动预测
 
 on:
   schedule:
-    - cron: '0 15 * * *'   # 根据新澳门实际开奖时间调整（建议香港时间晚上8-9点左右开奖）
+    # 北京时间晚上23:00 (UTC 15:00) 运行，可根据实际开奖时间调整
+    - cron: '0 15 * * *'
   workflow_dispatch:
 
 permissions:
@@ -19,8 +20,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 安装依赖（如果未来有需要）
-        run: pip install -r requirements.txt || echo "No requirements.txt, skipping"
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install numpy lightgbm xgboost catboost
 
       - name: 运行同步、回测、调优与预测
         run: python new_macau.py sync --with-backtest --auto-tune
