@@ -1,6 +1,6 @@
 name: 老澳门六合彩自动预测
 
-on:
+于:
   schedule:
     # 根据实际开奖时间调整：北京时间 23:00 (UTC 15:00)
     - cron: '0 15 * * *'
@@ -25,8 +25,6 @@ jobs:
           pip install --upgrade pip
           pip install numpy scikit-learn lightgbm xgboost catboost
 
-      - name: 运行 old_macau.py 同步、回测、调优与预测
-        run: python old_macau.py sync --with-backtest --auto-tune
 
       - name: 运行 macau.py 同步、回测、调优与预测
         run: python macau.py sync --with-backtest --auto-tune
@@ -39,11 +37,6 @@ jobs:
           git commit -m "🤖 老澳门自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
           git push
 
-      - name: 保存 old_macau.db 备份
-        uses: actions/upload-artifact@v4
-        with:
-          name: old-macau-db-backup
-          path: old_macau.db
 
       - name: 保存 macau.db 备份
         uses: actions/upload-artifact@v4
