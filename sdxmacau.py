@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 V7.4 (完整回测 + 准确率优化版)
+# 三彩种属性预测 V7.5 (完整回测 + 命中率优化版)
 
 from __future__ import annotations
 
@@ -173,7 +173,7 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
     rows = conn.execute("SELECT special_number, draw_date FROM draws ORDER BY draw_date ASC, issue_no ASC LIMIT ?", (limit,)).fetchall()
     return [{"num": r["special_number"], "date": r["draw_date"]} for r in rows]
 
-# ========== StableHMM (优化版) ==========
+# ========== StableHMM ==========
 class StableHMM:
     def __init__(self, n_states: int = 3, n_obs: int = 3, states_list: List[str] = None, reg_factor: float = 0.18):
         self.n_states = n_states
@@ -188,8 +188,7 @@ class StableHMM:
         self.B = np.ones((n_states, n_obs)) / n_obs
 
     def train(self, obs_seq: List[str], max_iter: int = 60):
-        if len(obs_seq) < 25:
-            return
+        if len(obs_seq) < 25: return
         obs_idx = np.array([self.obs_to_idx[o] for o in obs_seq])
         T = len(obs_idx)
 
@@ -253,7 +252,7 @@ class StableHMM:
 
         return {self.states_list[i]: float(next_probs[i]) for i in range(self.n_obs)}
 
-# ========== 其他模型 ==========
+# ========== 辅助模型 ==========
 class OnlineBayesianWeight:
     def __init__(self, models: List[str], alpha_prior: float = 1.0, beta_prior: float = 1.0):
         self.models = models
@@ -363,12 +362,13 @@ class TemperatureScaling:
         total = sum(scaled.values())
         return {s: p/total for s, p in scaled.items()}
 
-# ========== 集成引擎 ==========
-class AttributeEngineV7_4:
+# ========== 集成引擎 V7.5 ==========
+class AttributeEngineV7_5:
     def __init__(self, name: str, order: int = 3, alpha: float = 1.0, use_hmm: bool = True, temperature: float = 1.0):
         self.name = name
         self.states = ATTRIBUTE_STATES[name]
         self.use_hmm = use_hmm
+        self.base_temp = temperature
         self.temp_scaler = TemperatureScaling(temperature)
 
         self.markov = MarkovN(order, self.states, alpha)
@@ -436,30 +436,26 @@ class AttributeEngineV7_4:
             for m in self.model_names:
                 fused[s] += weights.get(m, 0) * model_dict[m].get(s, 0)
 
+        # 加强特征权重
         for s in self.states:
-            fused[s] = 0.72 * fused[s] + 0.28 * feature_probs.get(s, 1.0/3)
+            fused[s] = 0.68 * fused[s] + 0.32 * feature_probs.get(s, 1.0/3)
 
         total = sum(fused.values()) or 1.0
         fused = {s: p/total for s, p in fused.items()}
 
         return self.temp_scaler.calibrate(fused)
 
-    def update_feedback(self, predicted_probs: Dict[str, float], actual: str):
-        prob_actual = predicted_probs.get(actual, 1e-10)
-        for m in self.model_names:
-            self.bayes_weight.update(m, prob_actual)
-
 # ========== 预测系统 ==========
-class PredictionSystemV7_4:
+class PredictionSystemV7_5:
     def __init__(self, order: int = 3, min_ig: float = 0.01, temperature: float = 1.0, use_hmm: bool = True):
         self.order = order
         self.min_ig = min_ig
         self.temperature = temperature
         self.use_hmm = use_hmm
         self.engines = {
-            "color": AttributeEngineV7_4("color", order, use_hmm=use_hmm, temperature=temperature),
-            "size": AttributeEngineV7_4("size", order, use_hmm=use_hmm, temperature=temperature),
-            "odd_even": AttributeEngineV7_4("odd_even", order, use_hmm=use_hmm, temperature=temperature)
+            "color": AttributeEngineV7_5("color", order, use_hmm=use_hmm, temperature=temperature),
+            "size": AttributeEngineV7_5("size", order, use_hmm=use_hmm, temperature=temperature),
+            "odd_even": AttributeEngineV7_5("odd_even", order, use_hmm=use_hmm, temperature=temperature)
         }
 
     def train_all(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]]):
@@ -481,20 +477,18 @@ class PredictionSystemV7_4:
         results["meta"] = {"should_act": should_act, "reason": f"avg_max_prob={avg_max_prob:.3f}"}
         return results
 
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], test_len: int = 120):
+    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], test_len: int = 150):
         total = 0
         correct = {name: 0 for name in self.engines}
         logloss_sum = {name: 0.0 for name in self.engines}
         kl_sum = {name: 0.0 for name in self.engines}
         color_second_correct = 0
-        actuals_list = []
-        preds_list = []
 
         min_len = self.order + 30
         start_idx = max(len(seqs["color"]) - test_len, min_len)
 
         for idx in range(start_idx, len(seqs["color"]) - 1):
-            system = PredictionSystemV7_4(order=self.order, min_ig=self.min_ig,
+            system = PredictionSystemV7_5(order=self.order, min_ig=self.min_ig,
                                           temperature=self.temperature, use_hmm=self.use_hmm)
             train_seqs = {name: seqs[name][:idx] for name in seqs}
             train_draws = {name: draws[name][:idx] for name in draws}
@@ -517,8 +511,6 @@ class PredictionSystemV7_4:
                         correct[name] += 1
                 if pred["color"]["best_state"] == actuals["color"] or pred["color"]["second_state"] == actuals["color"]:
                     color_second_correct += 1
-                actuals_list.append(actuals["color"])
-                preds_list.append(pred["color"]["best_state"])
                 total += 1
 
         if total == 0:
@@ -555,7 +547,7 @@ def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV7_4(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
+    system = PredictionSystemV7_5(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
     system.train_all(seqs, draws_dict)
     recents = {name: seqs[name][-order:] for name in seqs}
     recent_draws = {name: draws[-order:] for name in seqs}
@@ -598,7 +590,7 @@ def process_lottery(lottery_name: str, args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V7.4")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V7.5")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
     p.add_argument("--order", type=int, default=3)
     p.add_argument("--min-ig", type=float, default=0.01)
