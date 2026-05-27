@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-三彩种属性预测 V9.2 (自动校准 + 智能 Regime + MI 过滤)
+三彩种属性预测 V9.2 (自动校准 + 智能 Regime + MI 过滤) - 修复版
 """
 
 from __future__ import annotations
@@ -448,7 +448,6 @@ class AdvancedMetrics:
 
     @staticmethod
     def merge_breakpoints(breakpoints, min_gap=3):
-        """合并间隔小于min_gap的断点，返回区间列表"""
         if not breakpoints: return []
         breakpoints = sorted(breakpoints)
         merged = [[breakpoints[0], breakpoints[0]]]
@@ -554,9 +553,9 @@ class AttributeEngineV9:
         sub = self._sub_preds(recent_seq, recent_draws)
         self.weight_learner.update(sub, actual)
 
-# ========== 预测系统 V9.2 ==========
+# ========== 预测系统 V9.2 (修复版) ==========
 class PredictionSystemV9_2:
-    def __init__(self, order=4, min_ig=0.45, temperature=1.0, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=1.0, entropy_pct=30, mi_threshold=0.2):
+    def __init__(self, order=4, min_ig=0.45, temperature=1.0, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=1.0, entropy_pct=30, mi_threshold=0.15):
         self.order = order; self.min_ig = min_ig; self.temp = temperature
         self.use_hmm = use_hmm; self.decay = decay; self.entropy_pct = entropy_pct
         self.mi_threshold = mi_threshold
@@ -578,7 +577,7 @@ class PredictionSystemV9_2:
                 eng.update_weights(rec, rd, s[i])
 
     def predict_all(self, recents, recent_draws):
-        res, subs, ents = {}, {}, {}
+        res, subs = {}, {}
         for n, eng in self.engines.items():
             probs, sub = eng.predict_proba(recents[n], recent_draws[n])
             subs[n] = sub
@@ -591,13 +590,11 @@ class PredictionSystemV9_2:
             thresh = math.log(len(ATTRIBUTE_STATES["color"]))*0.95
         else:
             thresh = np.percentile(self.entropy_history, self.entropy_pct)
-        # 计算互信息过滤
-        total_ent, exp_ent, mi = AdvancedMetrics.entropy_decomposition(
-            [{n: subs[n]} for n in self.engines],  # 简化：只计算每个属性的整体
-            [{n: res[n]["probs"]} for n in self.engines]
-        )
-        # 如果任意属性的MI过高，提高阈值
-        mi_override = any(AdvancedMetrics.entropy_decomposition([subs[n]], [res[n]["probs"]])[2] > self.mi_threshold for n in self.engines)
+        # 计算 MI 用于过滤
+        _, _, mi_color = AdvancedMetrics.entropy_decomposition([subs["color"]], [res["color"]["probs"]])
+        _, _, mi_size = AdvancedMetrics.entropy_decomposition([subs["size"]], [res["size"]["probs"]])
+        _, _, mi_odd = AdvancedMetrics.entropy_decomposition([subs["odd_even"]], [res["odd_even"]["probs"]])
+        mi_override = (mi_color > self.mi_threshold) or (mi_size > self.mi_threshold) or (mi_odd > self.mi_threshold)
         final_ig = self.min_ig + (0.1 if mi_override else 0.0)
         should_act = (avg_max >= final_ig) and (color_ent <= thresh)
         self.entropy_history.append(color_ent)
@@ -646,7 +643,6 @@ class PredictionSystemV9_2:
                     ctx = tuple(recent_seq[-(self.order+1):-1])
                     eng.markov.partial_fit(ctx, recent_seq[-1])
                 eng.update_weights(rec[n], rd[n], actuals[n])
-        # 汇总
         def safe(a,b): return a/b if b>0 else 0.0
         r = {}
         r["act"] = {"total": res["act"]["total"], "acc": {n: safe(res["act"]["acc"][n], res["act"]["total"]) for n in self.engines}}
@@ -684,7 +680,7 @@ def tune_temperature(seqs, draws, backtest_len=150, order=4):
         best_ece = float('inf')
         best_temp = 1.0
         for temp in [0.6,0.8,1.0,1.2,1.5]:
-            sys = PredictionSystemV9_2(order=order, temperature=temp, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=0.99, mi_threshold=0.2)
+            sys = PredictionSystemV9_2(order=order, temperature=temp, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=0.99, mi_threshold=0.15)
             result = sys.walk_forward_backtest(seqs, draws, test_len=backtest_len)
             ece = result["ece"][name]
             if ece < best_ece:
@@ -701,12 +697,11 @@ def print_dashboard(conn, lottery_name, args):
     if len(seqs["color"])<100:
         print("数据不足"); return
 
-    # 自动温度调优（如果开启）
+    # 自动温度调优
     if args.auto_temp:
         print("🔧 自动搜索最佳温度...")
         temps = tune_temperature(seqs, draws_dict, args.backtest, args.order)
         print(f"   最佳温度: {temps}")
-        # 使用调优后的温度（取color的作为全局）
         use_temp = temps["color"]
     else:
         use_temp = args.temp
@@ -756,7 +751,7 @@ def print_dashboard(conn, lottery_name, args):
             print(f"{n}: 无显著区间")
 
 def main():
-    p = argparse.ArgumentParser(description="V9.2 改进版")
+    p = argparse.ArgumentParser(description="V9.2 改进版 (修复)")
     p.add_argument("--lottery", choices=["老澳门彩","香港彩","新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.45)
