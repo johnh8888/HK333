@@ -1,0 +1,40 @@
+# .github/workflows/hk-color-tuner.yml
+name: 香港彩波色专项调优
+
+on:
+  workflow_dispatch:   # 仅手动触发，避免每次定时运行都调参
+  # 如果您希望每天定时运行调优，可以取消下面的注释
+  # schedule:
+  #   - cron: '15 14 * * *'   # 北京时间 22:15
+
+permissions:
+  contents: write
+
+jobs:
+  tune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: pip install numpy
+
+      - name: 运行波色调优
+        run: python hk_color_tuner.py
+
+      - name: 备份调优日志（可选）
+        uses: actions/upload-artifact@v4
+        with:
+          name: hk-color-tuning-log
+          path: tuning_report.txt   # 如果脚本输出到文件，此处需修改
