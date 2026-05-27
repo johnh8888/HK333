@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-三彩种属性预测 V9.0 Research Suite
-融合三条路线：
-1. 统计学版：条件置换检验 + 多重校正
-2. 金融化：信号强度、IC分析、累积收益
-3. 强化学习：在线策略梯度优化 should_act 决策
+三彩种属性预测 V9.1 研究加强版
+新增功能：
+1. ΔLogLoss 显著性检验 (Wilcoxon signed-rank)
+2. 期望校准误差 (ECE) + 可靠性图数据
+3. 预测熵分解 (总熵、期望熵、互信息)
+4. Regime 检测 (滚动窗口 ΔLogLoss 断点检验)
 """
 
 from __future__ import annotations
 
-import argparse, json, sqlite3, math, ssl, sys, time, random, copy
+import argparse, json, sqlite3, math, ssl, sys, time, random, copy, statistics
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -35,8 +36,7 @@ ATTRIBUTE_STATES = {
     "size": ["大", "小"],
     "odd_even": ["单", "双"]
 }
-# 假设赔率（下注成功返奖率，用于金融评估）
-PAYOFF_MULTIPLIER = {"color": 2.0, "size": 1.95, "odd_even": 1.95}  # 例如赔率1:2
+PAYOFF_MULTIPLIER = {"color": 2.0, "size": 1.95, "odd_even": 1.95}  # 假设赔率
 
 # ========== 属性映射 ==========
 def get_color(num: int) -> str:
@@ -173,7 +173,7 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
     rows = conn.execute("SELECT special_number, draw_date FROM draws ORDER BY issue_no ASC LIMIT ?", (limit,)).fetchall()
     return [{"num": r["special_number"], "date": r["draw_date"]} for r in rows]
 
-# ========== 纯 Python 二项检验 ==========
+# ========== 统计工具函数 ==========
 def binomial_p_value(k: int, n: int, p0: float) -> float:
     from math import comb
     if k <= 0: return 1.0
@@ -182,22 +182,38 @@ def binomial_p_value(k: int, n: int, p0: float) -> float:
         total += comb(n, i) * (p0 ** i) * ((1 - p0) ** (n - i))
     return total
 
-# ========== 多重检验校正 ==========
-def apply_bonferroni(p_values: List[float]) -> List[float]:
-    m = len(p_values)
-    return [min(p * m, 1.0) for p in p_values]
+def wilcoxon_signed_rank_test(diffs: List[float]) -> Tuple[float, float]:
+    """
+    对配对的差值做 Wilcoxon signed-rank 检验 (双尾)
+    返回统计量 T 和 p-value (近似正态)
+    """
+    diffs = [d for d in diffs if d != 0]
+    n = len(diffs)
+    if n < 5:
+        return 0, 1.0
+    abs_diffs = [abs(d) for d in diffs]
+    ranks = np.argsort(np.argsort(abs_diffs)) + 1  # 简单秩
+    # 处理并列秩：实际应更精细，这里简化
+    W_plus = sum(r for d, r in zip(diffs, ranks) if d > 0)
+    W_minus = sum(r for d, r in zip(diffs, ranks) if d < 0)
+    T = min(W_plus, W_minus)
+    mu = n*(n+1)/4
+    sigma = math.sqrt(n*(n+1)*(2*n+1)/24)
+    if sigma == 0: return T, 1.0
+    z = (T - mu) / sigma
+    # 双尾 p 值近似
+    from math import erf
+    p = 2 * (1 - 0.5 * (1 + erf(abs(z)/math.sqrt(2))))
+    return T, p
 
-def apply_bh(p_values: List[float], alpha: float = 0.05) -> List[bool]:
-    """Benjamini-Hochberg 过程，返回是否拒绝"""
-    m = len(p_values)
-    sorted_indices = np.argsort(p_values)
-    sorted_p = np.array(p_values)[sorted_indices]
-    reject = np.zeros(m, dtype=bool)
-    for i in range(m-1, -1, -1):
-        if sorted_p[i] <= (i+1) / m * alpha:
-            reject[sorted_indices[:i+1]] = True
-            break
-    return reject.tolist()
+def mann_whitney_u(x: List[float], y: List[float]) -> Tuple[float, float]:
+    """Mann-Whitney U 检验，返回 U 统计量和 p-value (近似正态)"""
+    from scipy.stats import mannwhitneyu
+    try:
+        u, p = mannwhitneyu(x, y, alternative='two-sided')
+        return u, p
+    except:
+        return 0, 1.0
 
 # ========== StableHMM ==========
 class StableHMM:
@@ -394,6 +410,96 @@ class OnlineBayesianWeight:
         if total < 1e-12: return {m: 1.0/len(self.models) for m in self.models}
         return {m: exp_weights[m]/total for m in self.models}
 
+# ========== 增强指标计算类 ==========
+class AdvancedMetrics:
+    @staticmethod
+    def ece(probs_list: List[Dict[str, float]], actual_list: List[str], n_bins: int = 10) -> Tuple[float, List[float], List[float]]:
+        """
+        计算期望校准误差 ECE。
+        返回 ECE, 每个bin的置信度均值, 每个bin的准确率。
+        """
+        confidences = []
+        accuracies = []
+        for prob_dict, actual in zip(probs_list, actual_list):
+            if actual in prob_dict:
+                confidences.append(prob_dict[actual])
+                accuracies.append(1.0)  # 事后准确率
+            else:
+                confidences.append(0.0)
+                accuracies.append(0.0)
+        if not confidences:
+            return 0.0, [], []
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_indices = np.digitize(confidences, bin_boundaries[1:])  # [0, n_bins-1]
+        ece_total = 0.0
+        bin_conf = []
+        bin_acc = []
+        for b in range(n_bins):
+            mask = bin_indices == b
+            if np.sum(mask) == 0:
+                bin_conf.append(0); bin_acc.append(0)
+                continue
+            avg_conf = np.mean(np.array(confidences)[mask])
+            avg_acc = np.mean(np.array(accuracies)[mask])
+            bin_conf.append(avg_conf)
+            bin_acc.append(avg_acc)
+            ece_total += (np.sum(mask) / len(confidences)) * abs(avg_conf - avg_acc)
+        return ece_total, bin_conf, bin_acc
+
+    @staticmethod
+    def entropy_decomposition(sub_model_probs_list: List[Dict[str, Dict[str, float]]],
+                              fused_probs_list: List[Dict[str, float]]) -> Tuple[float, float, float]:
+        """总熵, 期望熵, 互信息 (MI)。"""
+        total_ent = 0.0
+        avg_expected_ent = 0.0
+        n = len(fused_probs_list)
+        if n == 0: return 0,0,0
+        for fused, sub_dict in zip(fused_probs_list, sub_model_probs_list):
+            # 总熵 H(E[P])
+            h_total = -sum(p * math.log(p+1e-12) for p in fused.values() if p > 0)
+            total_ent += h_total
+            # 期望熵 E[H(P)]
+            expected_ent = 0.0
+            for m, probs in sub_dict.items():
+                h_sub = -sum(p * math.log(p+1e-12) for p in probs.values() if p > 0)
+                expected_ent += h_sub
+            expected_ent /= len(sub_dict)
+            avg_expected_ent += expected_ent
+        total_ent /= n
+        avg_expected_ent /= n
+        mi = total_ent - avg_expected_ent  # MI = H(E[P]) - E[H(P)]
+        return total_ent, avg_expected_ent, mi
+
+    @staticmethod
+    def rolling_window_delta_logloss(logloss_diffs: List[float], window: int = 30, step: int = 10) -> List[float]:
+        """滑动窗口的 ΔLogLoss 序列"""
+        if len(logloss_diffs) < window: return []
+        seq = []
+        for i in range(0, len(logloss_diffs)-window+1, step):
+            seq.append(np.mean(logloss_diffs[i:i+window]))
+        return seq
+
+    @staticmethod
+    def regime_detection(series: List[float], min_seg: int = 30) -> Dict:
+        """
+        简单 regime 检测：寻找统计显著的结构断点。
+        使用滑动 Mann-Whitney U 检验比较前后两段。
+        返回断点位置和 p-value。
+        """
+        n = len(series)
+        if n < 2 * min_seg:
+            return {"breakpoints": [], "p_values": []}
+        breakpoints = []
+        pvals = []
+        for t in range(min_seg, n - min_seg):
+            before = series[:t]
+            after = series[t:]
+            u, p = mann_whitney_u(before, after)
+            if p < 0.05:  # 显著
+                breakpoints.append(t)
+                pvals.append(p)
+        return {"breakpoints": breakpoints, "p_values": pvals}
+
 # ========== 集成引擎 ==========
 class AttributeEngineV9:
     def __init__(self, name: str, markov_order: int = 2, temperature: float = 1.0,
@@ -482,7 +588,7 @@ class AttributeEngineV9:
                 preds[feat] = {s: 1.0/len(self.states) for s in self.states}
         return preds
 
-    def predict_proba(self, recent_seq: List[str], recent_draws: List[Dict]) -> Dict[str, float]:
+    def predict_proba(self, recent_seq: List[str], recent_draws: List[Dict]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
         sub_preds = self._submodel_preds(recent_seq, recent_draws)
         weights = self.weight_learner.get_weights()
         fused = {s: 0.0 for s in self.states}
@@ -492,34 +598,15 @@ class AttributeEngineV9:
                 fused[s] += w * sub_preds[m].get(s, 1.0/len(self.states))
         total = sum(fused.values()) or 1.0
         fused = {s: p/total for s, p in fused.items()}
-        return self.temp_scaler.calibrate(fused)
+        fused_cal = self.temp_scaler.calibrate(fused)
+        return fused_cal, sub_preds
 
     def update_weights(self, recent_seq: List[str], recent_draws: List[Dict], actual_state: str):
         sub_preds = self._submodel_preds(recent_seq, recent_draws)
         self.weight_learner.update(sub_preds, actual_state)
 
-# ========== 强化学习策略模块 ==========
-class OnlineREINFORCE:
-    """
-    简单 REINFORCE 优化二元决策概率。
-    输入：状态特征向量；输出：下注概率。
-    """
-    def __init__(self, input_dim: int = 2, lr: float = 0.01):
-        self.weights = np.zeros(input_dim)
-        self.lr = lr
-
-    def predict_proba(self, state: np.ndarray) -> float:
-        z = np.dot(state, self.weights)
-        return 1.0 / (1.0 + math.exp(-z))  # sigmoid
-
-    def update(self, state: np.ndarray, action: int, reward: float):
-        """action 0 or 1, reward 为收益（如+1赢，-1输）"""
-        prob = self.predict_proba(state)
-        # 梯度 = state * (action - prob)
-        self.weights += self.lr * (action - prob) * state * reward
-
-# ========== 预测系统 V9 ==========
-class PredictionSystemV9:
+# ========== 预测系统 V9.1 ==========
+class PredictionSystemV9_1:
     def __init__(self, order: int = 4, min_ig: float = 0.45, temperature: float = 1.0,
                  use_hmm: bool = True, hmm_hidden: int = 6, hmm_reg: float = 0.25,
                  decay_factor: float = 1.0, entropy_percentile: int = 30):
@@ -527,7 +614,6 @@ class PredictionSystemV9:
         self.use_hmm = use_hmm; self.decay_factor = decay_factor
         self.entropy_percentile = entropy_percentile
         self.entropy_history: List[float] = []
-
         self.engines = {
             "color": AttributeEngineV9("color", markov_order=2 if order > 2 else order,
                                        temperature=temperature, use_hmm=use_hmm,
@@ -537,8 +623,6 @@ class PredictionSystemV9:
             "odd_even": AttributeEngineV9("odd_even", markov_order=1, temperature=temperature,
                                           use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor)
         }
-        # 强化学习模块
-        self.rl_agent = OnlineREINFORCE(input_dim=2, lr=0.02)
 
     def train_all(self, seqs, draws):
         for name, seq in seqs.items():
@@ -554,8 +638,10 @@ class PredictionSystemV9:
 
     def predict_all(self, recents, recent_draws) -> Dict[str, Any]:
         results = {}
+        sub_models = {}
         for name, engine in self.engines.items():
-            probs = engine.predict_proba(recents[name], recent_draws[name])
+            probs, sub_preds = engine.predict_proba(recents[name], recent_draws[name])
+            sub_models[name] = sub_preds
             sorted_probs = sorted(probs.items(), key=lambda x: -x[1])
             results[name] = {
                 "probs": probs,
@@ -570,38 +656,29 @@ class PredictionSystemV9:
             entropy_thr = math.log(len(ATTRIBUTE_STATES["color"])) * 0.95
         else:
             entropy_thr = np.percentile(self.entropy_history, self.entropy_percentile)
-        # 固定规则 should_act
-        should_act_fixed = (avg_max >= self.min_ig) and (color_entropy <= entropy_thr)
-        # 强化学习决策
-        state = np.array([avg_max, color_entropy])
-        rl_action_prob = self.rl_agent.predict_proba(state)
-        should_act_rl = random.random() < rl_action_prob  # 采样动作
+        should_act = (avg_max >= self.min_ig) and (color_entropy <= entropy_thr)
         self.entropy_history.append(color_entropy)
 
         results["meta"] = {
-            "should_act_fixed": should_act_fixed,
-            "should_act_rl": should_act_rl,
-            "rl_action_prob": rl_action_prob,
+            "should_act": should_act,
             "avg_max": avg_max,
             "entropy": color_entropy,
             "threshold": entropy_thr
         }
+        results["_sub_models"] = sub_models  # 内部使用，不打印
         return results
 
     def walk_forward_backtest(self, seqs, draws, test_len=150):
-        total_act_fixed = total_act_rl = 0
-        total_all = 0
-        correct_act_fixed = {n:0 for n in self.engines}
-        correct_act_rl = {n:0 for n in self.engines}
-        correct_all = {n:0 for n in self.engines}
-        # 金融指标
-        cum_return_fixed = {n:0.0 for n in self.engines}
-        cum_return_rl = {n:0.0 for n in self.engines}
-        ic_records = {n:[] for n in self.engines}
-        # 记录预测详情
-        pred_records_act_fixed = {n:[] for n in self.engines}
-        pred_records_act_rl = {n:[] for n in self.engines}
-        pred_records_all = {n:[] for n in self.engines}
+        total_act = 0; total_all = 0
+        correct_act = {n:0 for n in self.engines}; correct_all = {n:0 for n in self.engines}
+        logloss_act = {n:0.0 for n in self.engines}; logloss_all = {n:0.0 for n in self.engines}
+        uniform_logloss = {n: -math.log(1.0/len(ATTRIBUTE_STATES[n])) for n in self.engines}
+        delta_logloss_all = {n: [] for n in self.engines}  # 逐期记录
+
+        # 高级指标记录
+        pred_probs_all = {n: [] for n in self.engines}
+        actuals_all = {n: [] for n in self.engines}
+        sub_model_probs_all = {n: [] for n in self.engines}  # 用于熵分解
 
         min_len = self.order + 40
         start_idx = max(len(seqs["color"]) - test_len, min_len)
@@ -615,43 +692,28 @@ class PredictionSystemV9:
             recent_draws = {n: draws[n][idx-self.order:idx] if idx>=self.order else draws[n][:idx] for n in self.engines}
             pred = self.predict_all(recents, recent_draws)
             actuals = {n: seqs[n][idx] for n in self.engines}
+            act = pred["meta"]["should_act"]
 
-            # 固定策略动作
-            act_fixed = pred["meta"]["should_act_fixed"]
-            act_rl = pred["meta"]["should_act_rl"]
             for name in self.engines:
                 prob = pred[name]["probs"].get(actuals[name], 1e-12)
-                # 金融信号（简单用 max_prob - 1/k）
-                signal = pred[name]["max_prob"] - 1.0/len(ATTRIBUTE_STATES[name])
-                # 收益（假设下注正确得赔率-1，否则-1）
-                win = (pred[name]["best_state"] == actuals[name])
-                reward_fixed = (PAYOFF_MULTIPLIER[name]-1) if win else -1
-                if act_fixed:
-                    cum_return_fixed[name] += reward_fixed
-                    correct_act_fixed[name] += win
-                    total_act_fixed += 1
-                    pred_records_act_fixed[name].append((pred[name]["best_state"], actuals[name]))
-                if act_rl:
-                    cum_return_rl[name] += reward_fixed  # 同样奖励
-                    correct_act_rl[name] += win
-                    total_act_rl += 1
-                    pred_records_act_rl[name].append((pred[name]["best_state"], actuals[name]))
-                # 全量统计
-                cum_return_rl[name] += 0  # 不影响
-                correct_all[name] += win
-                total_all += 1
-                pred_records_all[name].append((pred[name]["best_state"], actuals[name]))
-                # IC: signal vs 实际收益的相关系数（简化：存储信号和收益标签）
-                ic_records[name].append((signal, 1 if win else -1))
+                logl = -math.log(prob)
+                logloss_all[name] += logl
+                delta = uniform_logloss[name] - logl
+                delta_logloss_all[name].append(delta)
 
-            # 强化学习更新：根据固定策略是否盈利调整（这里用固定策略盈利作为 RL 的奖励？）
-            # 我们使用 act_rl 产生的奖励更新 RL
-            state = np.array([pred["meta"]["avg_max"], pred["meta"]["entropy"]])
-            # 简单奖励：取所有属性的平均收益
-            avg_reward = np.mean([(PAYOFF_MULTIPLIER[name]-1) if (pred[name]["best_state"]==actuals[name]) else -1 for name in self.engines])
-            self.rl_agent.update(state, 1 if act_rl else 0, avg_reward)
+                if act:
+                    logloss_act[name] += logl
+                    correct_act[name] += (pred[name]["best_state"] == actuals[name])
+                correct_all[name] += (pred[name]["best_state"] == actuals[name])
+                # 记录用于ECE和熵分解
+                pred_probs_all[name].append(pred[name]["probs"])
+                actuals_all[name].append(actuals[name])
+                sub_model_probs_all[name].append(pred["_sub_models"][name])
 
-            # 增量更新模型
+            total_act += 1 if act else 0
+            total_all += 1
+
+            # 增量更新
             for name, engine in self.engines.items():
                 prev_draw = draws[name][idx-1] if idx>0 else draws[name][idx]
                 engine.partial_train(seqs[name][idx-1] if idx>0 else None, actuals[name], prev_draw, draws[name][idx])
@@ -662,68 +724,49 @@ class PredictionSystemV9:
             for name, engine in self.engines.items():
                 engine.update_weights(recents[name], recent_draws[name], actuals[name])
 
-        # 汇总指标
+        # 汇总
         def safe_div(a,b): return a/b if b>0 else 0
-        acc_fixed = {n: safe_div(correct_act_fixed[n], total_act_fixed) for n in self.engines}
-        acc_rl = {n: safe_div(correct_act_rl[n], total_act_rl) for n in self.engines}
+        acc_act = {n: safe_div(correct_act[n], total_act) for n in self.engines}
         acc_all = {n: safe_div(correct_all[n], total_all) for n in self.engines}
-        # 金融指标
-        sharpe_fixed = {n: np.mean([cum_return_fixed[n]])/(np.std([cum_return_fixed[n]])+1e-8) for n in self.engines}
-        sharpe_rl = {n: np.mean([cum_return_rl[n]])/(np.std([cum_return_rl[n]])+1e-8) for n in self.engines}
-        # 平均IC
-        ic_mean = {}
+        avg_delta_logloss = {n: np.mean(delta_logloss_all[n]) if delta_logloss_all[n] else 0 for n in self.engines}
+        # ECE
+        ece_results = {}
         for n in self.engines:
-            signals, returns = zip(*ic_records[n])
-            ic_mean[n] = np.corrcoef(signals, returns)[0,1] if len(signals)>1 else 0
+            ece, bin_conf, bin_acc = AdvancedMetrics.ece(pred_probs_all[n], actuals_all[n])
+            ece_results[n] = {"ece": ece, "bin_conf": bin_conf, "bin_acc": bin_acc}
+        # 熵分解
+        entropy_decomp = {}
+        for n in self.engines:
+            total_ent, exp_ent, mi = AdvancedMetrics.entropy_decomposition(sub_model_probs_all[n], pred_probs_all[n])
+            entropy_decomp[n] = {"total_ent": total_ent, "expected_ent": exp_ent, "mi": mi}
+        # Wilcoxon 检验 ΔLogLoss > 0
+        wilcoxon_p = {}
+        for n in self.engines:
+            if delta_logloss_all[n]:
+                _, p = wilcoxon_signed_rank_test(delta_logloss_all[n])
+                wilcoxon_p[n] = p
+            else:
+                wilcoxon_p[n] = 1.0
+        # Regime 检测 (对 ΔLogLoss 序列)
+        regime_results = {}
+        for n in self.engines:
+            dl = delta_logloss_all[n]
+            if len(dl) > 60:
+                regime_results[n] = AdvancedMetrics.regime_detection(dl, min_seg=30)
+            else:
+                regime_results[n] = {"breakpoints": [], "p_values": []}
 
         return {
-            "fixed": {"total":total_act_fixed, "acc":acc_fixed, "cum_return":cum_return_fixed, "sharpe":sharpe_fixed},
-            "rl": {"total":total_act_rl, "acc":acc_rl, "cum_return":cum_return_rl, "sharpe":sharpe_rl},
-            "all": {"total":total_all, "acc":acc_all},
-            "ic": ic_mean,
-            "pred_records_fixed": pred_records_act_fixed,
-            "pred_records_rl": pred_records_act_rl,
-            "pred_records_all": pred_records_all
+            "act": {"total": total_act, "acc": acc_act},
+            "all": {"total": total_all, "acc": acc_all},
+            "avg_delta_logloss": avg_delta_logloss,
+            "wilcoxon_p": wilcoxon_p,
+            "ece": ece_results,
+            "entropy_decomp": entropy_decomp,
+            "regime": regime_results,
+            "delta_series": delta_logloss_all,
+            "uniform_logloss": uniform_logloss
         }
-
-# ========== 条件置换检验（固定特征打乱颜色） ==========
-def conditional_permutation_test(seqs, draws, base_system, test_len=150, n_perm=100):
-    color_seq = seqs["color"]
-    # 抽取与颜色序列对应的特征索引
-    features = []
-    for i in range(len(color_seq)):
-        d = draws["color"][i]
-        fv = (get_tail(d["num"]), get_mod7(d["num"]), get_zone(d["num"]))
-        features.append(fv)
-    # 真实系统准确率
-    sys_real = copy.deepcopy(base_system)
-    res_real = sys_real.walk_forward_backtest(seqs, draws, test_len=test_len)
-    real_acc = res_real["fixed"]["acc"]["color"]
-
-    perm_accs = []
-    for _ in range(n_perm):
-        # 在每个特征组合内部打乱颜色标签
-        perm_color = color_seq.copy()
-        groups = defaultdict(list)
-        for idx, fv in enumerate(features):
-            groups[fv].append(idx)
-        for fv, indices in groups.items():
-            vals = [color_seq[i] for i in indices]
-            random.shuffle(vals)
-            for i, idx in enumerate(indices):
-                perm_color[idx] = vals[i]
-        perm_seqs = {**seqs, "color": perm_color}
-        sys_perm = PredictionSystemV9(
-            order=base_system.order, min_ig=base_system.min_ig, temperature=base_system.temperature,
-            use_hmm=base_system.use_hmm,
-            hmm_hidden=base_system.engines["color"].hmm.n_hidden if base_system.engines["color"].hmm else 6,
-            hmm_reg=base_system.engines["color"].hmm.reg_factor if base_system.engines["color"].hmm else 0.25,
-            decay_factor=base_system.decay_factor, entropy_percentile=base_system.entropy_percentile
-        )
-        res_perm = sys_perm.walk_forward_backtest(perm_seqs, draws, test_len=test_len)
-        perm_accs.append(res_perm["fixed"]["acc"]["color"])
-    p_val = sum(1 for a in perm_accs if a >= real_acc) / n_perm
-    return real_acc, perm_accs, p_val
 
 # ========== 仪表盘 ==========
 def print_dashboard(conn, lottery_name: str, args):
@@ -745,7 +788,7 @@ def print_dashboard(conn, lottery_name: str, args):
         attrs = { "色波": get_color(latest["special_number"]), "大小": get_big_small(latest["special_number"]), "单双": get_odd_even(latest["special_number"]) }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV9(
+    system = PredictionSystemV9_1(
         order=args.order, min_ig=args.min_ig, temperature=args.temp,
         use_hmm=args.use_hmm, hmm_hidden=args.hmm_hidden, hmm_reg=args.hmm_reg,
         decay_factor=args.decay, entropy_percentile=args.entropy_percentile
@@ -757,55 +800,49 @@ def print_dashboard(conn, lottery_name: str, args):
     recent_draws = {name: draws[-max(args.order,4):] for name in seqs}
     pred = system.predict_all(recents, recent_draws)
 
-    print(f"\n🔮 下一期属性预测 {lottery_name} (V9.0 Research)")
+    print(f"\n🔮 下一期属性预测 {lottery_name} (V9.1)")
     for name, data in pred.items():
-        if name == "meta": continue
+        if name in ("meta", "_sub_models"): continue
         print(f"\n{name}:")
         for s, p in sorted(data["probs"].items(), key=lambda x: -x[1]):
             marker = " ✓" if s == data["best_state"] else ""
             print(f"   {s}: {p*100:.1f}%{marker}")
-
     sorted_color = sorted(pred["color"]["probs"].items(), key=lambda x: -x[1])
     print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}")
     meta = pred["meta"]
-    print(f"\n🧠 固定规则: {'出手' if meta['should_act_fixed'] else '观望'}")
-    print(f"🤖 RL规则: {'出手' if meta['should_act_rl'] else '观望'} (概率 {meta['rl_action_prob']:.3f})")
+    print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'} (avg_max={meta['avg_max']:.3f}, entropy={meta['entropy']:.3f})")
 
     # 回测
     print(f"\n📊 在线增量 Walk-Forward 回测 (最近 {args.backtest} 期):")
     result = system.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
 
-    print("\n--- Coverage-aware 指标 ---")
-    print(f"总预测期: {result['all']['total']}, 固定出手: {result['fixed']['total']}, RL出手: {result['rl']['total']}")
+    print("\n--- 核心指标 ---")
     for name in ["color","size","odd_even"]:
-        a_f = result["fixed"]["acc"][name]*100; a_r = result["rl"]["acc"][name]*100; a_all = result["all"]["acc"][name]*100
-        print(f"{name}: 固定准确率 {a_f:.1f}% | RL准确率 {a_r:.1f}% | 全量 {a_all:.1f}%")
-    print("\n--- 金融指标 (假设赔率) ---")
-    for name in ["color","size","odd_even"]:
-        print(f"{name}: 固定累积收益 {result['fixed']['cum_return'][name]:+.2f}  Sharpe {result['fixed']['sharpe'][name]:.3f}")
-        print(f"      RL累积收益 {result['rl']['cum_return'][name]:+.2f}  Sharpe {result['rl']['sharpe'][name]:.3f}")
-    print("\n--- 信息系数 (IC) ---")
-    for name in ["color","size","odd_even"]:
-        print(f"{name}: 平均 IC = {result['ic'][name]:.4f}")
+        a_act = result["act"]["acc"][name]*100; a_all = result["all"]["acc"][name]*100
+        delta = result["avg_delta_logloss"][name]
+        p_wil = result["wilcoxon_p"][name]
+        print(f"{name}: 出手准确率 {a_act:.1f}% | 全量准确率 {a_all:.1f}% | ΔLogLoss = {delta:+.4f} (p={p_wil:.4f})")
 
-    # 条件置换检验
-    if args.perm_test and len(seqs["color"]) > 120:
-        print("\n🔄 条件置换检验 (固定特征，打乱颜色, 50次)...")
-        real_acc, perm_accs, p_val = conditional_permutation_test(seqs, draws_dict, system, test_len=args.backtest, n_perm=50)
-        print(f"   真实固定准确率: {real_acc:.3f}, 零分布均值: {np.mean(perm_accs):.3f}, p={p_val:.4f}")
+    print("\n--- 校准误差 (ECE) ---")
+    for name in ["color","size","odd_even"]:
+        ece = result["ece"][name]["ece"]
+        print(f"{name}: ECE = {ece:.4f}")
 
-    # HMM 贡献
-    if args.compare_hmm and system.use_hmm:
-        print("\n🔬 HMM 贡献检验:")
-        sys_no = PredictionSystemV9(order=args.order, min_ig=args.min_ig, temperature=args.temp,
-                                    use_hmm=False, decay_factor=args.decay, entropy_percentile=args.entropy_percentile)
-        res_no = sys_no.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
-        for name in ["color","size","odd_even"]:
-            diff = result["fixed"]["acc"][name] - res_no["fixed"]["acc"][name]
-            print(f"   {name}: ΔAcc(固定)={diff*100:+.2f}%")
+    print("\n--- 熵分解 (总熵 / 期望熵 / 互信息) ---")
+    for name in ["color","size","odd_even"]:
+        ent = result["entropy_decomp"][name]
+        print(f"{name}: Total={ent['total_ent']:.4f}  Expected={ent['expected_ent']:.4f}  MI={ent['mi']:.4f}")
+
+    print("\n--- Regime 检测 (ΔLogLoss 结构断点) ---")
+    for name in ["color","size","odd_even"]:
+        reg = result["regime"][name]
+        if reg["breakpoints"]:
+            print(f"{name}: 发现 {len(reg['breakpoints'])} 个潜在断点，位置索引: {reg['breakpoints']}")
+        else:
+            print(f"{name}: 未检测到显著断点 (序列较平稳)")
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V9.0 Research Suite")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V9.1 研究加强版")
     p.add_argument("--lottery", choices=["老澳门彩","香港彩","新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.45)
@@ -817,8 +854,6 @@ def main():
     p.add_argument("--decay", type=float, default=0.99)
     p.add_argument("--backtest", type=int, default=150)
     p.add_argument("--entropy-percentile", type=int, default=30)
-    p.add_argument("--perm-test", action="store_true")
-    p.add_argument("--compare-hmm", action="store_true")
     args = p.parse_args()
 
     for lottery in ([args.lottery] if args.lottery else ["老澳门彩","香港彩","新澳门彩"]):
