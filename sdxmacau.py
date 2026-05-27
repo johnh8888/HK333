@@ -196,7 +196,6 @@ class PlattCalibrator:
         self.A = 0.0; self.B = 0.0
 
     def fit(self, scores: np.ndarray, labels: np.ndarray):
-        # scores 是模型输出的概率或 logit，labels 是 0/1
         scores = np.clip(scores, 1e-12, 1-1e-12)
         logits = np.log(scores / (1 - scores))
         self.A = 0.0; self.B = 0.0
@@ -213,7 +212,70 @@ class PlattCalibrator:
         logits = np.log(scores / (1 - scores))
         return 1.0 / (1 + np.exp(-(self.A * logits + self.B)))
 
-# ========== 基础子模型 ==========
+# ========== StableHMM ==========
+class StableHMM:
+    def __init__(self, n_hidden=6, n_obs=3, states_list=None, reg_factor=0.25):
+        self.n_hidden = n_hidden; self.n_obs = n_obs
+        self.states_list = states_list
+        self.obs_to_idx = {s: i for i, s in enumerate(states_list)} if states_list else {}
+        self.reg_factor = reg_factor; self.eps = 1e-10
+        self.pi = np.ones(n_hidden)/n_hidden
+        self.A = np.ones((n_hidden, n_hidden))/n_hidden
+        self.B = np.ones((n_hidden, n_obs))/n_obs
+
+    def train(self, obs_seq, max_iter=50):
+        if len(obs_seq) < 40: return
+        obs_idx = np.array([self.obs_to_idx[o] for o in obs_seq])
+        T = len(obs_idx)
+        for _ in range(max_iter):
+            log_alpha = np.full((T, self.n_hidden), -np.inf)
+            log_alpha[0] = np.log(self.pi+self.eps) + np.log(self.B[:, obs_idx[0]]+self.eps)
+            for t in range(1,T):
+                tmp = log_alpha[t-1][:,None] + np.log(self.A+self.eps)
+                log_alpha[t] = np.logaddexp.reduce(tmp, axis=0) + np.log(self.B[:, obs_idx[t]]+self.eps)
+            log_beta = np.full((T, self.n_hidden), -np.inf)
+            log_beta[-1] = 0.0
+            for t in range(T-2,-1,-1):
+                tmp = np.log(self.A+self.eps) + np.log(self.B[:, obs_idx[t+1]]+self.eps) + log_beta[t+1]
+                log_beta[t] = np.logaddexp.reduce(tmp, axis=1)
+            log_gamma = log_alpha + log_beta
+            log_gamma -= np.logaddexp.reduce(log_gamma, axis=1, keepdims=True)
+            gamma = np.exp(log_gamma)
+            self.pi = gamma[0]/(np.sum(gamma[0])+self.eps)
+            xi_sum = np.zeros((self.n_hidden, self.n_hidden))
+            for t in range(T-1):
+                tmp = log_alpha[t][:,None] + np.log(self.A+self.eps) + np.log(self.B[:, obs_idx[t+1]]+self.eps) + log_beta[t+1]
+                log_xi = tmp - np.logaddexp.reduce(tmp, axis=1, keepdims=True)
+                xi_sum += np.exp(log_xi)
+            self.A = xi_sum/(np.sum(gamma[:-1], axis=0)[:,None]+self.eps)
+            uniform = np.full((self.n_hidden, self.n_hidden), 1.0/self.n_hidden)
+            self.A = (1-self.reg_factor)*self.A + self.reg_factor*uniform
+            self.A /= np.sum(self.A, axis=1, keepdims=True)+self.eps
+            self.B = np.zeros((self.n_hidden, self.n_obs))
+            for t in range(T):
+                self.B[:, obs_idx[t]] += gamma[t]
+            self.B += self.eps
+            self.B /= np.sum(self.B, axis=1, keepdims=True)+self.eps
+
+    def predict_next_probs(self, obs_seq):
+        if len(obs_seq) < 3: return {s: 1.0/len(self.states_list) for s in self.states_list}
+        obs_idx = [self.obs_to_idx[o] for o in obs_seq]
+        T = len(obs_idx)
+        log_alpha = np.full((T, self.n_hidden), -np.inf)
+        log_alpha[0] = np.log(self.pi+self.eps) + np.log(self.B[:, obs_idx[0]]+self.eps)
+        for t in range(1,T):
+            tmp = log_alpha[t-1][:,None] + np.log(self.A+self.eps)
+            log_alpha[t] = np.logaddexp.reduce(tmp, axis=0) + np.log(self.B[:, obs_idx[t]]+self.eps)
+        log_gamma = log_alpha[-1]
+        gamma = np.exp(log_gamma - np.logaddexp.reduce(log_gamma))
+        gamma /= np.sum(gamma)+self.eps
+        next_hidden = gamma @ self.A
+        next_probs = next_hidden @ self.B
+        next_probs = np.clip(next_probs, self.eps, 1.0)
+        next_probs /= np.sum(next_probs)
+        return {self.states_list[i]: float(next_probs[i]) for i in range(self.n_obs)}
+
+# ========== 子模型组件 ==========
 class FeatureConditionalModel:
     def __init__(self, states, alpha=2.0, min_count=5):
         self.states = states; self.alpha = alpha; self.min_count = min_count
@@ -222,8 +284,7 @@ class FeatureConditionalModel:
     def train(self, seq, fvs, decay=1.0):
         w = 1.0
         for s, fv in zip(reversed(seq), reversed(fvs)):
-            self.counts[fv][s] += w; self.total[fv] += w
-            w *= decay
+            self.counts[fv][s] += w; self.total[fv] += w; w *= decay
 
     def partial_fit(self, s, fv, w=1.0):
         self.counts[fv][s] += w; self.total[fv] += w
@@ -246,8 +307,7 @@ class MarkovN:
         for i in range(len(seq)-self.order-1, -1, -1):
             ctx = tuple(seq[i:i+self.order])
             nxt = seq[i+self.order]
-            self.counts[ctx][nxt] += w; self.total[ctx] += w
-            w *= decay
+            self.counts[ctx][nxt] += w; self.total[ctx] += w; w *= decay
 
     def partial_fit(self, ctx, nxt, w=1.0):
         self.counts[ctx][nxt] += w; self.total[ctx] += w
@@ -301,8 +361,7 @@ class FrequencyPrior:
         self._update()
 
     def partial_fit(self, s, w=1.0):
-        self._cnt[s] += w; self._total += w
-        self._update()
+        self._cnt[s] += w; self._total += w; self._update()
 
     def _update(self):
         if self._total > 0:
@@ -313,24 +372,36 @@ class FrequencyPrior:
     def predict(self): return self.probs.copy()
 
 class MomentumModel:
-    """简单动量：若上一期是X，则下一期继续X的概率高于均匀"""
     def __init__(self, states, alpha=2.0):
         self.states = states; self.alpha = alpha
-        self.counts = defaultdict(float); self.total = 0.0
+        self.same_count = 0.0; self.total = 0.0
 
     def train(self, seq):
         for i in range(len(seq)-1):
-            if seq[i] == seq[i+1]: self.counts["same"] += 1
+            if seq[i] == seq[i+1]: self.same_count += 1
             self.total += 1
-        self.total += self.alpha * len(self.states)
 
-    def predict(self, last_state) -> Dict[str, float]:
+    def partial_fit(self, prev_state, curr_state, weight=1.0):
+        if prev_state is not None and prev_state == curr_state:
+            self.same_count += weight
+        self.total += weight
+
+    def predict(self, last_state):
         K = len(self.states)
-        p_same = (self.counts["same"] + self.alpha) / (self.total + self.alpha * K)
+        if self.total == 0: return {s: 1.0/K for s in self.states}
+        p_same = (self.same_count + self.alpha) / (self.total + self.alpha * K)
         p_diff = 1.0 - p_same
         probs = {s: p_diff/(K-1) for s in self.states if s != last_state}
         probs[last_state] = p_same
         return probs
+
+class TemperatureScaling:
+    def __init__(self, temp=1.0): self.temp = temp
+    def calibrate(self, probs):
+        if abs(self.temp-1.0)<1e-6: return probs
+        scaled = {s: p**(1/self.temp) for s,p in probs.items()}
+        tot = sum(scaled.values())
+        return {s: p/tot for s,p in scaled.items()}
 
 class OnlineBayesianWeight:
     def __init__(self, models, lr=0.1):
@@ -350,37 +421,63 @@ class OnlineBayesianWeight:
         if tot < 1e-12: return {m: 1.0/len(self.models) for m in self.models}
         return {m: w/tot for m,w in exp_weights.items()}
 
-class TemperatureScaling:
-    def __init__(self, temp=1.0): self.temp = temp
-    def calibrate(self, probs):
-        if abs(self.temp-1.0)<1e-6: return probs
-        scaled = {s: p**(1/self.temp) for s,p in probs.items()}
-        tot = sum(scaled.values())
-        return {s: p/tot for s,p in scaled.items()}
+# ========== 增强指标 ==========
+class AdvancedMetrics:
+    @staticmethod
+    def ece(probs_list, actual_list, n_bins=10):
+        confs, accs = [], []
+        for pd, a in zip(probs_list, actual_list):
+            confs.append(pd.get(a, 0.0))
+            accs.append(1.0)
+        if not confs: return 0, [], []
+        bins = np.linspace(0, 1, n_bins+1)
+        idx = np.digitize(confs, bins[1:])
+        ece = 0.0
+        for b in range(n_bins):
+            mask = idx == b
+            n = np.sum(mask)
+            if n == 0: continue
+            avg_c = np.mean(np.array(confs)[mask])
+            avg_a = np.mean(np.array(accs)[mask])
+            ece += (n/len(confs)) * abs(avg_c - avg_a)
+        return ece, [], []
 
-# ========== 增强引擎 (多样性) ==========
+    @staticmethod
+    def entropy_decomposition(sub_probs_list, fused_list):
+        total_ent, avg_exp = 0.0, 0.0
+        n = len(fused_list)
+        if n == 0: return 0,0,0
+        for fused, subs in zip(fused_list, sub_probs_list):
+            ht = -sum(p*math.log(p+1e-12) for p in fused.values() if p>0)
+            total_ent += ht
+            exp = 0.0
+            for probs in subs.values():
+                exp += -sum(p*math.log(p+1e-12) for p in probs.values() if p>0)
+            exp /= len(subs)
+            avg_exp += exp
+        total_ent /= n; avg_exp /= n
+        mi = total_ent - avg_exp
+        return total_ent, avg_exp, mi
+
+# ========== 集成引擎 ==========
 class AttributeEngineV9_3:
     def __init__(self, name, markov_order=2, temperature=1.0, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=1.0):
         self.name = name; self.states = ATTRIBUTE_STATES[name]
         self.markov_order = markov_order; self.use_hmm = use_hmm
         self.temp_scaler = TemperatureScaling(temperature); self.decay = decay
 
-        # 基础模型
         self.markov = MarkovN(markov_order, self.states, alpha=1.2)
         self.markov2 = MarkovN(max(1, markov_order-1), self.states, alpha=1.2)  # 异阶
         self.streak = StreakBias(self.states, alpha=1.2)
         self.freq = FrequencyPrior(self.states)
         self.momentum = MomentumModel(self.states)
-        from .StableHMM import StableHMM  # 已在前面定义
         self.hmm = StableHMM(hmm_hidden, len(self.states), self.states, hmm_reg) if use_hmm else None
 
-        # 特征模型
         self.tail = FeatureConditionalModel(self.states)
         self.mod7 = FeatureConditionalModel(self.states)
         self.cross = FeatureConditionalModel(self.states)
         self.zone = FeatureConditionalModel(self.states)
 
-        # 子模型列表
         self.sub_models = ["markov","markov2","streak","freq","momentum"]
         if use_hmm: self.sub_models.append("hmm")
         self.sub_models += ["tail","mod7","cross","zone"]
@@ -389,8 +486,7 @@ class AttributeEngineV9_3:
     def train(self, seq, draws):
         d = self.decay
         self.markov.train(seq, d); self.markov2.train(seq, d)
-        self.streak.train(seq); self.freq.train(seq, d)
-        self.momentum.train(seq)
+        self.streak.train(seq); self.freq.train(seq, d); self.momentum.train(seq)
         if self.hmm and len(seq)>40: self.hmm.train(seq)
         tails = [get_tail(d["num"]) for d in draws]
         mod7s = [get_mod7(d["num"]) for d in draws]
@@ -404,7 +500,7 @@ class AttributeEngineV9_3:
 
     def partial_train(self, prev_state, curr_state, prev_draw, curr_draw, weight=1.0):
         self.freq.partial_fit(curr_state, weight)
-        self.momentum.partial_fit(prev_state, curr_state, weight)  # 需要简单实现
+        self.momentum.partial_fit(prev_state, curr_state, weight)
         tail = get_tail(curr_draw["num"]); mod7 = get_mod7(curr_draw["num"])
         zone = get_zone(curr_draw["num"]); cross = bin_cross_distance(get_cross_distance(prev_draw["num"], curr_draw["num"]))
         self.tail.partial_fit(curr_state, tail, weight); self.mod7.partial_fit(curr_state, mod7, weight)
@@ -486,35 +582,10 @@ class PredictionSystemV9_3:
                 rec = s[max(0,i-self.order):i]; rd = d[max(0,i-self.order):i]
                 eng.update_weights(rec, rd, s[i])
 
-    def fit_platt(self, seqs, draws, calib_len=50):
-        """使用最近 calib_len 期数据训练 Platt 校准器"""
-        if len(seqs["color"]) < calib_len+10: return
-        for n in self.engines:
-            scores, labels = [], []
-            for i in range(len(seqs[n])-calib_len, len(seqs[n])-1):
-                rec = seqs[n][max(0,i-self.order):i]
-                rd = draws[n][max(0,i-self.order):i]
-                probs, _ = self.engines[n].predict_proba(rec, rd)
-                actual = seqs[n][i]
-                # 使用预测状态的概率作为 score（针对真实类别的概率）
-                score = probs.get(actual, 0.0)
-                scores.append(score)
-                labels.append(1.0)  # 因为是实际发生的类别，所以我们期望校准后的概率应接近真实频率
-                # 注意：Platt Scaling 通常需要二元标签，这里我们只校准“模型对真实类别的概率”
-                # 一个更完整的做法是对每个类别分别校准，但这里简化：校准 “max_prob 对应类别” 的概率质量
-            if len(scores) > 10:
-                self.platt[n].fit(np.array(scores), np.array(labels))
-        self.platt_fitted = True
-
     def predict_all(self, recents, recent_draws):
         res, subs = {}, {}
         for n, eng in self.engines.items():
             probs, sub = eng.predict_proba(recents[n], recent_draws[n])
-            # 若已拟合 Platt，校准概率
-            if self.platt_fitted:
-                # 对每个状态的概率单独校准？暂不实现，仅对 max_prob 对应状态的概率做缩放（演示）
-                # 为保持简单，跳过完整 Platt，仅使用温度校准
-                pass
             subs[n] = sub
             sp = sorted(probs.items(), key=lambda x:-x[1])
             res[n] = {"probs":probs, "max_prob":sp[0][1], "best":sp[0][0], "second":sp[1][0] if len(sp)>1 else None,
@@ -538,7 +609,7 @@ class PredictionSystemV9_3:
     def _calc_mi(self, subs, fused):
         total_ent = -sum(p*math.log(p+1e-12) for p in fused.values() if p>0)
         exp_ent = 0.0
-        for m, probs in subs.items():
+        for probs in subs.values():
             exp_ent += -sum(p*math.log(p+1e-12) for p in probs.values() if p>0)
         exp_ent /= len(subs)
         return total_ent, exp_ent, total_ent - exp_ent
@@ -547,20 +618,17 @@ class PredictionSystemV9_3:
         res = {"act": {"total":0, "acc":{n:0 for n in self.engines}},
                "all": {"total":0, "acc":{n:0 for n in self.engines}},
                "delta_logloss": {n: [] for n in self.engines},
-               "regime_active": []  # 记录每期是否处于有利区间
-              }
+               "regime_active": []}
         uniform_loss = {n: -math.log(1.0/len(ATTRIBUTE_STATES[n])) for n in self.engines}
         ece_data = {n: {"probs":[], "actuals":[]} for n in self.engines}
         sub_probs = {n: [] for n in self.engines}; fused_probs = {n: [] for n in self.engines}
-        delta_window = {n: [] for n in self.engines}  # 滑动窗口存储
+        delta_window = {n: [] for n in self.engines}
 
         start = max(len(seqs["color"])-test_len, self.order+40)
         train_s = {n: seqs[n][:start] for n in seqs}
         train_d = {n: draws[n][:start] for n in draws}
         self.train_all(train_s, train_d)
         self.learn_weights_offline(seqs, draws, warmup=self.order+20)
-        # 在回测前用验证数据拟合Platt（可选，暂时跳过自动校准中的Platt，仅用温度）
-        # 在循环中动态调整 regime
 
         for idx in range(start, len(seqs["color"])-1):
             rec = {n: seqs[n][max(0,idx-self.order):idx] for n in self.engines}
@@ -569,18 +637,15 @@ class PredictionSystemV9_3:
             act = pred["meta"]["should_act"]
             actuals = {n: seqs[n][idx] for n in self.engines}
 
-            # Regime 择时：检查最近窗口的 delta_logloss 均值
+            # Regime 择时
             regime_ok = True
             if idx - start >= self.regime_window:
-                # 计算最近 self.regime_window 期的平均 delta（所有属性平均）
                 recent_deltas = []
                 for n in self.engines:
                     if len(delta_window[n]) >= self.regime_window:
                         recent_deltas.append(np.mean(delta_window[n][-self.regime_window:]))
                 if recent_deltas and np.mean(recent_deltas) < self.regime_min_delta:
                     regime_ok = False
-
-            # 如果 regime 不允许，则不交易（但仍记录全量指标）
             execute = act and regime_ok
 
             for n in self.engines:
@@ -608,41 +673,26 @@ class PredictionSystemV9_3:
                 if len(recent_seq)>=self.order+1:
                     ctx = tuple(recent_seq[-(self.order+1):-1])
                     eng.markov.partial_fit(ctx, recent_seq[-1])
-                    ctx2 = tuple(recent_seq[-self.engines[n].markov2.order:]) if len(recent_seq)>=self.engines[n].markov2.order else tuple()
+                    ctx2 = tuple(recent_seq[-eng.markov2.order:]) if len(recent_seq)>=eng.markov2.order else tuple()
                     if ctx2: eng.markov2.partial_fit(ctx2, recent_seq[-1])
                 eng.update_weights(rec[n], rd[n], actuals[n])
 
-        # 汇总
         def safe(a,b): return a/b if b>0 else 0.0
         r = {}
         r["act"] = {"total": res["act"]["total"], "acc": {n: safe(res["act"]["acc"][n], res["act"]["total"]) for n in self.engines}}
         r["all"] = {"total": res["all"]["total"], "acc": {n: safe(res["all"]["acc"][n], res["all"]["total"]) for n in self.engines}}
         r["avg_delta"] = {n: np.mean(res["delta_logloss"][n]) if res["delta_logloss"][n] else 0 for n in self.engines}
-        wilc = {}
-        for n in self.engines:
-            if res["delta_logloss"][n]:
-                _, p = wilcoxon_signed_rank_test(res["delta_logloss"][n])
-                wilc[n] = p
-            else: wilc[n]=1.0
+        wilc = {n: wilcoxon_signed_rank_test(res["delta_logloss"][n])[1] if res["delta_logloss"][n] else 1.0 for n in self.engines}
         r["wilcoxon_p"] = wilc
-        # ECE
-        ece_res = {}
-        for n in self.engines:
-            ece, _, _ = AdvancedMetrics.ece(ece_data[n]["probs"], ece_data[n]["actuals"])
-            ece_res[n] = ece
-        r["ece"] = ece_res
-        # 熵分解
-        ent = {}
-        for n in self.engines:
-            te, ee, mi = AdvancedMetrics.entropy_decomposition(sub_probs[n], fused_probs[n])
-            ent[n] = {"total":te, "exp":ee, "mi":mi}
-        r["entropy_decomp"] = ent
-        # Regime 统计
+        ece_r = {n: AdvancedMetrics.ece(ece_data[n]["probs"], ece_data[n]["actuals"])[0] for n in self.engines}
+        r["ece"] = ece_r
+        ent = {n: AdvancedMetrics.entropy_decomposition(sub_probs[n], fused_probs[n]) for n in self.engines}
+        r["entropy_decomp"] = {n: {"total":ent[n][0], "exp":ent[n][1], "mi":ent[n][2]} for n in self.engines}
         active_periods = sum(res["regime_active"])
         r["regime_coverage"] = active_periods / len(res["regime_active"]) if res["regime_active"] else 0
         return r
 
-# ========== 仪表盘 (聚焦香港彩波色) ==========
+# ========== 仪表盘 ==========
 def print_dashboard(conn, lottery_name, args):
     seqs = {"color": load_sequence(conn, get_color, 500), "size": load_sequence(conn, get_big_small, 500), "odd_even": load_sequence(conn, get_odd_even, 500)}
     draws = load_full_draws(conn, 500)
@@ -650,18 +700,14 @@ def print_dashboard(conn, lottery_name, args):
     if len(seqs["color"])<100:
         print("数据不足"); return
 
-    # 自动温度搜索
     if args.auto_temp:
         print("🔧 自动搜索最佳温度 (基于波色 ECE)...")
-        best_temp = 1.0
-        best_ece = float('inf')
+        best_temp, best_ece = 1.0, float('inf')
         for temp in [0.6,0.8,1.0,1.2,1.5]:
-            sys_tmp = PredictionSystemV9_3(order=args.order, temperature=temp, use_hmm=args.use_hmm, hmm_hidden=args.hmm_hidden, hmm_reg=args.hmm_reg, decay=args.decay, mi_threshold=0.15, regime_window=30, regime_min_delta=0.02)
+            sys_tmp = PredictionSystemV9_3(order=args.order, temperature=temp, use_hmm=args.use_hmm, hmm_hidden=args.hmm_hidden, hmm_reg=args.hmm_reg, decay=args.decay, mi_threshold=0.15, regime_window=args.regime_window, regime_min_delta=args.regime_min_delta)
             result = sys_tmp.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
             ece = result["ece"]["color"]
-            if ece < best_ece:
-                best_ece = ece
-                best_temp = temp
+            if ece < best_ece: best_ece, best_temp = ece, temp
         use_temp = best_temp
         print(f"   最佳温度: {use_temp}, ECE={best_ece:.4f}")
     else:
@@ -706,12 +752,11 @@ def print_dashboard(conn, lottery_name, args):
         e = result["entropy_decomp"][n]
         print(f"{n}: Total={e['total']:.4f} Exp={e['exp']:.4f} MI={e['mi']:.4f}")
 
-    # 若为香港彩，单独输出聚焦建议
     if lottery_name == "香港彩":
         print("\n🔍 香港彩波色聚焦分析:")
-        hk_color_delta = result["avg_delta"]["color"]
-        hk_color_p = result["wilcoxon_p"]["color"]
-        if hk_color_delta > 0.02 and hk_color_p < 0.05:
+        hk_c_delta = result["avg_delta"]["color"]
+        hk_c_p = result["wilcoxon_p"]["color"]
+        if hk_c_delta > 0.02 and hk_c_p < 0.05:
             print("   ✅ 信号显著且正向，建议在 regime 允许时轻仓下注。")
         else:
             print("   ⚠️ 信号未达稳健标准，继续观察。")
