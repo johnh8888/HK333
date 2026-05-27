@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-三彩种属性预测 V9.1 研究加强版 (无 scipy 依赖)
-新增功能：
-1. ΔLogLoss 显著性检验 (Wilcoxon signed-rank)
-2. 期望校准误差 (ECE) + 可靠性图数据
-3. 预测熵分解 (总熵、期望熵、互信息)
-4. Regime 检测 (滚动窗口 ΔLogLoss 断点检验)
+三彩种属性预测 V9.2 (自动校准 + 智能 Regime + MI 过滤)
 """
 
 from __future__ import annotations
 
-import argparse, json, sqlite3, math, ssl, sys, time, random, copy, statistics
+import argparse, json, sqlite3, math, ssl, sys, time, random, copy
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -36,7 +31,7 @@ ATTRIBUTE_STATES = {
     "size": ["大", "小"],
     "odd_even": ["单", "双"]
 }
-PAYOFF_MULTIPLIER = {"color": 2.0, "size": 1.95, "odd_even": 1.95}  # 假设赔率
+PAYOFF_MULTIPLIER = {"color": 2.0, "size": 1.95, "odd_even": 1.95}
 
 # ========== 属性映射 ==========
 def get_color(num: int) -> str:
@@ -173,7 +168,7 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
     rows = conn.execute("SELECT special_number, draw_date FROM draws ORDER BY issue_no ASC LIMIT ?", (limit,)).fetchall()
     return [{"num": r["special_number"], "date": r["draw_date"]} for r in rows]
 
-# ========== 统计工具函数 (纯 Python 实现) ==========
+# ========== 统计工具函数 ==========
 def binomial_p_value(k: int, n: int, p0: float) -> float:
     from math import comb
     if k <= 0: return 1.0
@@ -183,18 +178,11 @@ def binomial_p_value(k: int, n: int, p0: float) -> float:
     return total
 
 def wilcoxon_signed_rank_test(diffs: List[float]) -> Tuple[float, float]:
-    """
-    对配对的差值做 Wilcoxon signed-rank 检验 (双尾)
-    返回统计量 T 和 p-value (近似正态)
-    """
     diffs = [d for d in diffs if d != 0]
     n = len(diffs)
-    if n < 5:
-        return 0, 1.0
+    if n < 5: return 0, 1.0
     abs_diffs = [abs(d) for d in diffs]
-    # 计算秩（简单处理并列：平均秩）
-    order = np.argsort(np.argsort(abs_diffs)) + 1  # 无并列时正确，有并列时近似
-    ranks = order
+    ranks = np.argsort(np.argsort(abs_diffs)) + 1
     W_plus = sum(r for d, r in zip(diffs, ranks) if d > 0)
     W_minus = sum(r for d, r in zip(diffs, ranks) if d < 0)
     T = min(W_plus, W_minus)
@@ -202,40 +190,30 @@ def wilcoxon_signed_rank_test(diffs: List[float]) -> Tuple[float, float]:
     sigma = math.sqrt(n*(n+1)*(2*n+1)/24)
     if sigma == 0: return T, 1.0
     z = (T - mu) / sigma
-    # 双尾 p 值近似（标准正态 CDF）
     from math import erf
     p = 2 * (1 - 0.5 * (1 + erf(abs(z)/math.sqrt(2))))
     return T, p
 
 def mann_whitney_u(x: List[float], y: List[float]) -> Tuple[float, float]:
-    """
-    纯 Python 实现 Mann-Whitney U 检验 (双尾，正态近似)
-    返回 U 统计量和 p-value
-    """
-    n1 = len(x); n2 = len(y)
-    if n1 == 0 or n2 == 0:
-        return 0, 1.0
-    # 合并排序，计算秩
+    n1, n2 = len(x), len(y)
+    if n1 == 0 or n2 == 0: return 0, 1.0
     combined = np.concatenate([x, y])
-    ranks = np.argsort(np.argsort(combined)) + 1  # 简易秩（忽略并列精细处理）
+    ranks = np.argsort(np.argsort(combined)) + 1
     rank_x = np.sum(ranks[:n1])
-    # U 统计量
     U1 = n1*n2 + n1*(n1+1)/2 - rank_x
     U2 = n1*n2 - U1
     U = min(U1, U2)
-    # 正态近似参数
     mu = n1*n2/2
     sigma = math.sqrt(n1*n2*(n1+n2+1)/12)
     if sigma == 0: return U, 1.0
     z = (U - mu) / sigma
-    # 双尾 p 值
     from math import erf
     p = 2 * (1 - 0.5 * (1 + erf(abs(z)/math.sqrt(2))))
     return U, p
 
 # ========== StableHMM ==========
 class StableHMM:
-    def __init__(self, n_hidden: int = 6, n_obs: int = 3, states_list: List[str] = None, reg_factor: float = 0.25):
+    def __init__(self, n_hidden: int = 6, n_obs: int = 3, states_list=None, reg_factor: float = 0.25):
         self.n_hidden = n_hidden; self.n_obs = n_obs
         self.states_list = states_list
         self.obs_to_idx = {s: i for i, s in enumerate(states_list)} if states_list else {}
@@ -245,7 +223,7 @@ class StableHMM:
         self.A = np.ones((n_hidden, n_hidden)) / n_hidden
         self.B = np.ones((n_hidden, n_obs)) / n_obs
 
-    def train(self, obs_seq: List[str], max_iter: int = 70):
+    def train(self, obs_seq: List[str], max_iter: int = 50):
         if len(obs_seq) < 40: return
         obs_idx = np.array([self.obs_to_idx[o] for o in obs_seq])
         T = len(obs_idx)
@@ -303,124 +281,124 @@ class FeatureConditionalModel:
         self.states = states; self.alpha = alpha; self.min_count = min_count
         self.counts = defaultdict(lambda: defaultdict(float)); self.total = defaultdict(float)
 
-    def train(self, seq: List[str], feature_values: List[Any], decay_factor: float = 1.0):
+    def train(self, seq, feature_values, decay_factor=1.0):
         weight = 1.0
         for s, fv in zip(reversed(seq), reversed(feature_values)):
             self.counts[fv][s] += weight
             self.total[fv] += weight
             weight *= decay_factor
 
-    def partial_fit(self, state: str, feature_value: Any, weight: float = 1.0):
+    def partial_fit(self, state, feature_value, weight=1.0):
         self.counts[feature_value][state] += weight
         self.total[feature_value] += weight
 
-    def predict(self, fv: Any) -> Dict[str, float]:
+    def predict(self, fv):
         K = len(self.states)
         total = self.total.get(fv, 0.0)
         if total < self.min_count: return {s: 1.0/K for s in self.states}
         probs = {s: (self.counts[fv].get(s,0.0)+self.alpha)/(total+self.alpha*K) for s in self.states}
-        sum_p = sum(probs.values())
-        return {s: p/sum_p for s, p in probs.items()} if sum_p > 0 else {s: 1.0/K for s in self.states}
+        s = sum(probs.values())
+        return {k: v/s for k,v in probs.items()} if s > 0 else {k: 1.0/K for k in self.states}
 
 class MarkovN:
-    def __init__(self, order: int, states: List[str], alpha: float = 1.2):
+    def __init__(self, order, states, alpha=1.2):
         self.order = order; self.states = states; self.alpha = alpha
         self.counts = defaultdict(Counter); self.total = defaultdict(int)
 
-    def train(self, seq: List[str], decay_factor: float = 1.0):
+    def train(self, seq, decay_factor=1.0):
         weight = 1.0
         for i in range(len(seq)-self.order-1, -1, -1):
-            state = tuple(seq[i:i+self.order])
+            ctx = tuple(seq[i:i+self.order])
             nxt = seq[i+self.order]
-            self.counts[state][nxt] += weight
-            self.total[state] += weight
+            self.counts[ctx][nxt] += weight
+            self.total[ctx] += weight
             weight *= decay_factor
 
-    def partial_fit(self, context: Tuple[str], nxt: str, weight: float = 1.0):
-        self.counts[context][nxt] += weight
-        self.total[context] += weight
+    def partial_fit(self, ctx, nxt, weight=1.0):
+        self.counts[ctx][nxt] += weight
+        self.total[ctx] += weight
 
-    def predict(self, context: Tuple[str]) -> Dict[str, float]:
+    def predict(self, ctx):
         K = len(self.states)
-        total = self.total.get(context, 0)
-        probs = {s: (self.counts[context].get(s,0)+self.alpha)/(total+self.alpha*K) for s in self.states}
-        sum_p = sum(probs.values())
-        return {s: p/sum_p for s, p in probs.items()} if sum_p > 0 else {s: 1.0/K for s in self.states}
+        total = self.total.get(ctx, 0)
+        probs = {s: (self.counts[ctx].get(s,0)+self.alpha)/(total+self.alpha*K) for s in self.states}
+        s = sum(probs.values())
+        return {k: v/s for k,v in probs.items()} if s > 0 else {k: 1.0/K for k in self.states}
 
 class StreakBias:
-    def __init__(self, states: List[str], alpha: float = 1.2):
+    def __init__(self, states, alpha=1.2):
         self.states = states; self.alpha = alpha
         self.streak_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-        self._current_state = None; self._streak_len = 0
+        self.cur = None; self.cur_len = 0
 
-    def train(self, seq: List[str]):
+    def train(self, seq):
         i = 0
         while i < len(seq):
             j = i
             while j < len(seq) and seq[j] == seq[i]: j += 1
-            length = j - i; state = seq[i]
-            if j < len(seq): self.streak_counts[state][length][seq[j]] += 1.0
+            if j < len(seq):
+                self.streak_counts[seq[i]][j-i][seq[j]] += 1.0
             i = j
 
-    def partial_update(self, new_state: str):
-        if self._current_state is None:
-            self._current_state = new_state; self._streak_len = 1; return
-        if new_state == self._current_state:
-            self._streak_len += 1
+    def partial_update(self, new_state):
+        if self.cur is None:
+            self.cur = new_state; self.cur_len = 1; return
+        if new_state == self.cur:
+            self.cur_len += 1
         else:
-            self.streak_counts[self._current_state][self._streak_len][new_state] += 1.0
-            self._current_state = new_state; self._streak_len = 1
+            self.streak_counts[self.cur][self.cur_len][new_state] += 1.0
+            self.cur = new_state; self.cur_len = 1
 
-    def predict(self, last: str, streak_len: int) -> Dict[str, float]:
+    def predict(self, last, streak_len):
         K = len(self.states)
         total = sum(self.streak_counts[last][streak_len].values())
         probs = {s: (self.streak_counts[last][streak_len].get(s,0)+self.alpha)/(total+self.alpha*K) for s in self.states}
-        sum_p = sum(probs.values())
-        return {s: p/sum_p for s, p in probs.items()} if sum_p > 0 else {s: 1.0/K for s in self.states}
+        s = sum(probs.values())
+        return {k: v/s for k,v in probs.items()} if s > 0 else {k: 1.0/K for k in self.states}
 
 class FrequencyPrior:
-    def __init__(self, states: List[str]):
+    def __init__(self, states):
         self.states = states; self.probs = {s: 1.0/len(states) for s in states}
         self._cnt = defaultdict(float); self._total = 0.0
 
-    def train(self, seq: List[str], decay_factor: float = 1.0):
+    def train(self, seq, decay_factor=1.0):
         if not seq: return
         weights = np.power(decay_factor, np.arange(len(seq)-1, -1, -1))
         for s, w in zip(reversed(seq), weights):
             self._cnt[s] += w; self._total += w
-        self._update_probs()
+        self._update()
 
-    def partial_fit(self, state: str, weight: float = 1.0):
+    def partial_fit(self, state, weight=1.0):
         self._cnt[state] += weight; self._total += weight
-        self._update_probs()
+        self._update()
 
-    def _update_probs(self):
+    def _update(self):
         if self._total > 0:
             self.probs = {s: self._cnt[s]/self._total for s in self.states}
-            sum_p = sum(self.probs.values())
-            self.probs = {s: p/sum_p for s, p in self.probs.items()}
+            s = sum(self.probs.values())
+            self.probs = {k: v/s for k,v in self.probs.items()}
 
-    def predict(self) -> Dict[str, float]: return self.probs.copy()
+    def predict(self): return self.probs.copy()
 
 class TemperatureScaling:
-    def __init__(self, temperature: float = 1.0): self.temperature = temperature
-    def calibrate(self, probs: Dict[str, float]) -> Dict[str, float]:
+    def __init__(self, temperature=1.0): self.temperature = temperature
+    def calibrate(self, probs):
         if abs(self.temperature - 1.0) < 1e-6: return probs
         scaled = {s: p ** (1/self.temperature) for s, p in probs.items()}
         total = sum(scaled.values())
         return {s: p/total for s, p in scaled.items()}
 
 class OnlineBayesianWeight:
-    def __init__(self, models: List[str], learning_rate: float = 0.1):
+    def __init__(self, models, learning_rate=0.1):
         self.models = models; self.eta = learning_rate
         self.cum_loss = {m: 0.0 for m in models}
 
-    def update(self, model_probs: Dict[str, Dict[str, float]], actual: str):
+    def update(self, model_probs, actual):
         for m, probs in model_probs.items():
             p = probs.get(actual, 1e-12)
             self.cum_loss[m] += -math.log(p)
 
-    def get_weights(self) -> Dict[str, float]:
+    def get_weights(self):
         losses = {m: self.cum_loss[m] for m in self.models}
         min_loss = min(losses.values())
         exp_weights = {m: math.exp(-self.eta * (losses[m] - min_loss)) for m in self.models}
@@ -428,88 +406,74 @@ class OnlineBayesianWeight:
         if total < 1e-12: return {m: 1.0/len(self.models) for m in self.models}
         return {m: exp_weights[m]/total for m in self.models}
 
-# ========== 增强指标计算类 ==========
+# ========== 增强指标 ==========
 class AdvancedMetrics:
     @staticmethod
-    def ece(probs_list: List[Dict[str, float]], actual_list: List[str], n_bins: int = 10) -> Tuple[float, List[float], List[float]]:
-        confidences = []
-        accuracies = []
-        for prob_dict, actual in zip(probs_list, actual_list):
-            if actual in prob_dict:
-                confidences.append(prob_dict[actual])
-                accuracies.append(1.0)
-            else:
-                confidences.append(0.0)
-                accuracies.append(0.0)
-        if not confidences:
-            return 0.0, [], []
-        bin_boundaries = np.linspace(0, 1, n_bins + 1)
-        bin_indices = np.digitize(confidences, bin_boundaries[1:])
-        ece_total = 0.0
-        bin_conf = []
-        bin_acc = []
+    def ece(probs_list, actual_list, n_bins=10):
+        confs, accs = [], []
+        for pd, a in zip(probs_list, actual_list):
+            confs.append(pd.get(a, 0.0))
+            accs.append(1.0)
+        if not confs: return 0, [], []
+        bins = np.linspace(0, 1, n_bins+1)
+        idx = np.digitize(confs, bins[1:])
+        ece = 0.0
+        bin_conf, bin_acc = [], []
         for b in range(n_bins):
-            mask = bin_indices == b
-            if np.sum(mask) == 0:
-                bin_conf.append(0); bin_acc.append(0)
-                continue
-            avg_conf = np.mean(np.array(confidences)[mask])
-            avg_acc = np.mean(np.array(accuracies)[mask])
-            bin_conf.append(avg_conf)
-            bin_acc.append(avg_acc)
-            ece_total += (np.sum(mask) / len(confidences)) * abs(avg_conf - avg_acc)
-        return ece_total, bin_conf, bin_acc
+            mask = idx == b
+            n = np.sum(mask)
+            if n == 0: bin_conf.append(0); bin_acc.append(0); continue
+            avg_c = np.mean(np.array(confs)[mask])
+            avg_a = np.mean(np.array(accs)[mask])
+            bin_conf.append(avg_c); bin_acc.append(avg_a)
+            ece += (n/len(confs)) * abs(avg_c - avg_a)
+        return ece, bin_conf, bin_acc
 
     @staticmethod
-    def entropy_decomposition(sub_model_probs_list: List[Dict[str, Dict[str, float]]],
-                              fused_probs_list: List[Dict[str, float]]) -> Tuple[float, float, float]:
-        total_ent = 0.0
-        avg_expected_ent = 0.0
-        n = len(fused_probs_list)
+    def entropy_decomposition(sub_probs_list, fused_list):
+        total_ent, avg_exp = 0.0, 0.0
+        n = len(fused_list)
         if n == 0: return 0,0,0
-        for fused, sub_dict in zip(fused_probs_list, sub_model_probs_list):
-            h_total = -sum(p * math.log(p+1e-12) for p in fused.values() if p > 0)
-            total_ent += h_total
-            expected_ent = 0.0
-            for m, probs in sub_dict.items():
-                h_sub = -sum(p * math.log(p+1e-12) for p in probs.values() if p > 0)
-                expected_ent += h_sub
-            expected_ent /= len(sub_dict)
-            avg_expected_ent += expected_ent
-        total_ent /= n
-        avg_expected_ent /= n
-        mi = total_ent - avg_expected_ent
-        return total_ent, avg_expected_ent, mi
+        for fused, subs in zip(fused_list, sub_probs_list):
+            ht = -sum(p*math.log(p+1e-12) for p in fused.values() if p>0)
+            total_ent += ht
+            exp = 0.0
+            for m, probs in subs.items():
+                exp += -sum(p*math.log(p+1e-12) for p in probs.values() if p>0)
+            exp /= len(subs)
+            avg_exp += exp
+        total_ent /= n; avg_exp /= n
+        mi = total_ent - avg_exp
+        return total_ent, avg_exp, mi
 
     @staticmethod
-    def rolling_window_delta_logloss(logloss_diffs: List[float], window: int = 30, step: int = 10) -> List[float]:
-        if len(logloss_diffs) < window: return []
-        seq = []
-        for i in range(0, len(logloss_diffs)-window+1, step):
-            seq.append(np.mean(logloss_diffs[i:i+window]))
-        return seq
+    def merge_breakpoints(breakpoints, min_gap=3):
+        """合并间隔小于min_gap的断点，返回区间列表"""
+        if not breakpoints: return []
+        breakpoints = sorted(breakpoints)
+        merged = [[breakpoints[0], breakpoints[0]]]
+        for bp in breakpoints[1:]:
+            if bp - merged[-1][1] <= min_gap:
+                merged[-1][1] = bp
+            else:
+                merged.append([bp, bp])
+        return merged
 
     @staticmethod
-    def regime_detection(series: List[float], min_seg: int = 30) -> Dict:
+    def regime_detection(series, min_seg=30, min_gap=3):
         n = len(series)
-        if n < 2 * min_seg:
-            return {"breakpoints": [], "p_values": []}
-        breakpoints = []
-        pvals = []
+        if n < 2*min_seg: return {"breakpoints": [], "regimes": []}
+        bps = []
         for t in range(min_seg, n - min_seg):
-            before = series[:t]
-            after = series[t:]
-            u, p = mann_whitney_u(before, after)
-            if p < 0.05:
-                breakpoints.append(t)
-                pvals.append(p)
-        return {"breakpoints": breakpoints, "p_values": pvals}
+            before, after = series[:t], series[t:]
+            _, p = mann_whitney_u(before, after)
+            if p < 0.05: bps.append(t)
+        regimes = AdvancedMetrics.merge_breakpoints(bps, min_gap)
+        return {"breakpoints": bps, "regimes": regimes}
 
 # ========== 集成引擎 ==========
 class AttributeEngineV9:
-    def __init__(self, name: str, markov_order: int = 2, temperature: float = 1.0,
-                 use_hmm: bool = True, hmm_hidden: int = 6, hmm_reg: float = 0.25,
-                 decay_factor: float = 1.0):
+    def __init__(self, name, markov_order=2, temperature=1.0, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay_factor=1.0):
         self.name = name; self.states = ATTRIBUTE_STATES[name]
         self.markov_order = markov_order; self.use_hmm = use_hmm
         self.temp_scaler = TemperatureScaling(temperature); self.decay_factor = decay_factor
@@ -517,353 +481,307 @@ class AttributeEngineV9:
         self.markov = MarkovN(markov_order, self.states, alpha=1.2)
         self.streak = StreakBias(self.states, alpha=1.2)
         self.freq = FrequencyPrior(self.states)
-        self.hmm = StableHMM(n_hidden=hmm_hidden, n_obs=len(self.states),
-                             states_list=self.states, reg_factor=hmm_reg) if use_hmm else None
-        self.tail_model = FeatureConditionalModel(self.states)
-        self.mod7_model = FeatureConditionalModel(self.states)
-        self.cross_model = FeatureConditionalModel(self.states)
-        self.zone_model = FeatureConditionalModel(self.states)
+        self.hmm = StableHMM(hmm_hidden, len(self.states), self.states, hmm_reg) if use_hmm else None
+        self.tail = FeatureConditionalModel(self.states)
+        self.mod7 = FeatureConditionalModel(self.states)
+        self.cross = FeatureConditionalModel(self.states)
+        self.zone = FeatureConditionalModel(self.states)
 
-        self.submodel_names = ["markov", "streak", "freq"]
-        if use_hmm: self.submodel_names.append("hmm")
-        self.submodel_names += ["tail", "mod7", "cross", "zone"]
-        self.weight_learner = OnlineBayesianWeight(self.submodel_names, learning_rate=0.1)
+        self.sub_models = ["markov","streak","freq"]
+        if use_hmm: self.sub_models.append("hmm")
+        self.sub_models += ["tail","mod7","cross","zone"]
+        self.weight_learner = OnlineBayesianWeight(self.sub_models, learning_rate=0.1)
 
-    def train(self, seq: List[str], draws: List[Dict]):
+    def train(self, seq, draws):
         d = self.decay_factor
-        self.markov.train(seq, decay_factor=d)
-        self.streak.train(seq)
-        self.freq.train(seq, decay_factor=d)
-        if self.hmm and len(seq) > 40: self.hmm.train(seq)
-
+        self.markov.train(seq, d); self.streak.train(seq); self.freq.train(seq, d)
+        if self.hmm and len(seq)>40: self.hmm.train(seq)
         tails = [get_tail(d["num"]) for d in draws]
         mod7s = [get_mod7(d["num"]) for d in draws]
         zones = [get_zone(d["num"]) for d in draws]
         cross_bins = []
         for i in range(len(draws)):
-            if i > 0:
-                dist = get_cross_distance(draws[i-1]["num"], draws[i]["num"])
-                cross_bins.append(bin_cross_distance(dist))
+            if i>0:
+                cross_bins.append(bin_cross_distance(get_cross_distance(draws[i-1]["num"], draws[i]["num"])))
             else: cross_bins.append(0)
+        self.tail.train(seq, tails, d); self.mod7.train(seq, mod7s, d)
+        self.zone.train(seq, zones, d); self.cross.train(seq, cross_bins, d)
 
-        self.tail_model.train(seq, tails, decay_factor=d)
-        self.mod7_model.train(seq, mod7s, decay_factor=d)
-        self.zone_model.train(seq, zones, decay_factor=d)
-        self.cross_model.train(seq, cross_bins, decay_factor=d)
-
-    def partial_train(self, prev_state: str, curr_state: str, prev_draw: Dict, curr_draw: Dict, weight: float = 1.0):
+    def partial_train(self, prev_state, curr_state, prev_draw, curr_draw, weight=1.0):
         self.freq.partial_fit(curr_state, weight)
         tail = get_tail(curr_draw["num"]); mod7 = get_mod7(curr_draw["num"])
         zone = get_zone(curr_draw["num"]); cross = bin_cross_distance(get_cross_distance(prev_draw["num"], curr_draw["num"]))
-        self.tail_model.partial_fit(curr_state, tail, weight)
-        self.mod7_model.partial_fit(curr_state, mod7, weight)
-        self.zone_model.partial_fit(curr_state, zone, weight)
-        self.cross_model.partial_fit(curr_state, cross, weight)
+        self.tail.partial_fit(curr_state, tail, weight); self.mod7.partial_fit(curr_state, mod7, weight)
+        self.zone.partial_fit(curr_state, zone, weight); self.cross.partial_fit(curr_state, cross, weight)
         self.streak.partial_update(curr_state)
 
-    def _submodel_preds(self, recent_seq: List[str], recent_draws: List[Dict]) -> Dict[str, Dict[str, float]]:
+    def _sub_preds(self, recent_seq, recent_draws):
         preds = {}
-        context = tuple(recent_seq[-self.markov_order:]) if len(recent_seq) >= self.markov_order else tuple()
-        preds["markov"] = self.markov.predict(context) if context else {s: 1.0/len(self.states) for s in self.states}
-        streak_probs = {s: 1.0/len(self.states) for s in self.states}
+        ctx = tuple(recent_seq[-self.markov_order:]) if len(recent_seq)>=self.markov_order else tuple()
+        preds["markov"] = self.markov.predict(ctx) if ctx else {s:1.0/len(self.states) for s in self.states}
         if recent_seq:
-            last = recent_seq[-1]
-            streak_len = 1
-            for i in range(len(recent_seq)-2, -1, -1):
-                if recent_seq[i] == last: streak_len += 1
+            last = recent_seq[-1]; streak_len = 1
+            for i in range(len(recent_seq)-2,-1,-1):
+                if recent_seq[i]==last: streak_len+=1
                 else: break
-            streak_probs = self.streak.predict(last, streak_len)
-        preds["streak"] = streak_probs
+            preds["streak"] = self.streak.predict(last, streak_len)
+        else: preds["streak"] = {s:1.0/len(self.states) for s in self.states}
         preds["freq"] = self.freq.predict()
-        if self.hmm and len(recent_seq) >= 3:
-            preds["hmm"] = self.hmm.predict_next_probs(recent_seq)
-        elif self.use_hmm:
-            preds["hmm"] = {s: 1.0/len(self.states) for s in self.states}
-
+        if self.hmm and len(recent_seq)>=3: preds["hmm"] = self.hmm.predict_next_probs(recent_seq)
+        elif self.use_hmm: preds["hmm"] = {s:1.0/len(self.states) for s in self.states}
         if recent_draws:
-            prev = recent_draws[-2] if len(recent_draws) >= 2 else None
+            prev = recent_draws[-2] if len(recent_draws)>=2 else None
             curr = recent_draws[-1]
-            preds["tail"] = self.tail_model.predict(get_tail(curr["num"]))
-            preds["mod7"] = self.mod7_model.predict(get_mod7(curr["num"]))
-            preds["zone"] = self.zone_model.predict(get_zone(curr["num"]))
-            cross_val = bin_cross_distance(get_cross_distance(prev["num"], curr["num"]) if prev else 0)
-            preds["cross"] = self.cross_model.predict(cross_val)
+            preds["tail"] = self.tail.predict(get_tail(curr["num"]))
+            preds["mod7"] = self.mod7.predict(get_mod7(curr["num"]))
+            preds["zone"] = self.zone.predict(get_zone(curr["num"]))
+            preds["cross"] = self.cross.predict(bin_cross_distance(get_cross_distance(prev["num"], curr["num"]) if prev else 0))
         else:
-            for feat in ["tail", "mod7", "cross", "zone"]:
-                preds[feat] = {s: 1.0/len(self.states) for s in self.states}
+            for f in ["tail","mod7","cross","zone"]: preds[f] = {s:1.0/len(self.states) for s in self.states}
         return preds
 
-    def predict_proba(self, recent_seq: List[str], recent_draws: List[Dict]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
-        sub_preds = self._submodel_preds(recent_seq, recent_draws)
-        weights = self.weight_learner.get_weights()
-        fused = {s: 0.0 for s in self.states}
-        for m in self.submodel_names:
-            w = weights.get(m, 0.0)
-            for s in self.states:
-                fused[s] += w * sub_preds[m].get(s, 1.0/len(self.states))
-        total = sum(fused.values()) or 1.0
-        fused = {s: p/total for s, p in fused.items()}
-        fused_cal = self.temp_scaler.calibrate(fused)
-        return fused_cal, sub_preds
+    def predict_proba(self, recent_seq, recent_draws):
+        sub = self._sub_preds(recent_seq, recent_draws)
+        w = self.weight_learner.get_weights()
+        fused = {s:0.0 for s in self.states}
+        for m in self.sub_models:
+            for s in self.states: fused[s] += w.get(m,0) * sub[m].get(s, 1.0/len(self.states))
+        s = sum(fused.values()) or 1.0
+        fused = {k: v/s for k,v in fused.items()}
+        return self.temp_scaler.calibrate(fused), sub
 
-    def update_weights(self, recent_seq: List[str], recent_draws: List[Dict], actual_state: str):
-        sub_preds = self._submodel_preds(recent_seq, recent_draws)
-        self.weight_learner.update(sub_preds, actual_state)
+    def update_weights(self, recent_seq, recent_draws, actual):
+        sub = self._sub_preds(recent_seq, recent_draws)
+        self.weight_learner.update(sub, actual)
 
-# ========== 预测系统 V9.1 ==========
-class PredictionSystemV9_1:
-    def __init__(self, order: int = 4, min_ig: float = 0.45, temperature: float = 1.0,
-                 use_hmm: bool = True, hmm_hidden: int = 6, hmm_reg: float = 0.25,
-                 decay_factor: float = 1.0, entropy_percentile: int = 30):
-        self.order = order; self.min_ig = min_ig; self.temperature = temperature
-        self.use_hmm = use_hmm; self.decay_factor = decay_factor
-        self.entropy_percentile = entropy_percentile
+# ========== 预测系统 V9.2 ==========
+class PredictionSystemV9_2:
+    def __init__(self, order=4, min_ig=0.45, temperature=1.0, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=1.0, entropy_pct=30, mi_threshold=0.2):
+        self.order = order; self.min_ig = min_ig; self.temp = temperature
+        self.use_hmm = use_hmm; self.decay = decay; self.entropy_pct = entropy_pct
+        self.mi_threshold = mi_threshold
         self.entropy_history: List[float] = []
         self.engines = {
-            "color": AttributeEngineV9("color", markov_order=2 if order > 2 else order,
-                                       temperature=temperature, use_hmm=use_hmm,
-                                       hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor),
-            "size": AttributeEngineV9("size", markov_order=2, temperature=temperature,
-                                      use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor),
-            "odd_even": AttributeEngineV9("odd_even", markov_order=1, temperature=temperature,
-                                          use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor)
+            "color": AttributeEngineV9("color", markov_order=2 if order>2 else order, temperature=temperature, use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay),
+            "size": AttributeEngineV9("size", markov_order=2, temperature=temperature, use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay),
+            "odd_even": AttributeEngineV9("odd_even", markov_order=1, temperature=temperature, use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay)
         }
 
     def train_all(self, seqs, draws):
-        for name, seq in seqs.items():
-            self.engines[name].train(seq, draws[name])
+        for n, s in seqs.items(): self.engines[n].train(s, draws[n])
 
     def learn_weights_offline(self, seqs, draws, warmup=50):
-        for name, engine in self.engines.items():
-            seq = seqs[name]; draw_list = draws[name]
-            for i in range(warmup, len(seq)-1):
-                rec_seq = seq[i-self.order:i] if i >= self.order else seq[:i]
-                rec_draws = draw_list[i-self.order:i] if i >= self.order else draw_list[:i]
-                engine.update_weights(rec_seq, rec_draws, seq[i])
+        for n, eng in self.engines.items():
+            s, d = seqs[n], draws[n]
+            for i in range(warmup, len(s)-1):
+                rec = s[max(0,i-self.order):i]; rd = d[max(0,i-self.order):i]
+                eng.update_weights(rec, rd, s[i])
 
-    def predict_all(self, recents, recent_draws) -> Dict[str, Any]:
-        results = {}
-        sub_models = {}
-        for name, engine in self.engines.items():
-            probs, sub_preds = engine.predict_proba(recents[name], recent_draws[name])
-            sub_models[name] = sub_preds
-            sorted_probs = sorted(probs.items(), key=lambda x: -x[1])
-            results[name] = {
-                "probs": probs,
-                "max_prob": sorted_probs[0][1],
-                "best_state": sorted_probs[0][0],
-                "second_state": sorted_probs[1][0] if len(sorted_probs)>=2 else None,
-                "entropy": -sum(p*math.log(p+1e-12) for p in probs.values())
-            }
-        avg_max = np.mean([results[n]["max_prob"] for n in self.engines])
-        color_entropy = results["color"]["entropy"]
-        if len(self.entropy_history) < 20:
-            entropy_thr = math.log(len(ATTRIBUTE_STATES["color"])) * 0.95
+    def predict_all(self, recents, recent_draws):
+        res, subs, ents = {}, {}, {}
+        for n, eng in self.engines.items():
+            probs, sub = eng.predict_proba(recents[n], recent_draws[n])
+            subs[n] = sub
+            sp = sorted(probs.items(), key=lambda x:-x[1])
+            res[n] = {"probs":probs,"max_prob":sp[0][1],"best":sp[0][0],"second":sp[1][0] if len(sp)>1 else None,
+                      "entropy": -sum(p*math.log(p+1e-12) for p in probs.values())}
+        avg_max = np.mean([res[n]["max_prob"] for n in self.engines])
+        color_ent = res["color"]["entropy"]
+        if len(self.entropy_history)<20:
+            thresh = math.log(len(ATTRIBUTE_STATES["color"]))*0.95
         else:
-            entropy_thr = np.percentile(self.entropy_history, self.entropy_percentile)
-        should_act = (avg_max >= self.min_ig) and (color_entropy <= entropy_thr)
-        self.entropy_history.append(color_entropy)
-
-        results["meta"] = {
-            "should_act": should_act,
-            "avg_max": avg_max,
-            "entropy": color_entropy,
-            "threshold": entropy_thr
-        }
-        results["_sub_models"] = sub_models
-        return results
+            thresh = np.percentile(self.entropy_history, self.entropy_pct)
+        # 计算互信息过滤
+        total_ent, exp_ent, mi = AdvancedMetrics.entropy_decomposition(
+            [{n: subs[n]} for n in self.engines],  # 简化：只计算每个属性的整体
+            [{n: res[n]["probs"]} for n in self.engines]
+        )
+        # 如果任意属性的MI过高，提高阈值
+        mi_override = any(AdvancedMetrics.entropy_decomposition([subs[n]], [res[n]["probs"]])[2] > self.mi_threshold for n in self.engines)
+        final_ig = self.min_ig + (0.1 if mi_override else 0.0)
+        should_act = (avg_max >= final_ig) and (color_ent <= thresh)
+        self.entropy_history.append(color_ent)
+        res["meta"] = {"should_act":should_act,"avg_max":avg_max,"entropy":color_ent,"thresh":thresh,"mi_override":mi_override}
+        res["_sub"] = subs
+        return res
 
     def walk_forward_backtest(self, seqs, draws, test_len=150):
-        total_act = 0; total_all = 0
-        correct_act = {n:0 for n in self.engines}; correct_all = {n:0 for n in self.engines}
-        logloss_act = {n:0.0 for n in self.engines}; logloss_all = {n:0.0 for n in self.engines}
-        uniform_logloss = {n: -math.log(1.0/len(ATTRIBUTE_STATES[n])) for n in self.engines}
-        delta_logloss_all = {n: [] for n in self.engines}
-
-        pred_probs_all = {n: [] for n in self.engines}
-        actuals_all = {n: [] for n in self.engines}
-        sub_model_probs_all = {n: [] for n in self.engines}
-
-        min_len = self.order + 40
-        start_idx = max(len(seqs["color"]) - test_len, min_len)
-        train_seqs = {n: seqs[n][:start_idx] for n in seqs}
-        train_draws = {n: draws[n][:start_idx] for n in draws}
-        self.train_all(train_seqs, train_draws)
-        self.learn_weights_offline(seqs, draws, warmup=min_len)
-
-        for idx in range(start_idx, len(seqs["color"]) - 1):
-            recents = {n: seqs[n][idx-self.order:idx] if idx>=self.order else seqs[n][:idx] for n in self.engines}
-            recent_draws = {n: draws[n][idx-self.order:idx] if idx>=self.order else draws[n][:idx] for n in self.engines}
-            pred = self.predict_all(recents, recent_draws)
-            actuals = {n: seqs[n][idx] for n in self.engines}
+        res = {"act": {"total":0, "acc":{n:0 for n in self.engines}},
+               "all": {"total":0, "acc":{n:0 for n in self.engines}},
+               "delta_logloss": {n: [] for n in self.engines},
+               "uniform_logloss": {n: -math.log(1.0/len(ATTRIBUTE_STATES[n])) for n in self.engines},
+               "ece_data": {n: {"probs":[], "actuals":[]} for n in self.engines},
+               "sub_probs": {n: [] for n in self.engines},
+               "fused_probs": {n: [] for n in self.engines}}
+        start = max(len(seqs["color"])-test_len, self.order+40)
+        train_s = {n: seqs[n][:start] for n in seqs}
+        train_d = {n: draws[n][:start] for n in draws}
+        self.train_all(train_s, train_d)
+        self.learn_weights_offline(seqs, draws, warmup=self.order+20)
+        for idx in range(start, len(seqs["color"])-1):
+            rec = {n: seqs[n][max(0,idx-self.order):idx] for n in self.engines}
+            rd = {n: draws[n][max(0,idx-self.order):idx] for n in self.engines}
+            pred = self.predict_all(rec, rd)
             act = pred["meta"]["should_act"]
-
-            for name in self.engines:
-                prob = pred[name]["probs"].get(actuals[name], 1e-12)
-                logl = -math.log(prob)
-                logloss_all[name] += logl
-                delta = uniform_logloss[name] - logl
-                delta_logloss_all[name].append(delta)
-
+            actuals = {n: seqs[n][idx] for n in self.engines}
+            for n in self.engines:
+                prob = pred[n]["probs"].get(actuals[n], 1e-12)
+                delta = res["uniform_logloss"][n] - (-math.log(prob))
+                res["delta_logloss"][n].append(delta)
                 if act:
-                    logloss_act[name] += logl
-                    correct_act[name] += (pred[name]["best_state"] == actuals[name])
-                correct_all[name] += (pred[name]["best_state"] == actuals[name])
-                pred_probs_all[name].append(pred[name]["probs"])
-                actuals_all[name].append(actuals[name])
-                sub_model_probs_all[name].append(pred["_sub_models"][name])
-
-            total_act += 1 if act else 0
-            total_all += 1
-
+                    res["act"]["acc"][n] += (pred[n]["best"] == actuals[n])
+                res["all"]["acc"][n] += (pred[n]["best"] == actuals[n])
+                res["ece_data"][n]["probs"].append(pred[n]["probs"])
+                res["ece_data"][n]["actuals"].append(actuals[n])
+                res["sub_probs"][n].append(pred["_sub"][n])
+                res["fused_probs"][n].append(pred[n]["probs"])
+            res["act"]["total"] += 1 if act else 0
+            res["all"]["total"] += 1
             # 增量更新
-            for name, engine in self.engines.items():
-                prev_draw = draws[name][idx-1] if idx>0 else draws[name][idx]
-                engine.partial_train(seqs[name][idx-1] if idx>0 else None, actuals[name], prev_draw, draws[name][idx])
-                recent_seq = seqs[name][max(0, idx-self.order):idx+1]
-                if len(recent_seq) >= self.order+1:
+            for n, eng in self.engines.items():
+                pd = draws[n][idx-1] if idx>0 else draws[n][idx]
+                eng.partial_train(seqs[n][idx-1] if idx>0 else None, actuals[n], pd, draws[n][idx])
+                recent_seq = seqs[n][max(0,idx-self.order):idx+1]
+                if len(recent_seq)>=self.order+1:
                     ctx = tuple(recent_seq[-(self.order+1):-1])
-                    engine.markov.partial_fit(ctx, recent_seq[-1])
-            for name, engine in self.engines.items():
-                engine.update_weights(recents[name], recent_draws[name], actuals[name])
+                    eng.markov.partial_fit(ctx, recent_seq[-1])
+                eng.update_weights(rec[n], rd[n], actuals[n])
+        # 汇总
+        def safe(a,b): return a/b if b>0 else 0.0
+        r = {}
+        r["act"] = {"total": res["act"]["total"], "acc": {n: safe(res["act"]["acc"][n], res["act"]["total"]) for n in self.engines}}
+        r["all"] = {"total": res["all"]["total"], "acc": {n: safe(res["all"]["acc"][n], res["all"]["total"]) for n in self.engines}}
+        r["avg_delta"] = {n: np.mean(res["delta_logloss"][n]) if res["delta_logloss"][n] else 0.0 for n in self.engines}
+        wilcox_p = {}
+        for n in self.engines:
+            if res["delta_logloss"][n]:
+                _, p = wilcoxon_signed_rank_test(res["delta_logloss"][n])
+                wilcox_p[n] = p
+            else: wilcox_p[n]=1.0
+        r["wilcoxon_p"] = wilcox_p
+        ece = {}
+        for n in self.engines:
+            ece_val, _, _ = AdvancedMetrics.ece(res["ece_data"][n]["probs"], res["ece_data"][n]["actuals"])
+            ece[n] = ece_val
+        r["ece"] = ece
+        ent = {}
+        for n in self.engines:
+            te, ee, mi = AdvancedMetrics.entropy_decomposition(res["sub_probs"][n], res["fused_probs"][n])
+            ent[n] = {"total": te, "exp": ee, "mi": mi}
+        r["entropy_decomp"] = ent
+        reg = {}
+        for n in self.engines:
+            dl = res["delta_logloss"][n]
+            if len(dl) > 60: reg[n] = AdvancedMetrics.regime_detection(dl, min_seg=30)
+            else: reg[n] = {"breakpoints":[], "regimes":[]}
+        r["regime"] = reg
+        return r
 
-        def safe_div(a,b): return a/b if b>0 else 0
-        acc_act = {n: safe_div(correct_act[n], total_act) for n in self.engines}
-        acc_all = {n: safe_div(correct_all[n], total_all) for n in self.engines}
-        avg_delta_logloss = {n: np.mean(delta_logloss_all[n]) if delta_logloss_all[n] else 0 for n in self.engines}
-        ece_results = {}
-        for n in self.engines:
-            ece, bin_conf, bin_acc = AdvancedMetrics.ece(pred_probs_all[n], actuals_all[n])
-            ece_results[n] = {"ece": ece, "bin_conf": bin_conf, "bin_acc": bin_acc}
-        entropy_decomp = {}
-        for n in self.engines:
-            total_ent, exp_ent, mi = AdvancedMetrics.entropy_decomposition(sub_model_probs_all[n], pred_probs_all[n])
-            entropy_decomp[n] = {"total_ent": total_ent, "expected_ent": exp_ent, "mi": mi}
-        wilcoxon_p = {}
-        for n in self.engines:
-            if delta_logloss_all[n]:
-                _, p = wilcoxon_signed_rank_test(delta_logloss_all[n])
-                wilcoxon_p[n] = p
-            else:
-                wilcoxon_p[n] = 1.0
-        regime_results = {}
-        for n in self.engines:
-            dl = delta_logloss_all[n]
-            if len(dl) > 60:
-                regime_results[n] = AdvancedMetrics.regime_detection(dl, min_seg=30)
-            else:
-                regime_results[n] = {"breakpoints": [], "p_values": []}
-
-        return {
-            "act": {"total": total_act, "acc": acc_act},
-            "all": {"total": total_all, "acc": acc_all},
-            "avg_delta_logloss": avg_delta_logloss,
-            "wilcoxon_p": wilcoxon_p,
-            "ece": ece_results,
-            "entropy_decomp": entropy_decomp,
-            "regime": regime_results,
-            "delta_series": delta_logloss_all,
-            "uniform_logloss": uniform_logloss
-        }
+# ========== 自动温度搜索 ==========
+def tune_temperature(seqs, draws, backtest_len=150, order=4):
+    best_temps = {}
+    for name in ["color","size","odd_even"]:
+        best_ece = float('inf')
+        best_temp = 1.0
+        for temp in [0.6,0.8,1.0,1.2,1.5]:
+            sys = PredictionSystemV9_2(order=order, temperature=temp, use_hmm=True, hmm_hidden=6, hmm_reg=0.25, decay=0.99, mi_threshold=0.2)
+            result = sys.walk_forward_backtest(seqs, draws, test_len=backtest_len)
+            ece = result["ece"][name]
+            if ece < best_ece:
+                best_ece = ece
+                best_temp = temp
+        best_temps[name] = best_temp
+    return best_temps
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, lottery_name: str, args):
-    seqs = {
-        "color": load_sequence(conn, get_color, limit=500),
-        "size": load_sequence(conn, get_big_small, limit=500),
-        "odd_even": load_sequence(conn, get_odd_even, limit=500)
-    }
-    draws = load_full_draws(conn, limit=500)
-    draws_dict = {"color": draws, "size": draws, "odd_even": draws}
+def print_dashboard(conn, lottery_name, args):
+    seqs = {"color": load_sequence(conn, get_color, 500), "size": load_sequence(conn, get_big_small, 500), "odd_even": load_sequence(conn, get_odd_even, 500)}
+    draws = load_full_draws(conn, 500)
+    draws_dict = {k: draws for k in seqs}
+    if len(seqs["color"])<100:
+        print("数据不足"); return
 
-    if len(seqs["color"]) < 100:
-        print("历史数据不足，请先同步数据。"); return
+    # 自动温度调优（如果开启）
+    if args.auto_temp:
+        print("🔧 自动搜索最佳温度...")
+        temps = tune_temperature(seqs, draws_dict, args.backtest, args.order)
+        print(f"   最佳温度: {temps}")
+        # 使用调优后的温度（取color的作为全局）
+        use_temp = temps["color"]
+    else:
+        use_temp = args.temp
 
-    latest = conn.execute("SELECT * FROM draws ORDER BY issue_no DESC LIMIT 1").fetchone()
-    if latest:
-        nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
-        print(f"最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
-        attrs = { "色波": get_color(latest["special_number"]), "大小": get_big_small(latest["special_number"]), "单双": get_odd_even(latest["special_number"]) }
-        print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
-
-    system = PredictionSystemV9_1(
-        order=args.order, min_ig=args.min_ig, temperature=args.temp,
-        use_hmm=args.use_hmm, hmm_hidden=args.hmm_hidden, hmm_reg=args.hmm_reg,
-        decay_factor=args.decay, entropy_percentile=args.entropy_percentile
-    )
+    system = PredictionSystemV9_2(order=args.order, min_ig=args.min_ig, temperature=use_temp,
+                                  use_hmm=args.use_hmm, hmm_hidden=args.hmm_hidden, hmm_reg=args.hmm_reg,
+                                  decay=args.decay, entropy_pct=args.entropy_pct, mi_threshold=0.15)
     system.train_all(seqs, draws_dict)
     system.learn_weights_offline(seqs, draws_dict, warmup=50)
 
-    recents = {name: seqs[name][-max(args.order,4):] for name in seqs}
-    recent_draws = {name: draws[-max(args.order,4):] for name in seqs}
-    pred = system.predict_all(recents, recent_draws)
+    recents = {n: seqs[n][-max(args.order,4):] for n in seqs}
+    rd = {n: draws[-max(args.order,4):] for n in seqs}
+    pred = system.predict_all(recents, rd)
 
-    print(f"\n🔮 下一期属性预测 {lottery_name} (V9.1)")
-    for name, data in pred.items():
-        if name in ("meta", "_sub_models"): continue
+    print(f"\n🔮 下一期预测 {lottery_name} (V9.2)")
+    for name in ["color","size","odd_even"]:
+        d = pred[name]
         print(f"\n{name}:")
-        for s, p in sorted(data["probs"].items(), key=lambda x: -x[1]):
-            marker = " ✓" if s == data["best_state"] else ""
-            print(f"   {s}: {p*100:.1f}%{marker}")
-    sorted_color = sorted(pred["color"]["probs"].items(), key=lambda x: -x[1])
-    print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}")
+        for s,p in sorted(d["probs"].items(), key=lambda x:-x[1]):
+            mark = " ✓" if s==d["best"] else ""
+            print(f"   {s}: {p*100:.1f}%{mark}")
+    sorted_c = sorted(pred["color"]["probs"].items(), key=lambda x:-x[1])
+    print(f"\n🎯 推荐波色: {sorted_c[0][0]} + {sorted_c[1][0]}")
     meta = pred["meta"]
-    print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'} (avg_max={meta['avg_max']:.3f}, entropy={meta['entropy']:.3f})")
+    print(f"\n🧠 决策: {'出手' if meta['should_act'] else '观望'} (avg_max={meta['avg_max']:.3f}, entropy={meta['entropy']:.3f}, MI过滤={meta['mi_override']})")
 
-    print(f"\n📊 在线增量 Walk-Forward 回测 (最近 {args.backtest} 期):")
+    print(f"\n📊 回测 (最近 {args.backtest} 期):")
     result = system.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
-
     print("\n--- 核心指标 ---")
-    for name in ["color","size","odd_even"]:
-        a_act = result["act"]["acc"][name]*100; a_all = result["all"]["acc"][name]*100
-        delta = result["avg_delta_logloss"][name]
-        p_wil = result["wilcoxon_p"][name]
-        print(f"{name}: 出手准确率 {a_act:.1f}% | 全量准确率 {a_all:.1f}% | ΔLogLoss = {delta:+.4f} (p={p_wil:.4f})")
-
-    print("\n--- 校准误差 (ECE) ---")
-    for name in ["color","size","odd_even"]:
-        ece = result["ece"][name]["ece"]
-        print(f"{name}: ECE = {ece:.4f}")
-
-    print("\n--- 熵分解 (总熵 / 期望熵 / 互信息) ---")
-    for name in ["color","size","odd_even"]:
-        ent = result["entropy_decomp"][name]
-        print(f"{name}: Total={ent['total_ent']:.4f}  Expected={ent['expected_ent']:.4f}  MI={ent['mi']:.4f}")
-
-    print("\n--- Regime 检测 (ΔLogLoss 结构断点) ---")
-    for name in ["color","size","odd_even"]:
-        reg = result["regime"][name]
-        if reg["breakpoints"]:
-            print(f"{name}: 发现 {len(reg['breakpoints'])} 个潜在断点，位置索引: {reg['breakpoints']}")
+    for n in ["color","size","odd_even"]:
+        a_act = result["act"]["acc"][n]*100; a_all = result["all"]["acc"][n]*100
+        delta = result["avg_delta"][n]; p = result["wilcoxon_p"][n]
+        print(f"{n}: 出手 {a_act:.1f}% | 全量 {a_all:.1f}% | ΔLogLoss={delta:+.4f} (p={p:.4f})")
+    print("\n--- 校准误差 ---")
+    for n in ["color","size","odd_even"]:
+        print(f"{n}: ECE = {result['ece'][n]:.4f}")
+    print("\n--- 熵分解 ---")
+    for n in ["color","size","odd_even"]:
+        e = result["entropy_decomp"][n]
+        print(f"{n}: Total={e['total']:.4f} Exp={e['exp']:.4f} MI={e['mi']:.4f}")
+    print("\n--- 稳定区间 (Regime) ---")
+    for n in ["color","size","odd_even"]:
+        reg = result["regime"][n]
+        if reg["regimes"]:
+            print(f"{n}: 区间: {reg['regimes']}")
         else:
-            print(f"{name}: 未检测到显著断点 (序列较平稳)")
+            print(f"{n}: 无显著区间")
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V9.1 研究加强版 (无 scipy)")
+    p = argparse.ArgumentParser(description="V9.2 改进版")
     p.add_argument("--lottery", choices=["老澳门彩","香港彩","新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.45)
     p.add_argument("--temp", type=float, default=0.85)
+    p.add_argument("--auto-temp", action="store_true", help="自动搜索最佳温度")
     p.add_argument("--use-hmm", action="store_true", default=True)
     p.add_argument("--no-hmm", dest="use_hmm", action="store_false")
     p.add_argument("--hmm-hidden", type=int, default=6)
     p.add_argument("--hmm-reg", type=float, default=0.25)
     p.add_argument("--decay", type=float, default=0.99)
     p.add_argument("--backtest", type=int, default=150)
-    p.add_argument("--entropy-percentile", type=int, default=30)
+    p.add_argument("--entropy-pct", type=int, default=30)
     args = p.parse_args()
 
-    for lottery in ([args.lottery] if args.lottery else ["老澳门彩","香港彩","新澳门彩"]):
-        db_path = str(SCRIPT_DIR / DB_FILES[lottery])
-        conn = connect_db(db_path)
+    for lot in ([args.lottery] if args.lottery else ["老澳门彩","香港彩","新澳门彩"]):
+        db = str(SCRIPT_DIR / DB_FILES[lot])
+        conn = connect_db(db)
         try:
             init_db(conn)
-            records, source, url = fetch_online_records(lottery)
-            total, ins, upd = sync_from_records(conn, records, source)
-            print(f"{lottery} 同步: {total} 条 (新增{ins}, 更新{upd})")
-            print_dashboard(conn, lottery, args)
+            recs, src, url = fetch_online_records(lot)
+            t, i, u = sync_from_records(conn, recs, src)
+            print(f"{lot} 同步: {t} 条 (新增{i}, 更新{u})")
+            print_dashboard(conn, lot, args)
         except Exception as e:
-            print(f"错误 {lottery}: {e}")
+            print(f"错误 {lot}: {e}")
         finally:
             conn.close()
 
