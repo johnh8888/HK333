@@ -11,43 +11,40 @@ import ssl
 from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 # ============================================================
-# 基础配置
+# 数据源
 # ============================================================
-
-LOTTERIES = {
-    "老澳门彩": {
-        "db": "old_macau.db",
-    },
-    "香港彩": {
-        "db": "hk_macau.db",
-    },
-    "新澳门彩": {
-        "db": "xin_macau.db",
-    },
-}
 
 API_URL = "https://marksix6.net/index.php?api=1"
 
-RED = {
-    1, 2, 7, 8, 12, 13, 18, 19, 23, 24,
-    29, 30, 34, 35, 40, 45, 46
-}
-
-BLUE = {
-    3, 4, 9, 10, 14, 15, 20, 25, 26,
-    31, 36, 37, 41, 42, 47, 48
-}
-
-GREEN = {
-    5, 6, 11, 16, 17, 21, 22, 27, 28,
-    32, 33, 38, 39, 43, 44, 49
+DB_CONFIG = {
+    "老澳门彩": "old_macau.db",
+    "香港彩": "hk_macau.db",
+    "新澳门彩": "xin_macau.db",
 }
 
 # ============================================================
-# 工具函数
+# 波色
+# ============================================================
+
+RED = {
+    1, 2, 7, 8, 12, 13, 18, 19,
+    23, 24, 29, 30, 34, 35, 40, 45, 46
+}
+
+BLUE = {
+    3, 4, 9, 10, 14, 15, 20, 25,
+    26, 31, 36, 37, 41, 42, 47, 48
+}
+
+GREEN = {
+    5, 6, 11, 16, 17, 21, 22, 27,
+    28, 32, 33, 38, 39, 43, 44, 49
+}
+
+# ============================================================
+# 工具
 # ============================================================
 
 def get_color(n):
@@ -61,30 +58,7 @@ def get_size(n):
     return "大" if n >= 25 else "小"
 
 def get_odd_even(n):
-    return "双" if n % 2 == 0 else "单"
-
-def fetch_json(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    req = Request(url, headers=headers)
-
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    try:
-        with urlopen(req, timeout=20, context=ctx) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except HTTPError as e:
-        print(f"[ERROR] HTTP错误: {e.code}")
-    except URLError as e:
-        print(f"[ERROR] 网络错误: {e}")
-    except Exception as e:
-        print(f"[ERROR] 获取失败: {e}")
-
-    return None
+    return "单" if n % 2 else "双"
 
 # ============================================================
 # 数据库
@@ -92,18 +66,43 @@ def fetch_json(url):
 
 def init_db(conn):
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS marksix (
+    CREATE TABLE IF NOT EXISTS lottery (
         period TEXT PRIMARY KEY,
         tm INTEGER
     )
     """)
     conn.commit()
 
-def sync_data(conn):
-    data = fetch_json(API_URL)
+# ============================================================
+# 获取数据
+# ============================================================
 
-    if not data:
-        print("[WARN] API 获取失败，继续使用本地数据库")
+def fetch_json(url):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+
+    with urlopen(req, context=ctx, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+# ============================================================
+# 同步数据
+# ============================================================
+
+def sync_data(conn):
+    try:
+        data = fetch_json(API_URL)
+    except Exception as e:
+        print(f"[ERROR] 获取数据失败: {e}")
+        return
+
+    if not isinstance(data, list):
+        print("[ERROR] API返回不是列表")
         return
 
     added = 0
@@ -111,11 +110,14 @@ def sync_data(conn):
 
     for row in data:
 
-        period = str(row.get("expect", ""))
+        if not isinstance(row, dict):
+            continue
 
-        opencode = row.get("opencode", "")
+        period = str(row.get("expect", "")).strip()
 
-        if "+" not in opencode:
+        opencode = str(row.get("opencode", "")).strip()
+
+        if not period or "+" not in opencode:
             continue
 
         try:
@@ -124,19 +126,21 @@ def sync_data(conn):
             continue
 
         cur = conn.execute(
-            "SELECT tm FROM marksix WHERE period=?",
+            "SELECT tm FROM lottery WHERE period=?",
             (period,)
-        ).fetchone()
+        )
 
-        if cur is None:
+        old = cur.fetchone()
+
+        if old is None:
             conn.execute(
-                "INSERT INTO marksix(period, tm) VALUES(?, ?)",
+                "INSERT INTO lottery VALUES (?, ?)",
                 (period, tm)
             )
             added += 1
         else:
             conn.execute(
-                "UPDATE marksix SET tm=? WHERE period=?",
+                "UPDATE lottery SET tm=? WHERE period=?",
                 (tm, period)
             )
             updated += 1
@@ -144,7 +148,7 @@ def sync_data(conn):
     conn.commit()
 
     total = conn.execute(
-        "SELECT COUNT(*) FROM marksix"
+        "SELECT COUNT(*) FROM lottery"
     ).fetchone()[0]
 
     print(
@@ -152,26 +156,28 @@ def sync_data(conn):
     )
 
 # ============================================================
-# 获取特码序列
+# 获取特码
 # ============================================================
 
 def load_tms(conn):
-
     rows = conn.execute("""
     SELECT tm
-    FROM marksix
+    FROM lottery
     ORDER BY period
     """).fetchall()
 
-    return [x[0] for x in rows]
+    return [r[0] for r in rows]
 
 # ============================================================
-# 时间衰减 Markov
+# 马尔可夫预测
 # ============================================================
 
-def build_markov(seq, order=2):
+def build_model(seq, order=2):
 
     table = defaultdict(Counter)
+
+    if len(seq) <= order:
+        return table
 
     for i in range(order, len(seq)):
 
@@ -181,27 +187,26 @@ def build_markov(seq, order=2):
 
         age = len(seq) - i
 
+        # 时间衰减
         weight = math.exp(-age / 80)
 
         table[state][nxt] += weight
 
     return table
 
-def predict_next(seq, mapper, labels, order=2):
+def predict_next(seq, categories, order=2):
 
     if len(seq) <= order:
-        return None
+        return {}
 
-    mapped = [mapper(x) for x in seq]
+    model = build_model(seq, order)
 
-    table = build_markov(mapped, order)
+    state = tuple(seq[-order:])
 
-    state = tuple(mapped[-order:])
-
-    counts = table.get(state)
+    counts = model.get(state)
 
     if not counts:
-        return None
+        return {}
 
     total = sum(counts.values())
 
@@ -210,81 +215,52 @@ def predict_next(seq, mapper, labels, order=2):
     for k, v in counts.items():
         probs[k] = v / total
 
-    for label in labels:
-        probs.setdefault(label, 0.0)
-
-    return sorted(
-        probs.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
+    return probs
 
 # ============================================================
 # 回测
 # ============================================================
 
-def backtest(seq, mapper, labels, order=2, backtest=30):
+def backtest(seq, order=2, n=30):
 
-    if len(seq) < order + backtest + 1:
-        return 0.0, 0.0
-
-    mapped = [mapper(x) for x in seq]
+    if len(seq) < order + n + 5:
+        return 0.0
 
     correct = 0
-    brier_total = 0
     total = 0
 
-    for i in range(order, len(mapped)-1):
+    for i in range(order + 20, len(seq)-1):
 
-        if i < len(mapped) - backtest:
+        train = seq[:i]
+
+        probs = predict_next(
+            train,
+            list(set(seq)),
+            order
+        )
+
+        if not probs:
             continue
-
-        train = mapped[:i]
-
-        target = mapped[i]
-
-        table = build_markov(train, order)
-
-        state = tuple(train[-order:])
-
-        counts = table.get(state)
-
-        if not counts:
-            continue
-
-        s = sum(counts.values())
-
-        probs = {}
-
-        for k, v in counts.items():
-            probs[k] = v / s
 
         pred = max(probs.items(), key=lambda x: x[1])[0]
 
-        if pred == target:
+        actual = seq[i]
+
+        if pred == actual:
             correct += 1
-
-        brier = 0
-
-        for lab in labels:
-            p = probs.get(lab, 0)
-            y = 1 if lab == target else 0
-            brier += (p - y) ** 2
-
-        brier_total += brier
 
         total += 1
 
     if total == 0:
-        return 0.0, 0.0
+        return 0.0
 
-    return correct / total, brier_total / total
+    return correct / total
 
 # ============================================================
-# 展示预测
+# 显示预测
 # ============================================================
 
-def show_prediction(name, conn, order, backtest_n):
+def show_prediction(conn, name, order, backtest_n):
 
     print()
     print("=" * 60)
@@ -300,73 +276,79 @@ def show_prediction(name, conn, order, backtest_n):
     latest = tms[-1]
 
     print(f"最新特码: {latest}")
-    print()
+
+    color_seq = [get_color(x) for x in tms]
+    size_seq = [get_size(x) for x in tms]
+    odd_seq = [get_odd_even(x) for x in tms]
 
     attrs = {
-        "color": (
-            get_color,
-            ["红", "蓝", "绿"]
-        ),
-        "size": (
-            get_size,
-            ["大", "小"]
-        ),
-        "odd_even": (
-            get_odd_even,
-            ["单", "双"]
-        )
+        "color": color_seq,
+        "size": size_seq,
+        "odd_even": odd_seq,
     }
 
+    print()
     print("========== 下一期预测 ==========")
 
-    avg_acc = []
+    avg_conf = []
 
-    for key, (mapper, labels) in attrs.items():
+    for key, seq in attrs.items():
 
-        print()
-        print(f"{key}:")
-
-        pred = predict_next(
-            tms,
-            mapper,
-            labels,
+        probs = predict_next(
+            seq,
+            list(set(seq)),
             order
         )
 
-        if pred:
+        if not probs:
+            continue
 
-            for i, (k, v) in enumerate(pred):
+        print()
+        print(key)
 
-                flag = " ✓" if i == 0 else ""
-
-                print(f"   {k}: {v*100:.1f}%{flag}")
-
-        acc, brier = backtest(
-            tms,
-            mapper,
-            labels,
-            order,
-            backtest_n
+        sorted_probs = sorted(
+            probs.items(),
+            key=lambda x: x[1],
+            reverse=True
         )
 
-        avg_acc.append(acc)
+        best = sorted_probs[0][0]
 
-        print(
-            f"   回测准确率: {acc*100:.1f}%"
-            f"  Brier: {brier:.4f}"
-        )
+        avg_conf.append(sorted_probs[0][1])
 
-    avg = sum(avg_acc) / len(avg_acc)
+        for k, v in sorted_probs:
+
+            flag = "✓" if k == best else ""
+
+            print(f"{k}: {v:.2%} {flag}")
 
     print()
     print("========== 元决策 ==========")
 
-    if avg >= 0.55:
-        print("建议: 出手")
+    if avg_conf:
+        avg = sum(avg_conf) / len(avg_conf)
     else:
-        print("建议: 观望")
+        avg = 0
 
-    print(f"平均准确率: {avg*100:.1f}%")
+    decision = "出手" if avg >= 0.55 else "观望"
+
+    print(f"建议: {decision}")
+    print(f"平均置信度: {avg:.3f}")
+
+    print()
+    print("========== 回测结果 ==========")
+
+    for key, seq in attrs.items():
+
+        acc = backtest(
+            seq,
+            order,
+            backtest_n
+        )
+
+        print(
+            f"{key} | 准确率={acc:.3f}"
+        )
 
 # ============================================================
 # 主程序
@@ -390,24 +372,22 @@ def main():
 
     args = parser.parse_args()
 
-    for name, cfg in LOTTERIES.items():
+    for name, db_file in DB_CONFIG.items():
 
         print()
         print("=" * 60)
         print(f"处理彩种: {name}")
         print("=" * 60)
 
-        db_path = Path(cfg["db"])
-
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_file)
 
         init_db(conn)
 
         sync_data(conn)
 
         show_prediction(
-            name,
             conn,
+            name,
             args.order,
             args.backtest
         )
