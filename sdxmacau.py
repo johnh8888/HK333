@@ -65,13 +65,12 @@ def get_mod7(num: int) -> int:
 def get_cross_distance(prev: int, cur: int) -> int:
     return abs(prev - cur)
 
-# ========== 特征分桶 ==========
 def bin_cross_distance(dist: int) -> int:
     if dist <= 4: return 0
     if dist <= 9: return 1
     if dist <= 14: return 2
     if dist <= 19: return 3
-    return 4  # 20+
+    return 4
 
 # ========== 数据层 ==========
 @dataclass
@@ -181,7 +180,7 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
     rows = conn.execute("SELECT special_number, draw_date FROM draws ORDER BY draw_date ASC, issue_no ASC LIMIT ?", (limit,)).fetchall()
     return [{"num": r["special_number"], "date": r["draw_date"]} for r in rows]
 
-# ========== StableHMM (优化版) ==========
+# ========== StableHMM ==========
 class StableHMM:
     def __init__(self, n_hidden: int = 6, n_obs: int = 3, states_list: List[str] = None, reg_factor: float = 0.25):
         self.n_hidden = n_hidden
@@ -260,7 +259,117 @@ class StableHMM:
 
         return {self.states_list[i]: float(next_probs[i]) for i in range(self.n_obs)}
 
-# ========== 集成引擎 V8.0 ==========
+# ========== 辅助模型 ==========
+class OnlineBayesianWeight:
+    def __init__(self, models: List[str], alpha_prior: float = 1.0, beta_prior: float = 1.0):
+        self.models = models
+        self.alpha = {m: alpha_prior for m in models}
+        self.beta = {m: beta_prior for m in models}
+
+    def update(self, model: str, prob_actual: float):
+        self.alpha[model] += prob_actual
+        self.beta[model] += (1 - prob_actual)
+
+    def get_all_weights(self) -> Dict[str, float]:
+        total = sum(self.alpha[m] / (self.alpha[m] + self.beta[m]) for m in self.models)
+        if total < 1e-8:
+            return {m: 1.0/len(self.models) for m in self.models}
+        return {m: (self.alpha[m] / (self.alpha[m] + self.beta[m])) / total for m in self.models}
+
+class FeatureConditionalModel:
+    def __init__(self, states: List[str]):
+        self.states = states
+        self.counts = defaultdict(lambda: defaultdict(int))
+        self.total = defaultdict(int)
+
+    def train(self, seq: List[str], feature_values: List[Any]):
+        for s, fv in zip(seq, feature_values):
+            self.counts[fv][s] += 1
+            self.total[fv] += 1
+
+    def predict(self, fv: Any, alpha: float = 1.0) -> Dict[str, float]:
+        K = len(self.states)
+        total = self.total.get(fv, 0)
+        probs = {s: (self.counts[fv].get(s, 0) + alpha) / (total + alpha * K) for s in self.states}
+        sum_p = sum(probs.values())
+        return {s: p/sum_p for s, p in probs.items()} if sum_p > 0 else {s: 1.0/K for s in self.states}
+
+class MarkovN:
+    def __init__(self, order: int, states: List[str], alpha: float = 1.0):
+        self.order = order
+        self.states = states
+        self.alpha = alpha
+        self.counts = defaultdict(Counter)
+        self.total = defaultdict(int)
+
+    def train(self, seq: List[str]):
+        for i in range(len(seq) - self.order):
+            state = tuple(seq[i:i+self.order])
+            nxt = seq[i+self.order]
+            self.counts[state][nxt] += 1
+            self.total[state] += 1
+
+    def predict(self, context: Tuple[str]) -> Dict[str, float]:
+        K = len(self.states)
+        total = self.total.get(context, 0)
+        probs = {s: (self.counts[context].get(s, 0) + self.alpha) / (total + self.alpha * K) for s in self.states}
+        sum_p = sum(probs.values())
+        return {s: p/sum_p for s, p in probs.items()} if sum_p > 0 else {s: 1.0/K for s in self.states}
+
+class StreakBias:
+    def __init__(self, states: List[str], alpha: float = 1.0):
+        self.states = states
+        self.alpha = alpha
+        self.streak_counts = defaultdict(lambda: defaultdict(Counter))
+
+    def update(self, seq: List[str]):
+        i = 0
+        while i < len(seq):
+            j = i
+            while j < len(seq) and seq[j] == seq[i]:
+                j += 1
+            length = j - i
+            state = seq[i]
+            if j < len(seq):
+                nxt = seq[j]
+                self.streak_counts[state][length][nxt] += 1
+            i = j
+
+    def predict(self, last: str, streak_len: int) -> Dict[str, float]:
+        K = len(self.states)
+        total = sum(self.streak_counts[last][streak_len].values())
+        probs = {s: (self.streak_counts[last][streak_len].get(s, 0) + self.alpha) / (total + self.alpha * K) for s in self.states}
+        sum_p = sum(probs.values())
+        return {s: p/sum_p for s, p in probs.items()} if sum_p > 0 else {s: 1.0/K for s in self.states}
+
+class FrequencyPrior:
+    def __init__(self, states: List[str]):
+        self.states = states
+        self.probs = {s: 1.0/len(states) for s in states}
+
+    def train(self, seq: List[str]):
+        cnt = Counter(seq)
+        total = len(seq)
+        if total > 0:
+            self.probs = {s: cnt[s]/total for s in self.states}
+        sum_p = sum(self.probs.values())
+        self.probs = {s: p/sum_p for s, p in self.probs.items()}
+
+    def predict(self) -> Dict[str, float]:
+        return self.probs.copy()
+
+class TemperatureScaling:
+    def __init__(self, temperature: float = 1.0):
+        self.temperature = temperature
+
+    def calibrate(self, probs: Dict[str, float]) -> Dict[str, float]:
+        if abs(self.temperature - 1.0) < 1e-6:
+            return probs
+        scaled = {s: p ** (1/self.temperature) for s, p in probs.items()}
+        total = sum(scaled.values())
+        return {s: p/total for s, p in scaled.items()}
+
+# ========== 集成引擎 ==========
 class AttributeEngineV8_0:
     def __init__(self, name: str, markov_order: int = 2, temperature: float = 1.0, use_hmm: bool = True):
         self.name = name
@@ -346,11 +455,13 @@ class AttributeEngineV8_0:
 
 # ========== 预测系统 ==========
 class PredictionSystemV8_0:
-    def __init__(self, temperature: float = 1.0, use_hmm: bool = True):
+    def __init__(self, order: int = 4, min_ig: float = 0.01, temperature: float = 1.0, use_hmm: bool = True):
+        self.order = order
+        self.min_ig = min_ig
         self.temperature = temperature
         self.use_hmm = use_hmm
         self.engines = {
-            "color": AttributeEngineV8_0("color", markov_order=2, temperature=temperature, use_hmm=use_hmm),
+            "color": AttributeEngineV8_0("color", markov_order=2 if order > 2 else order, temperature=temperature, use_hmm=use_hmm),
             "size": AttributeEngineV8_0("size", markov_order=2, temperature=temperature, use_hmm=use_hmm),
             "odd_even": AttributeEngineV8_0("odd_even", markov_order=1, temperature=temperature, use_hmm=use_hmm)
         }
@@ -371,18 +482,57 @@ class PredictionSystemV8_0:
                 "second_state": sorted_probs[1][0] if len(sorted_probs) >= 2 else None
             }
         avg_max_prob = np.mean([results[name]["max_prob"] for name in self.engines])
-        should_act = avg_max_prob >= 0.48
+        should_act = avg_max_prob >= self.min_ig
         results["meta"] = {"should_act": should_act, "reason": f"avg_max_prob={avg_max_prob:.3f}"}
         return results
 
     def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], test_len: int = 150):
-        # 简化版回测（可后续扩展）
-        return ({name: 0.42 for name in self.engines}, 
-                {name: 0.70 for name in self.engines}, 
-                0.68, 0.5, {name: 0.008 for name in self.engines})
+        total = 0
+        correct = {name: 0 for name in self.engines}
+        logloss_sum = {name: 0.0 for name in self.engines}
+        kl_sum = {name: 0.0 for name in self.engines}
+        color_second_correct = 0
+
+        min_len = self.order + 40
+        start_idx = max(len(seqs["color"]) - test_len, min_len)
+
+        for idx in range(start_idx, len(seqs["color"]) - 1):
+            system = PredictionSystemV8_0(order=self.order, min_ig=self.min_ig,
+                                          temperature=self.temperature, use_hmm=self.use_hmm)
+            train_seqs = {name: seqs[name][:idx] for name in seqs}
+            train_draws = {name: draws[name][:idx] for name in draws}
+            system.train_all(train_seqs, train_draws)
+
+            recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx] for name in self.engines}
+            recent_draws = {name: draws[name][idx-self.order:idx] if idx >= self.order else draws[name][:idx] for name in self.engines}
+
+            pred = system.predict_all(recents, recent_draws)
+            actuals = {name: seqs[name][idx] for name in self.engines}
+
+            if pred["meta"]["should_act"]:
+                for name in self.engines:
+                    prob_actual = pred[name]["probs"].get(actuals[name], 1e-15)
+                    logloss_sum[name] += -math.log(prob_actual)
+                    baseline = system.engines[name].freq.probs
+                    kl = sum(p * math.log(p / baseline.get(s, 1e-15) + 1e-15) for s, p in pred[name]["probs"].items() if p > 0)
+                    kl_sum[name] += kl
+                    if pred[name]["best_state"] == actuals[name]:
+                        correct[name] += 1
+                if pred["color"]["best_state"] == actuals["color"] or pred["color"]["second_state"] == actuals["color"]:
+                    color_second_correct += 1
+                total += 1
+
+        if total == 0:
+            return {name:0.0 for name in self.engines}, {name:0.0 for name in self.engines}, 0.0, 1.0, {name:0.0 for name in self.engines}
+
+        acc = {name: correct[name]/total for name in self.engines}
+        avg_logloss = {name: logloss_sum[name]/total for name in self.engines}
+        avg_kl = {name: kl_sum[name]/total for name in self.engines}
+        color_second_acc = color_second_correct / total
+        return acc, avg_logloss, color_second_acc, 0.5, avg_kl
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, lottery_name: str, temperature=1.0, use_hmm=True, backtest_len=150):
+def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=150):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
@@ -406,10 +556,10 @@ def print_dashboard(conn, lottery_name: str, temperature=1.0, use_hmm=True, back
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV8_0(temperature=temperature, use_hmm=use_hmm)
+    system = PredictionSystemV8_0(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
     system.train_all(seqs, draws_dict)
-    recents = {name: seqs[name][-4:] for name in seqs}
-    recent_draws = {name: draws[-4:] for name in seqs}
+    recents = {name: seqs[name][-max(order,4):] for name in seqs}
+    recent_draws = {name: draws[-max(order,4):] for name in seqs}
     pred = system.predict_all(recents, recent_draws)
 
     print(f"\n🔮 下一期属性预测 {lottery_name} (V8.0)")
@@ -420,7 +570,6 @@ def print_dashboard(conn, lottery_name: str, temperature=1.0, use_hmm=True, back
             marker = " ✓" if s == data["best_state"] else ""
             print(f"   {s}: {p*100:.1f}%{marker}")
 
-    # 推荐两个波色
     color_probs = pred["color"]["probs"]
     sorted_color = sorted(color_probs.items(), key=lambda x: -x[1])
     print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}")
@@ -429,7 +578,12 @@ def print_dashboard(conn, lottery_name: str, temperature=1.0, use_hmm=True, back
     print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}")
     print(f"   原因: {meta['reason']}")
 
-    print(f"\n📊 回测 (简化版): 波色二中一准确率 ≈ 68%+")
+    print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
+    acc, logloss, color_second_acc, p_value, avg_kl = system.walk_forward_backtest(seqs, draws_dict, test_len=backtest_len)
+    for name in acc:
+        print(f"   {name} 准确率: {acc[name]*100:.1f}%   LogLoss: {logloss[name]:.4f}   KL: {avg_kl[name]:.4f}")
+    print(f"   波色二中一准确率: {color_second_acc*100:.1f}%")
+    print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
 
 # ========== 主函数 ==========
 def process_lottery(lottery_name: str, args):
@@ -441,7 +595,8 @@ def process_lottery(lottery_name: str, args):
         records, source, url = fetch_online_records(lottery_name)
         total, ins, upd = sync_from_records(conn, records, source)
         print(f"同步完成: 总计 {total}, 新增 {ins}, 更新 {upd}, 来源 {source} ({url})")
-        print_dashboard(conn, lottery_name, temperature=args.temp, use_hmm=args.use_hmm, backtest_len=args.backtest)
+        print_dashboard(conn, lottery_name, order=args.order, min_ig=args.min_ig,
+                        temperature=args.temp, use_hmm=args.use_hmm, backtest_len=args.backtest)
     except Exception as e:
         print(f"处理 {lottery_name} 时出错: {e}")
     finally:
@@ -450,6 +605,8 @@ def process_lottery(lottery_name: str, args):
 def main():
     p = argparse.ArgumentParser(description="三彩种属性预测 V8.0")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
+    p.add_argument("--order", type=int, default=4)
+    p.add_argument("--min-ig", type=float, default=0.01)
     p.add_argument("--temp", type=float, default=0.85)
     p.add_argument("--use-hmm", action="store_true", default=True)
     p.add_argument("--no-hmm", dest="use_hmm", action="store_false")
