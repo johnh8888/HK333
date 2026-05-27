@@ -16,9 +16,10 @@ from collections import defaultdict, Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 
 import numpy as np
+from urllib.request import Request, urlopen
 
 # ========== 配置 ==========
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -201,7 +202,6 @@ class StableHMM:
 
         prev_log_lik = -np.inf
         for it in range(max_iter):
-            # Forward
             log_alpha = np.full((T, self.n_states), -np.inf)
             log_alpha[0] = np.log(self.pi + self.eps) + np.log(self.B[:, obs_idx[0]] + self.eps)
 
@@ -215,19 +215,16 @@ class StableHMM:
                 break
             prev_log_lik = log_lik
 
-            # Backward
             log_beta = np.full((T, self.n_states), -np.inf)
             log_beta[-1] = 0.0
             for t in range(T-2, -1, -1):
                 tmp = np.log(self.A + self.eps) + np.log(self.B[:, obs_idx[t+1]] + self.eps) + log_beta[t+1]
                 log_beta[t] = self._logsumexp(tmp, axis=1)
 
-            # Gamma
             log_gamma = log_alpha + log_beta
             log_gamma -= self._logsumexp(log_gamma, axis=1, keepdims=True)
             gamma = np.exp(log_gamma)
 
-            # Xi
             xi = np.zeros((T-1, self.n_states, self.n_states))
             for t in range(T-1):
                 tmp = (log_alpha[t][:, None] + np.log(self.A + self.eps) +
@@ -235,7 +232,6 @@ class StableHMM:
                 log_xi = tmp - self._logsumexp(tmp, axis=1, keepdims=True)
                 xi[t] = np.exp(log_xi)
 
-            # Update parameters
             self.pi = gamma[0]
             self.pi /= self.pi.sum() + self.eps
 
@@ -398,7 +394,7 @@ class TemperatureScaling:
         total = sum(scaled.values())
         return {s: p/total for s, p in scaled.items()}
 
-# ========== 集成引擎 V7.3 ==========
+# ========== 集成引擎 ==========
 class AttributeEngineV7_3:
     def __init__(self, name: str, order: int = 3, alpha: float = 1.0,
                  use_hmm: bool = True, hmm_states: int = 3, temperature: float = 1.0):
@@ -438,11 +434,9 @@ class AttributeEngineV7_3:
         self.cross_dist_model.train(seq, cross_dists)
 
     def predict_proba(self, recent_seq: List[str], recent_draws: List[Dict]) -> Dict[str, float]:
-        # Markov
         context = tuple(recent_seq[-self.markov.order:]) if len(recent_seq) >= self.markov.order else tuple()
         markov_probs = self.markov.predict(context) if context else {s: 1.0/len(self.states) for s in self.states}
 
-        # Streak
         streak_probs = {s: 1.0/len(self.states) for s in self.states}
         if recent_seq:
             last = recent_seq[-1]
@@ -457,7 +451,6 @@ class AttributeEngineV7_3:
         freq_probs = self.freq.predict()
         hmm_probs = self.hmm.predict_next_probs(recent_seq) if self.hmm and len(recent_seq) >= 2 else {s: 1.0/len(self.states) for s in self.states}
 
-        # Feature probs
         feature_probs = {s: 1.0/len(self.states) for s in self.states}
         if recent_draws:
             prev = recent_draws[-2] if len(recent_draws) >= 2 else None
@@ -469,7 +462,6 @@ class AttributeEngineV7_3:
             total = sum(feature_probs.values()) or 1.0
             feature_probs = {s: p/total for s, p in feature_probs.items()}
 
-        # Ensemble
         weights = self.bayes_weight.get_all_weights()
         fused = {s: 0.0 for s in self.states}
         for s in self.states:
@@ -479,7 +471,6 @@ class AttributeEngineV7_3:
                      freq_probs if m == "freq" else hmm_probs).get(s, 0)
                 fused[s] += weights.get(m, 0) * p
 
-        # Blend with features
         for s in self.states:
             fused[s] = 0.75 * fused[s] + 0.25 * feature_probs.get(s, 1/3)
 
@@ -525,8 +516,7 @@ class PredictionSystemV7_3:
         results["meta"] = {"should_act": should_act, "reason": f"avg_max_prob={avg_max_prob:.3f}"}
         return results
 
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]],
-                              test_len: int = 100):
+    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], test_len: int = 100):
         total = 0
         correct = {name: 0 for name in self.engines}
         logloss_sum = {name: 0.0 for name in self.engines}
@@ -560,29 +550,33 @@ class PredictionSystemV7_3:
                     prob_actual = pred[name]["probs"].get(actuals[name], 1e-15)
                     logloss_sum[name] += -math.log(prob_actual)
                     baseline = system.engines[name].freq.probs
-                    kl = sum(p * math.log(p / baseline.get(s, 1e-15) + 1e-15) for s, p in pred[name]["probs"].items() if p > 0)
+                    kl = sum(p * math.log(p / baseline.get(s, 1e-15) + 1e-15) 
+                            for s, p in pred[name]["probs"].items() if p > 0)
                     kl_sum[name] += kl
                     if pred[name]["best_state"] == actuals[name]:
                         correct[name] += 1
                     max_probs_list[name].append(pred[name]["max_prob"])
                     outcomes_list[name].append(1 if pred[name]["best_state"] == actuals[name] else 0)
 
-                if pred["color"]["best_state"] == actuals["color"] or pred["color"]["second_state"] == actuals["color"]:
+                if (pred["color"]["best_state"] == actuals["color"] or 
+                    pred["color"]["second_state"] == actuals["color"]):
                     color_second_correct += 1
                 actuals_list.append(actuals["color"])
                 preds_list.append(pred["color"]["best_state"])
                 total += 1
 
         if total == 0:
-            return {name:0.0 for name in self.engines}, {name:0.0 for name in self.engines}, 0.0, 1.0, {name:0.0 for name in self.engines}, {name:0.0 for name in self.engines}
+            return ({name:0.0 for name in self.engines}, 
+                    {name:0.0 for name in self.engines}, 0.0, 1.0, 
+                    {name:0.0 for name in self.engines}, {name:0.0 for name in self.engines})
 
         acc = {name: correct[name]/total for name in self.engines}
         avg_logloss = {name: logloss_sum[name]/total for name in self.engines}
         avg_kl = {name: kl_sum[name]/total for name in self.engines}
-        ece = {name: 0.0 for name in self.engines}  # 简化版，可后续完善
+        ece = {name: 0.0 for name in self.engines}
 
         color_second_acc = color_second_correct / total
-        return acc, avg_logloss, color_second_acc, 0.5, avg_kl, ece   # p_value 简化
+        return acc, avg_logloss, color_second_acc, 0.5, avg_kl, ece
 
 # ========== 仪表盘 ==========
 def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1.0,
@@ -618,7 +612,8 @@ def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1
 
     print(f"\n🔮 下一期属性预测 {lottery_name} (阶数={order}, 温度={temperature}, HMM={use_hmm})")
     for name, data in pred.items():
-        if name == "meta": continue
+        if name == "meta":
+            continue
         print(f"\n{name}:")
         for s, p in sorted(data["probs"].items(), key=lambda x: -x[1]):
             marker = " ✓" if s == data["best_state"] else ""
