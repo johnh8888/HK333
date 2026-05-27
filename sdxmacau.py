@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+V9 AI 时序稳定版
+-----------------------------------
+特点：
+1. 多接口容灾
+2. 空数据保护
+3. 指数时间衰减
+4. Markov 时序预测
+5. 自动回测
+6. GitHub Actions 稳定运行
+7. 无 scipy 依赖
+8. Python 3.10+ 可运行
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -8,27 +22,35 @@ import json
 import math
 import sqlite3
 import ssl
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Dict, List
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 # ============================================================
-# 配置
+# 彩种配置
 # ============================================================
 
 LOTTERIES = {
     "老澳门彩": {
         "db": "old_macau.db",
-        "url": "https://www.macaumarksix.com/api/macaujc.com",
+        "urls": [
+            "https://www.macaumarksix.com/api/macau",
+        ]
     },
     "香港彩": {
         "db": "hk_macau.db",
-        "url": "https://www.macaumarksix.com/api/hkjc.com",
+        "urls": [
+            "https://www.macaumarksix.com/api/hk"
+        ]
     },
     "新澳门彩": {
         "db": "xin_macau.db",
-        "url": "https://www.macaumarksix.com/api/macaujc2.com",
-    },
+        "urls": [
+            "https://www.macaumarksix.com/api/xin"
+        ]
+    }
 }
 
 # ============================================================
@@ -42,20 +64,22 @@ RED = {
 }
 
 BLUE = {
-    3, 4, 9, 10, 14, 15, 20, 25,
-    26, 31, 36, 37, 41, 42, 47, 48
+    3, 4, 9, 10, 14, 15, 20,
+    25, 26, 31, 36, 37, 41,
+    42, 47, 48
 }
 
 GREEN = {
-    5, 6, 11, 16, 17, 21, 22, 27,
-    28, 32, 33, 38, 39, 43, 44, 49
+    5, 6, 11, 16, 17, 21, 22,
+    27, 28, 32, 33, 38, 39,
+    43, 44, 49
 }
 
 # ============================================================
-# 工具
+# 工具函数
 # ============================================================
 
-def color_of(n: int) -> str:
+def get_color(n: int) -> str:
     if n in RED:
         return "红"
     if n in BLUE:
@@ -63,11 +87,11 @@ def color_of(n: int) -> str:
     return "绿"
 
 
-def size_of(n: int) -> str:
+def get_size(n: int) -> str:
     return "大" if n >= 25 else "小"
 
 
-def odd_even_of(n: int) -> str:
+def get_odd_even(n: int) -> str:
     return "单" if n % 2 else "双"
 
 
@@ -76,11 +100,11 @@ def odd_even_of(n: int) -> str:
 # ============================================================
 
 def init_db(conn):
+    cur = conn.cursor()
 
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS lottery (
-        period TEXT PRIMARY KEY,
-        code TEXT,
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS records(
+        issue TEXT PRIMARY KEY,
         tm INTEGER
     )
     """)
@@ -89,113 +113,169 @@ def init_db(conn):
 
 
 # ============================================================
-# 拉取 JSON
+# 获取 JSON（稳定版）
 # ============================================================
 
 def fetch_json(url):
 
-    ctx = ssl._create_unverified_context()
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
 
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
-    )
+    req = Request(url, headers=headers)
 
-    with urlopen(req, context=ctx, timeout=20) as r:
-        return json.loads(r.read().decode("utf-8"))
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        with urlopen(req, context=ctx, timeout=20) as r:
+
+            text = r.read().decode("utf-8")
+
+            if not text.strip():
+                print(f"[WARN] 接口空数据: {url}")
+                return []
+
+            return json.loads(text)
+
+    except HTTPError as e:
+        print(f"[ERROR] HTTP错误 {e.code}: {url}")
+
+    except URLError as e:
+        print(f"[ERROR] 网络错误: {e}")
+
+    except Exception as e:
+        print(f"[ERROR] 获取失败: {e}")
+
+    return []
+
+
+# ============================================================
+# 多接口容灾
+# ============================================================
+
+def fetch_from_urls(urls):
+
+    for url in urls:
+
+        data = fetch_json(url)
+
+        if data:
+            print(f"[OK] 接口成功: {url}")
+            return data
+
+    print("[WARN] 所有接口失败")
+    return []
 
 
 # ============================================================
 # 同步数据
 # ============================================================
 
-def sync_data(conn, url):
+def sync_data(conn, urls):
 
-    try:
-        data = fetch_json(url)
-    except Exception as e:
-        print(f"同步失败: {e}")
+    data = fetch_from_urls(urls)
+
+    if not data:
+        print("[WARN] 本次未获取到数据")
         return
 
-    inserted = 0
+    cur = conn.cursor()
+
+    added = 0
     updated = 0
 
     for row in data:
 
-        period = str(row.get("expect", ""))
+        issue = str(
+            row.get("expect")
+            or row.get("issue")
+            or row.get("period")
+            or ""
+        )
 
-        opentime = row.get("opencode", "")
+        tm = (
+            row.get("openCode")
+            or row.get("opencode")
+            or row.get("tm")
+            or ""
+        )
 
-        if "+" not in opentime:
+        if not issue or not tm:
             continue
 
         try:
-            tm = int(opentime.split("+")[-1].strip())
+            if isinstance(tm, str):
+
+                if "+" in tm:
+                    tm = tm.split("+")[-1].strip()
+
+                elif "," in tm:
+                    tm = tm.split(",")[-1].strip()
+
+            tm = int(tm)
+
         except:
             continue
 
-        cur = conn.execute(
-            "SELECT period FROM lottery WHERE period=?",
-            (period,)
-        ).fetchone()
+        cur.execute(
+            "SELECT issue FROM records WHERE issue=?",
+            (issue,)
+        )
 
-        if cur:
-            conn.execute(
-                """
-                UPDATE lottery
-                SET code=?, tm=?
-                WHERE period=?
-                """,
-                (opentime, tm, period)
+        old = cur.fetchone()
+
+        if old:
+
+            cur.execute(
+                "UPDATE records SET tm=? WHERE issue=?",
+                (tm, issue)
             )
+
             updated += 1
+
         else:
-            conn.execute(
-                """
-                INSERT INTO lottery(period, code, tm)
-                VALUES (?, ?, ?)
-                """,
-                (period, opentime, tm)
+
+            cur.execute(
+                "INSERT INTO records(issue, tm) VALUES(?, ?)",
+                (issue, tm)
             )
-            inserted += 1
+
+            added += 1
 
     conn.commit()
 
-    total = conn.execute(
-        "SELECT COUNT(*) FROM lottery"
-    ).fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM records")
+    total = cur.fetchone()[0]
 
-    print(f"同步完成 总={total} 新增={inserted} 更新={updated}")
+    print(f"同步完成 总={total} 新增={added} 更新={updated}")
 
 
 # ============================================================
-# 读取数据
+# 获取特码序列
 # ============================================================
 
-def load_tm(conn):
+def get_tm_series(conn):
 
-    rows = conn.execute("""
+    cur = conn.cursor()
+
+    cur.execute("""
     SELECT tm
-    FROM lottery
-    ORDER BY period
-    """).fetchall()
+    FROM records
+    ORDER BY issue
+    """)
+
+    rows = cur.fetchall()
+
+    if not rows:
+        return []
 
     return [x[0] for x in rows]
 
 
 # ============================================================
-# 时序权重
-# ============================================================
-
-def time_weight(age):
-
-    return math.exp(-age / 80)
-
-
-# ============================================================
-# 马尔可夫预测
+# Markov 时序预测
 # ============================================================
 
 def markov_predict(seq, order=2):
@@ -203,86 +283,100 @@ def markov_predict(seq, order=2):
     if len(seq) <= order:
         return {}
 
-    counts = defaultdict(float)
-
-    history = tuple(seq[-order:])
+    trans = defaultdict(Counter)
 
     for i in range(order, len(seq)):
 
-        prev = tuple(seq[i-order:i])
+        state = tuple(seq[i - order:i])
 
-        if prev != history:
-            continue
-
-        nxt = seq[i]
+        target = seq[i]
 
         age = len(seq) - i
 
-        w = time_weight(age)
+        # 时间衰减
+        weight = math.exp(-age / 80)
 
-        counts[nxt] += w
+        trans[state][target] += weight
 
-    total = sum(counts.values())
+    current = tuple(seq[-order:])
 
-    if total <= 0:
+    if current not in trans:
+        return {}
 
-        uniq = sorted(set(seq))
+    cnt = trans[current]
 
-        p = 1 / len(uniq)
-
-        return {k: p for k in uniq}
+    total = sum(cnt.values())
 
     return {
         k: v / total
-        for k, v in counts.items()
+        for k, v in cnt.items()
     }
 
 
 # ============================================================
-# 分类序列
+# 分类预测
 # ============================================================
 
-def build_features(tms):
+def predict_feature(tms, func, order=2):
 
-    return {
-        "color": [color_of(x) for x in tms],
-        "size": [size_of(x) for x in tms],
-        "odd_even": [odd_even_of(x) for x in tms],
-    }
+    seq = [func(x) for x in tms]
+
+    return markov_predict(seq, order)
+
+
+# ============================================================
+# LogLoss
+# ============================================================
+
+def log_loss(prob, truth):
+
+    eps = 1e-15
+
+    p = max(min(prob, 1 - eps), eps)
+
+    return -math.log(p if truth else (1 - p))
 
 
 # ============================================================
 # 回测
 # ============================================================
 
-def backtest(seq, order=2, n=100):
+def backtest(tms, func, order=2, n=100):
 
-    if len(seq) < order + n + 5:
+    if len(tms) < n + order + 1:
         return None
 
-    ok = 0
-    total_loss = 0
+    seq = [func(x) for x in tms]
 
-    for i in range(len(seq)-n, len(seq)):
+    correct = 0
+    losses = []
+
+    for i in range(order, len(seq) - 1):
 
         train = seq[:i]
 
         real = seq[i]
 
-        probs = markov_predict(train, order)
+        pred = markov_predict(train, order)
 
-        pred = max(probs.items(), key=lambda x: x[1])[0]
+        if not pred:
+            continue
 
-        if pred == real:
-            ok += 1
+        best = max(pred.items(), key=lambda x: x[1])[0]
 
-        p = probs.get(real, 1e-9)
+        if best == real:
+            correct += 1
 
-        total_loss += -math.log(p)
+        prob = pred.get(real, 0.0001)
+
+        losses.append(log_loss(prob, True))
+
+    if not losses:
+        return None
 
     return {
-        "acc": ok / n,
-        "logloss": total_loss / n
+        "acc": correct / len(losses),
+        "loss": sum(losses) / len(losses)
     }
 
 
@@ -290,73 +384,97 @@ def backtest(seq, order=2, n=100):
 # 输出预测
 # ============================================================
 
-def show_prediction(name, tms, order=2, bt=100):
+def show_prediction(conn, name, order, backtest_n):
+
+    tms = get_tm_series(conn)
 
     print()
     print("=" * 60)
     print(name)
     print("=" * 60)
 
+    if not tms:
+        print("[WARN] 当前数据库没有数据")
+        return
+
     latest = tms[-1]
 
     print(f"最新特码: {latest}")
 
-    if len(tms) < 30:
-        print("数据不足，跳过预测")
-        return
-
-    feats = build_features(tms)
-
-    results = {}
+    features = {
+        "color": get_color,
+        "size": get_size,
+        "odd_even": get_odd_even
+    }
 
     print()
     print("========== 下一期预测 ==========")
 
-    for k, seq in feats.items():
+    avg_conf = []
 
-        probs = markov_predict(seq, order)
+    for fname, func in features.items():
 
-        probs = sorted(
-            probs.items(),
+        print()
+        print(fname)
+
+        pred = predict_feature(tms, func, order)
+
+        if not pred:
+            print("无预测数据")
+            continue
+
+        sorted_pred = sorted(
+            pred.items(),
             key=lambda x: x[1],
             reverse=True
         )
 
-        print()
-        print(k)
+        best_conf = sorted_pred[0][1]
 
-        for label, p in probs:
+        avg_conf.append(best_conf)
 
-            flag = "✓" if p == probs[0][1] else ""
+        for i, (k, v) in enumerate(sorted_pred):
 
-            print(f"{label}: {p*100:.2f}% {flag}")
+            flag = " ✓" if i == 0 else ""
 
-        results[k] = probs[0][1]
+            print(f"{k}: {v:.2%}{flag}")
 
-    avg_conf = sum(results.values()) / len(results)
+    avg = sum(avg_conf) / len(avg_conf) if avg_conf else 0
 
     print()
     print("========== 元决策 ==========")
 
-    advice = "下注" if avg_conf >= 0.58 else "观望"
+    if avg >= 0.65:
+        decision = "强信号"
 
-    print(f"建议: {advice}")
-    print(f"平均置信度: {avg_conf:.3f}")
+    elif avg >= 0.55:
+        decision = "可关注"
+
+    else:
+        decision = "观望"
+
+    print(f"建议: {decision}")
+    print(f"平均置信度: {avg:.3f}")
 
     print()
     print("========== 回测结果 ==========")
 
-    for k, seq in feats.items():
+    for fname, func in features.items():
 
-        r = backtest(seq, order, bt)
+        bt = backtest(
+            tms,
+            func,
+            order,
+            backtest_n
+        )
 
-        if not r:
+        if not bt:
             continue
 
         print(
-            f"{k} | "
-            f"准确率={r['acc']:.3f} | "
-            f"LogLoss={r['logloss']:.4f}"
+            f"{fname} | "
+            f"准确率={bt['acc']:.3f} | "
+            f"LogLoss={bt['loss']:.4f}"
         )
 
 
@@ -366,36 +484,34 @@ def show_prediction(name, tms, order=2, bt=100):
 
 def main():
 
-    ap = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
 
-    ap.add_argument(
+    parser.add_argument(
         "--lottery",
-        choices=list(LOTTERIES.keys())
+        default="全部",
+        choices=["全部"] + list(LOTTERIES.keys())
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--order",
         type=int,
         default=2
     )
 
-    ap.add_argument(
+    parser.add_argument(
         "--backtest",
         type=int,
-        default=100
+        default=120
     )
 
-    args = ap.parse_args()
+    args = parser.parse_args()
 
-    targets = (
-        [args.lottery]
-        if args.lottery
-        else list(LOTTERIES.keys())
-    )
+    for name, cfg in LOTTERIES.items():
 
-    for name in targets:
+        if args.lottery != "全部":
 
-        cfg = LOTTERIES[name]
+            if name != args.lottery:
+                continue
 
         print()
         print("=" * 60)
@@ -406,19 +522,21 @@ def main():
 
         init_db(conn)
 
-        sync_data(conn, cfg["url"])
-
-        tms = load_tm(conn)
+        sync_data(conn, cfg["urls"])
 
         show_prediction(
+            conn,
             name,
-            tms,
-            order=args.order,
-            bt=args.backtest
+            args.order,
+            args.backtest
         )
 
         conn.close()
 
+
+# ============================================================
+# 启动
+# ============================================================
 
 if __name__ == "__main__":
     main()
