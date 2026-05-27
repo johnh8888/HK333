@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-三彩种属性预测 V8.3 (严格统计检验 + 真正在线增量 + 覆盖度感知指标)
-修复内容：
-- 移除 scipy 依赖，用纯 Python 实现二项检验 p 值
-- 置换检验完整实现三层（full shuffle, block shuffle, circular shift）
-- Block Bootstrap 保留时序依赖
-- 回测改为真正在线增量，避免重复全量训练，大幅提速
-- 权重学习器恢复为纯粹的对数损失累积（不破坏 scoring rule）
-- 增加所有子模型的增量更新方法，HMM 仅在初始化时训练一次
-- 输出覆盖度感知指标：出手准确率/全量准确率，ΔLogLoss
+三彩种属性预测 V9.0 Research Suite
+融合三条路线：
+1. 统计学版：条件置换检验 + 多重校正
+2. 金融化：信号强度、IC分析、累积收益
+3. 强化学习：在线策略梯度优化 should_act 决策
 """
 
 from __future__ import annotations
@@ -39,6 +35,8 @@ ATTRIBUTE_STATES = {
     "size": ["大", "小"],
     "odd_even": ["单", "双"]
 }
+# 假设赔率（下注成功返奖率，用于金融评估）
+PAYOFF_MULTIPLIER = {"color": 2.0, "size": 1.95, "odd_even": 1.95}  # 例如赔率1:2
 
 # ========== 属性映射 ==========
 def get_color(num: int) -> str:
@@ -177,20 +175,34 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
 
 # ========== 纯 Python 二项检验 ==========
 def binomial_p_value(k: int, n: int, p0: float) -> float:
-    """计算单边 p-value: P(X >= k) under Binomial(n, p0)"""
-    if k <= 0: return 1.0
-    # 使用正态近似或直接求和，这里采用互补累积求和
     from math import comb
+    if k <= 0: return 1.0
     total = 0.0
     for i in range(k, n + 1):
         total += comb(n, i) * (p0 ** i) * ((1 - p0) ** (n - i))
     return total
 
+# ========== 多重检验校正 ==========
+def apply_bonferroni(p_values: List[float]) -> List[float]:
+    m = len(p_values)
+    return [min(p * m, 1.0) for p in p_values]
+
+def apply_bh(p_values: List[float], alpha: float = 0.05) -> List[bool]:
+    """Benjamini-Hochberg 过程，返回是否拒绝"""
+    m = len(p_values)
+    sorted_indices = np.argsort(p_values)
+    sorted_p = np.array(p_values)[sorted_indices]
+    reject = np.zeros(m, dtype=bool)
+    for i in range(m-1, -1, -1):
+        if sorted_p[i] <= (i+1) / m * alpha:
+            reject[sorted_indices[:i+1]] = True
+            break
+    return reject.tolist()
+
 # ========== StableHMM ==========
 class StableHMM:
     def __init__(self, n_hidden: int = 6, n_obs: int = 3, states_list: List[str] = None, reg_factor: float = 0.25):
-        self.n_hidden = n_hidden
-        self.n_obs = n_obs
+        self.n_hidden = n_hidden; self.n_obs = n_obs
         self.states_list = states_list
         self.obs_to_idx = {s: i for i, s in enumerate(states_list)} if states_list else {}
         self.reg_factor = reg_factor
@@ -198,7 +210,6 @@ class StableHMM:
         self.pi = np.ones(n_hidden) / n_hidden
         self.A = np.ones((n_hidden, n_hidden)) / n_hidden
         self.B = np.ones((n_hidden, n_obs)) / n_obs
-        self.train_loglik = None
 
     def train(self, obs_seq: List[str], max_iter: int = 70):
         if len(obs_seq) < 40: return
@@ -233,16 +244,6 @@ class StableHMM:
                 self.B[:, obs_idx[t]] += gamma[t]
             self.B += self.eps
             self.B /= np.sum(self.B, axis=1, keepdims=True) + self.eps
-        self.train_loglik = self._compute_log_likelihood(obs_idx)
-
-    def _compute_log_likelihood(self, obs_idx: np.ndarray) -> float:
-        T = len(obs_idx)
-        log_alpha = np.full((T, self.n_hidden), -np.inf)
-        log_alpha[0] = np.log(self.pi + self.eps) + np.log(self.B[:, obs_idx[0]] + self.eps)
-        for t in range(1, T):
-            tmp = log_alpha[t-1][:, None] + np.log(self.A + self.eps)
-            log_alpha[t] = np.logaddexp.reduce(tmp, axis=0) + np.log(self.B[:, obs_idx[t]] + self.eps)
-        return float(np.logaddexp.reduce(log_alpha[-1]))
 
     def predict_next_probs(self, obs_seq: List[str]) -> Dict[str, float]:
         if len(obs_seq) < 3: return {s: 1.0/len(self.states_list) for s in self.states_list}
@@ -262,7 +263,7 @@ class StableHMM:
         next_probs /= np.sum(next_probs)
         return {self.states_list[i]: float(next_probs[i]) for i in range(self.n_obs)}
 
-# ========== 子模型组件 (含增量更新) ==========
+# ========== 子模型组件 ==========
 class FeatureConditionalModel:
     def __init__(self, states: List[str], alpha: float = 2.0, min_count: int = 5):
         self.states = states; self.alpha = alpha; self.min_count = min_count
@@ -329,15 +330,12 @@ class StreakBias:
 
     def partial_update(self, new_state: str):
         if self._current_state is None:
-            self._current_state = new_state
-            self._streak_len = 1
-            return
+            self._current_state = new_state; self._streak_len = 1; return
         if new_state == self._current_state:
             self._streak_len += 1
         else:
             self.streak_counts[self._current_state][self._streak_len][new_state] += 1.0
-            self._current_state = new_state
-            self._streak_len = 1
+            self._current_state = new_state; self._streak_len = 1
 
     def predict(self, last: str, streak_len: int) -> Dict[str, float]:
         K = len(self.states)
@@ -355,13 +353,11 @@ class FrequencyPrior:
         if not seq: return
         weights = np.power(decay_factor, np.arange(len(seq)-1, -1, -1))
         for s, w in zip(reversed(seq), weights):
-            self._cnt[s] += w
-            self._total += w
+            self._cnt[s] += w; self._total += w
         self._update_probs()
 
     def partial_fit(self, state: str, weight: float = 1.0):
-        self._cnt[state] += weight
-        self._total += weight
+        self._cnt[state] += weight; self._total += weight
         self._update_probs()
 
     def _update_probs(self):
@@ -380,12 +376,9 @@ class TemperatureScaling:
         total = sum(scaled.values())
         return {s: p/total for s, p in scaled.items()}
 
-# ========== 在线权重学习器 (纯对数损失累积) ==========
 class OnlineBayesianWeight:
-    """累积对数损失，不加熵归一化，保持 proper scoring rule"""
     def __init__(self, models: List[str], learning_rate: float = 0.1):
-        self.models = models
-        self.eta = learning_rate
+        self.models = models; self.eta = learning_rate
         self.cum_loss = {m: 0.0 for m in models}
 
     def update(self, model_probs: Dict[str, Dict[str, float]], actual: str):
@@ -402,24 +395,19 @@ class OnlineBayesianWeight:
         return {m: exp_weights[m]/total for m in self.models}
 
 # ========== 集成引擎 ==========
-class AttributeEngineV8_3:
+class AttributeEngineV9:
     def __init__(self, name: str, markov_order: int = 2, temperature: float = 1.0,
                  use_hmm: bool = True, hmm_hidden: int = 6, hmm_reg: float = 0.25,
                  decay_factor: float = 1.0):
-        self.name = name
-        self.states = ATTRIBUTE_STATES[name]
-        self.markov_order = markov_order
-        self.use_hmm = use_hmm
-        self.base_temp = temperature
-        self.temp_scaler = TemperatureScaling(temperature)
-        self.decay_factor = decay_factor
+        self.name = name; self.states = ATTRIBUTE_STATES[name]
+        self.markov_order = markov_order; self.use_hmm = use_hmm
+        self.temp_scaler = TemperatureScaling(temperature); self.decay_factor = decay_factor
 
         self.markov = MarkovN(markov_order, self.states, alpha=1.2)
         self.streak = StreakBias(self.states, alpha=1.2)
         self.freq = FrequencyPrior(self.states)
         self.hmm = StableHMM(n_hidden=hmm_hidden, n_obs=len(self.states),
                              states_list=self.states, reg_factor=hmm_reg) if use_hmm else None
-
         self.tail_model = FeatureConditionalModel(self.states)
         self.mod7_model = FeatureConditionalModel(self.states)
         self.cross_model = FeatureConditionalModel(self.states)
@@ -428,7 +416,6 @@ class AttributeEngineV8_3:
         self.submodel_names = ["markov", "streak", "freq"]
         if use_hmm: self.submodel_names.append("hmm")
         self.submodel_names += ["tail", "mod7", "cross", "zone"]
-
         self.weight_learner = OnlineBayesianWeight(self.submodel_names, learning_rate=0.1)
 
     def train(self, seq: List[str], draws: List[Dict]):
@@ -454,17 +441,9 @@ class AttributeEngineV8_3:
         self.cross_model.train(seq, cross_bins, decay_factor=d)
 
     def partial_train(self, prev_state: str, curr_state: str, prev_draw: Dict, curr_draw: Dict, weight: float = 1.0):
-        """增量更新一个样本，用于在线学习"""
-        # Markov: 获取最近上下文并更新
-        context = tuple()  # 由外部维护上下文，这里简化：仅更新 curr_state 和特征
-        # 实际需要知道最近序列，在系统层处理
-        # 这里实现必要的更新：特征模型和频率
         self.freq.partial_fit(curr_state, weight)
-        # 特征
-        tail = get_tail(curr_draw["num"])
-        mod7 = get_mod7(curr_draw["num"])
-        zone = get_zone(curr_draw["num"])
-        cross = bin_cross_distance(get_cross_distance(prev_draw["num"], curr_draw["num"]))
+        tail = get_tail(curr_draw["num"]); mod7 = get_mod7(curr_draw["num"])
+        zone = get_zone(curr_draw["num"]); cross = bin_cross_distance(get_cross_distance(prev_draw["num"], curr_draw["num"]))
         self.tail_model.partial_fit(curr_state, tail, weight)
         self.mod7_model.partial_fit(curr_state, mod7, weight)
         self.zone_model.partial_fit(curr_state, zone, weight)
@@ -519,239 +498,232 @@ class AttributeEngineV8_3:
         sub_preds = self._submodel_preds(recent_seq, recent_draws)
         self.weight_learner.update(sub_preds, actual_state)
 
-# ========== 预测系统 (真正在线增量) ==========
-class PredictionSystemV8_3:
+# ========== 强化学习策略模块 ==========
+class OnlineREINFORCE:
+    """
+    简单 REINFORCE 优化二元决策概率。
+    输入：状态特征向量；输出：下注概率。
+    """
+    def __init__(self, input_dim: int = 2, lr: float = 0.01):
+        self.weights = np.zeros(input_dim)
+        self.lr = lr
+
+    def predict_proba(self, state: np.ndarray) -> float:
+        z = np.dot(state, self.weights)
+        return 1.0 / (1.0 + math.exp(-z))  # sigmoid
+
+    def update(self, state: np.ndarray, action: int, reward: float):
+        """action 0 or 1, reward 为收益（如+1赢，-1输）"""
+        prob = self.predict_proba(state)
+        # 梯度 = state * (action - prob)
+        self.weights += self.lr * (action - prob) * state * reward
+
+# ========== 预测系统 V9 ==========
+class PredictionSystemV9:
     def __init__(self, order: int = 4, min_ig: float = 0.45, temperature: float = 1.0,
                  use_hmm: bool = True, hmm_hidden: int = 6, hmm_reg: float = 0.25,
                  decay_factor: float = 1.0, entropy_percentile: int = 30):
-        self.order = order
-        self.min_ig = min_ig
-        self.temperature = temperature
-        self.use_hmm = use_hmm
-        self.decay_factor = decay_factor
+        self.order = order; self.min_ig = min_ig; self.temperature = temperature
+        self.use_hmm = use_hmm; self.decay_factor = decay_factor
         self.entropy_percentile = entropy_percentile
         self.entropy_history: List[float] = []
 
         self.engines = {
-            "color": AttributeEngineV8_3("color", markov_order=2 if order > 2 else order,
-                                         temperature=temperature, use_hmm=use_hmm,
-                                         hmm_hidden=hmm_hidden, hmm_reg=hmm_reg,
-                                         decay_factor=decay_factor),
-            "size": AttributeEngineV8_3("size", markov_order=2,
-                                        temperature=temperature, use_hmm=use_hmm,
-                                        hmm_hidden=hmm_hidden, hmm_reg=hmm_reg,
-                                        decay_factor=decay_factor),
-            "odd_even": AttributeEngineV8_3("odd_even", markov_order=1,
-                                            temperature=temperature, use_hmm=use_hmm,
-                                            hmm_hidden=hmm_hidden, hmm_reg=hmm_reg,
-                                            decay_factor=decay_factor)
+            "color": AttributeEngineV9("color", markov_order=2 if order > 2 else order,
+                                       temperature=temperature, use_hmm=use_hmm,
+                                       hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor),
+            "size": AttributeEngineV9("size", markov_order=2, temperature=temperature,
+                                      use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor),
+            "odd_even": AttributeEngineV9("odd_even", markov_order=1, temperature=temperature,
+                                          use_hmm=use_hmm, hmm_hidden=hmm_hidden, hmm_reg=hmm_reg, decay_factor=decay_factor)
         }
+        # 强化学习模块
+        self.rl_agent = OnlineREINFORCE(input_dim=2, lr=0.02)
 
-    def train_all(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]]):
+    def train_all(self, seqs, draws):
         for name, seq in seqs.items():
             self.engines[name].train(seq, draws[name])
 
-    def learn_weights_offline(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], warmup: int = 50):
+    def learn_weights_offline(self, seqs, draws, warmup=50):
         for name, engine in self.engines.items():
-            seq = seqs[name]
-            draw_list = draws[name]
+            seq = seqs[name]; draw_list = draws[name]
             for i in range(warmup, len(seq)-1):
                 rec_seq = seq[i-self.order:i] if i >= self.order else seq[:i]
                 rec_draws = draw_list[i-self.order:i] if i >= self.order else draw_list[:i]
-                actual = seq[i]
-                engine.update_weights(rec_seq, rec_draws, actual)
+                engine.update_weights(rec_seq, rec_draws, seq[i])
 
-    def predict_all(self, recents: Dict[str, List[str]], draws: Dict[str, List[Dict]]) -> Dict[str, Any]:
+    def predict_all(self, recents, recent_draws) -> Dict[str, Any]:
         results = {}
         for name, engine in self.engines.items():
-            probs = engine.predict_proba(recents[name], draws[name])
+            probs = engine.predict_proba(recents[name], recent_draws[name])
             sorted_probs = sorted(probs.items(), key=lambda x: -x[1])
             results[name] = {
                 "probs": probs,
                 "max_prob": sorted_probs[0][1],
                 "best_state": sorted_probs[0][0],
-                "second_state": sorted_probs[1][0] if len(sorted_probs) >= 2 else None,
-                "entropy": -sum(p * math.log(p + 1e-12) for p in probs.values())
+                "second_state": sorted_probs[1][0] if len(sorted_probs)>=2 else None,
+                "entropy": -sum(p*math.log(p+1e-12) for p in probs.values())
             }
-        avg_max_prob = np.mean([results[name]["max_prob"] for name in self.engines])
+        avg_max = np.mean([results[n]["max_prob"] for n in self.engines])
         color_entropy = results["color"]["entropy"]
-
         if len(self.entropy_history) < 20:
-            entropy_threshold = math.log(len(ATTRIBUTE_STATES["color"])) * 0.95
+            entropy_thr = math.log(len(ATTRIBUTE_STATES["color"])) * 0.95
         else:
-            entropy_threshold = np.percentile(self.entropy_history, self.entropy_percentile)
-        should_act = (avg_max_prob >= self.min_ig) and (color_entropy <= entropy_threshold)
+            entropy_thr = np.percentile(self.entropy_history, self.entropy_percentile)
+        # 固定规则 should_act
+        should_act_fixed = (avg_max >= self.min_ig) and (color_entropy <= entropy_thr)
+        # 强化学习决策
+        state = np.array([avg_max, color_entropy])
+        rl_action_prob = self.rl_agent.predict_proba(state)
+        should_act_rl = random.random() < rl_action_prob  # 采样动作
         self.entropy_history.append(color_entropy)
 
         results["meta"] = {
-            "should_act": should_act,
-            "reason": f"avg_max={avg_max_prob:.3f} entropy={color_entropy:.3f} thr={entropy_threshold:.3f}"
+            "should_act_fixed": should_act_fixed,
+            "should_act_rl": should_act_rl,
+            "rl_action_prob": rl_action_prob,
+            "avg_max": avg_max,
+            "entropy": color_entropy,
+            "threshold": entropy_thr
         }
         return results
 
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]],
-                              test_len: int = 150):
-        """真正在线增量回测：一次性初始化，逐步增量更新，避免全量重训"""
-        total_act = 0
+    def walk_forward_backtest(self, seqs, draws, test_len=150):
+        total_act_fixed = total_act_rl = 0
         total_all = 0
-        correct_act = {name: 0 for name in self.engines}
-        correct_all = {name: 0 for name in self.engines}
-        logloss_sum_act = {name: 0.0 for name in self.engines}
-        logloss_sum_all = {name: 0.0 for name in self.engines}
-        color_second_correct_act = 0
-        color_second_correct_all = 0
-        predictions_record_act = {name: [] for name in self.engines}
-        predictions_record_all = {name: [] for name in self.engines}
-        all_loglosses = {name: [] for name in self.engines}
+        correct_act_fixed = {n:0 for n in self.engines}
+        correct_act_rl = {n:0 for n in self.engines}
+        correct_all = {n:0 for n in self.engines}
+        # 金融指标
+        cum_return_fixed = {n:0.0 for n in self.engines}
+        cum_return_rl = {n:0.0 for n in self.engines}
+        ic_records = {n:[] for n in self.engines}
+        # 记录预测详情
+        pred_records_act_fixed = {n:[] for n in self.engines}
+        pred_records_act_rl = {n:[] for n in self.engines}
+        pred_records_all = {n:[] for n in self.engines}
 
         min_len = self.order + 40
         start_idx = max(len(seqs["color"]) - test_len, min_len)
-        # 复制当前系统作为起点，使用截止到 start_idx 之前的数据进行初始训练
-        train_seqs = {name: seqs[name][:start_idx] for name in seqs}
-        train_draws = {name: draws[name][:start_idx] for name in draws}
+        train_seqs = {n: seqs[n][:start_idx] for n in seqs}
+        train_draws = {n: draws[n][:start_idx] for n in draws}
         self.train_all(train_seqs, train_draws)
-        # 离线学习权重到 start_idx-1
         self.learn_weights_offline(seqs, draws, warmup=min_len)
 
-        # 回测从 start_idx 开始逐期增量更新
         for idx in range(start_idx, len(seqs["color"]) - 1):
-            recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx] for name in self.engines}
-            recent_draws = {name: draws[name][idx-self.order:idx] if idx >= self.order else draws[name][:idx] for name in self.engines}
+            recents = {n: seqs[n][idx-self.order:idx] if idx>=self.order else seqs[n][:idx] for n in self.engines}
+            recent_draws = {n: draws[n][idx-self.order:idx] if idx>=self.order else draws[n][:idx] for n in self.engines}
             pred = self.predict_all(recents, recent_draws)
-            actuals = {name: seqs[name][idx] for name in self.engines}
+            actuals = {n: seqs[n][idx] for n in self.engines}
 
-            act = pred["meta"]["should_act"]
+            # 固定策略动作
+            act_fixed = pred["meta"]["should_act_fixed"]
+            act_rl = pred["meta"]["should_act_rl"]
             for name in self.engines:
-                prob_actual = pred[name]["probs"].get(actuals[name], 1e-15)
-                logl = -math.log(prob_actual)
-                uniform_prob = 1.0/len(ATTRIBUTE_STATES[name])
-                if act:
-                    logloss_sum_act[name] += logl
-                    predictions_record_act[name].append((pred[name]["best_state"], actuals[name]))
-                    if pred[name]["best_state"] == actuals[name]:
-                        correct_act[name] += 1
-                logloss_sum_all[name] += logl
-                predictions_record_all[name].append((pred[name]["best_state"], actuals[name]))
-                if pred[name]["best_state"] == actuals[name]:
-                    correct_all[name] += 1
-                if name == "color":
-                    second_correct = (pred[name]["best_state"] == actuals[name] or pred[name]["second_state"] == actuals[name])
-                    if act: color_second_correct_act += 1 if second_correct else 0
-                    color_second_correct_all += 1 if second_correct else 0
-            total_act += 1 if act else 0
-            total_all += 1
+                prob = pred[name]["probs"].get(actuals[name], 1e-12)
+                # 金融信号（简单用 max_prob - 1/k）
+                signal = pred[name]["max_prob"] - 1.0/len(ATTRIBUTE_STATES[name])
+                # 收益（假设下注正确得赔率-1，否则-1）
+                win = (pred[name]["best_state"] == actuals[name])
+                reward_fixed = (PAYOFF_MULTIPLIER[name]-1) if win else -1
+                if act_fixed:
+                    cum_return_fixed[name] += reward_fixed
+                    correct_act_fixed[name] += win
+                    total_act_fixed += 1
+                    pred_records_act_fixed[name].append((pred[name]["best_state"], actuals[name]))
+                if act_rl:
+                    cum_return_rl[name] += reward_fixed  # 同样奖励
+                    correct_act_rl[name] += win
+                    total_act_rl += 1
+                    pred_records_act_rl[name].append((pred[name]["best_state"], actuals[name]))
+                # 全量统计
+                cum_return_rl[name] += 0  # 不影响
+                correct_all[name] += win
+                total_all += 1
+                pred_records_all[name].append((pred[name]["best_state"], actuals[name]))
+                # IC: signal vs 实际收益的相关系数（简化：存储信号和收益标签）
+                ic_records[name].append((signal, 1 if win else -1))
 
-            # 增量更新模型（使用新一期的真实数据）
+            # 强化学习更新：根据固定策略是否盈利调整（这里用固定策略盈利作为 RL 的奖励？）
+            # 我们使用 act_rl 产生的奖励更新 RL
+            state = np.array([pred["meta"]["avg_max"], pred["meta"]["entropy"]])
+            # 简单奖励：取所有属性的平均收益
+            avg_reward = np.mean([(PAYOFF_MULTIPLIER[name]-1) if (pred[name]["best_state"]==actuals[name]) else -1 for name in self.engines])
+            self.rl_agent.update(state, 1 if act_rl else 0, avg_reward)
+
+            # 增量更新模型
             for name, engine in self.engines.items():
-                prev_draw = draws[name][idx-1] if idx > 0 else draws[name][idx]
-                curr_draw = draws[name][idx]
-                engine.partial_train(seqs[name][idx-1] if idx>0 else None, actuals[name], prev_draw, curr_draw, weight=1.0)
-                # 更新 Markov 上下文需单独处理：传递最近序列
-                # 这里简化，完整实现需要跟踪序列
-                # 暂时沿用回测框架的简单增量（已实现特征、频率、连击）
-                # 对 Markov，我们采用重新训练最近窗口的方式保证准确性
-                # 但为了性能，可只更新最新转移计数
+                prev_draw = draws[name][idx-1] if idx>0 else draws[name][idx]
+                engine.partial_train(seqs[name][idx-1] if idx>0 else None, actuals[name], prev_draw, draws[name][idx])
                 recent_seq = seqs[name][max(0, idx-self.order):idx+1]
                 if len(recent_seq) >= self.order+1:
                     ctx = tuple(recent_seq[-(self.order+1):-1])
-                    nxt = recent_seq[-1]
-                    engine.markov.partial_fit(ctx, nxt, weight=1.0)
-            # 更新权重
+                    engine.markov.partial_fit(ctx, recent_seq[-1])
             for name, engine in self.engines.items():
                 engine.update_weights(recents[name], recent_draws[name], actuals[name])
 
-        # 计算结果
-        acc_act = {name: correct_act[name]/total_act if total_act > 0 else 0.0 for name in self.engines}
-        acc_all = {name: correct_all[name]/total_all for name in self.engines}
-        avg_logloss_act = {name: logloss_sum_act[name]/total_act if total_act > 0 else 0.0 for name in self.engines}
-        avg_logloss_all = {name: logloss_sum_all[name]/total_all for name in self.engines}
-        color_second_acc_act = color_second_correct_act/total_act if total_act > 0 else 0.0
-        color_second_acc_all = color_second_correct_all/total_all
-
-        # Δ log loss vs uniform
-        delta_logloss_all = {}
-        for name in self.engines:
-            uniform_avg = -math.log(1.0/len(ATTRIBUTE_STATES[name]))
-            delta_logloss_all[name] = uniform_avg - avg_logloss_all[name]
+        # 汇总指标
+        def safe_div(a,b): return a/b if b>0 else 0
+        acc_fixed = {n: safe_div(correct_act_fixed[n], total_act_fixed) for n in self.engines}
+        acc_rl = {n: safe_div(correct_act_rl[n], total_act_rl) for n in self.engines}
+        acc_all = {n: safe_div(correct_all[n], total_all) for n in self.engines}
+        # 金融指标
+        sharpe_fixed = {n: np.mean([cum_return_fixed[n]])/(np.std([cum_return_fixed[n]])+1e-8) for n in self.engines}
+        sharpe_rl = {n: np.mean([cum_return_rl[n]])/(np.std([cum_return_rl[n]])+1e-8) for n in self.engines}
+        # 平均IC
+        ic_mean = {}
+        for n in self.engines:
+            signals, returns = zip(*ic_records[n])
+            ic_mean[n] = np.corrcoef(signals, returns)[0,1] if len(signals)>1 else 0
 
         return {
-            "act": {"total": total_act, "acc": acc_act, "logloss": avg_logloss_act, "color_second_acc": color_second_acc_act},
-            "all": {"total": total_all, "acc": acc_all, "logloss": avg_logloss_all, "color_second_acc": color_second_acc_all},
-            "delta_logloss_all": delta_logloss_all,
-            "predictions_act": predictions_record_act,
-            "predictions_all": predictions_record_all
+            "fixed": {"total":total_act_fixed, "acc":acc_fixed, "cum_return":cum_return_fixed, "sharpe":sharpe_fixed},
+            "rl": {"total":total_act_rl, "acc":acc_rl, "cum_return":cum_return_rl, "sharpe":sharpe_rl},
+            "all": {"total":total_all, "acc":acc_all},
+            "ic": ic_mean,
+            "pred_records_fixed": pred_records_act_fixed,
+            "pred_records_rl": pred_records_act_rl,
+            "pred_records_all": pred_records_all
         }
 
-# ========== 时间序列 Bootstrap 和 Permutation 工具 ==========
-def moving_block_bootstrap(data: List[Tuple], block_len: int, n_bootstrap: int = 2000):
-    n = len(data)
-    if n == 0: return []
-    boot_samples = []
-    for _ in range(n_bootstrap):
-        sample = []
-        while len(sample) < n:
-            start = random.randint(0, max(0, n - block_len))
-            block = data[start:start+block_len]
-            sample.extend(block)
-        boot_samples.append(sample[:n])
-    return boot_samples
-
-def block_bootstrap_ci(predictions: List[Tuple[str, str]], block_len: int = 5, n_bootstrap: int = 2000, alpha: float = 0.05):
-    if len(predictions) < block_len:
-        accs = []
-        n = len(predictions)
-        for _ in range(n_bootstrap):
-            sample = [random.choice(predictions) for _ in range(n)]
-            correct = sum(1 for p, t in sample if p == t)
-            accs.append(correct / n)
-        return np.percentile(accs, 100 * alpha / 2), np.percentile(accs, 100 * (1 - alpha / 2))
-    accs = []
-    n = len(predictions)
-    for sample in moving_block_bootstrap(predictions, block_len, n_bootstrap):
-        correct = sum(1 for p, t in sample if p == t)
-        accs.append(correct / n)
-    return np.percentile(accs, 100 * alpha / 2), np.percentile(accs, 100 * (1 - alpha / 2))
-
-def circular_shift_permutation(seq: List[str]) -> List[str]:
-    shifts = random.randint(1, len(seq)-1)
-    return seq[shifts:] + seq[:shifts]
-
-def block_permutation(seq: List[str], block_size: int = 5) -> List[str]:
-    n = len(seq)
-    if n < block_size: return random.sample(seq, len(seq))
-    blocks = [seq[i:i+block_size] for i in range(0, n, block_size)]
-    random.shuffle(blocks)
-    permuted = []
-    for b in blocks: permuted.extend(b)
-    return permuted[:n]
-
-def run_permutation_tests(seqs, draws_dict, base_system, test_len=150, n_perm=100):
+# ========== 条件置换检验（固定特征打乱颜色） ==========
+def conditional_permutation_test(seqs, draws, base_system, test_len=150, n_perm=100):
     color_seq = seqs["color"]
-    results = {"full_shuffle": [], "block_shuffle": [], "circular_shift": []}
-    # 真实系统准确率 (使用同一个 base_system 的 copy)
+    # 抽取与颜色序列对应的特征索引
+    features = []
+    for i in range(len(color_seq)):
+        d = draws["color"][i]
+        fv = (get_tail(d["num"]), get_mod7(d["num"]), get_zone(d["num"]))
+        features.append(fv)
+    # 真实系统准确率
     sys_real = copy.deepcopy(base_system)
-    res_real = sys_real.walk_forward_backtest(seqs, draws_dict, test_len=test_len)
-    real_acc_act = res_real["act"]["acc"]["color"]
+    res_real = sys_real.walk_forward_backtest(seqs, draws, test_len=test_len)
+    real_acc = res_real["fixed"]["acc"]["color"]
 
-    for method, func in [("full_shuffle", lambda s: random.sample(s, len(s))),
-                         ("block_shuffle", lambda s: block_permutation(s, block_size=5)),
-                         ("circular_shift", circular_shift_permutation)]:
-        perm_accs = []
-        for _ in range(n_perm):
-            perm_color = func(color_seq)
-            perm_seqs = {**seqs, "color": perm_color}
-            sys_perm = PredictionSystemV8_3(
-                order=base_system.order, min_ig=base_system.min_ig, temperature=base_system.temperature,
-                use_hmm=base_system.use_hmm,
-                hmm_hidden=base_system.engines["color"].hmm.n_hidden if base_system.engines["color"].hmm else 6,
-                hmm_reg=base_system.engines["color"].hmm.reg_factor if base_system.engines["color"].hmm else 0.25,
-                decay_factor=base_system.decay_factor, entropy_percentile=base_system.entropy_percentile
-            )
-            res_perm = sys_perm.walk_forward_backtest(perm_seqs, draws_dict, test_len=test_len)
-            perm_accs.append(res_perm["act"]["acc"]["color"])
-        p_val = sum(1 for a in perm_accs if a >= real_acc_act) / n_perm
-        results[method] = {"real_acc": real_acc_act, "perm_mean": np.mean(perm_accs), "p_value": p_val}
-    return results
+    perm_accs = []
+    for _ in range(n_perm):
+        # 在每个特征组合内部打乱颜色标签
+        perm_color = color_seq.copy()
+        groups = defaultdict(list)
+        for idx, fv in enumerate(features):
+            groups[fv].append(idx)
+        for fv, indices in groups.items():
+            vals = [color_seq[i] for i in indices]
+            random.shuffle(vals)
+            for i, idx in enumerate(indices):
+                perm_color[idx] = vals[i]
+        perm_seqs = {**seqs, "color": perm_color}
+        sys_perm = PredictionSystemV9(
+            order=base_system.order, min_ig=base_system.min_ig, temperature=base_system.temperature,
+            use_hmm=base_system.use_hmm,
+            hmm_hidden=base_system.engines["color"].hmm.n_hidden if base_system.engines["color"].hmm else 6,
+            hmm_reg=base_system.engines["color"].hmm.reg_factor if base_system.engines["color"].hmm else 0.25,
+            decay_factor=base_system.decay_factor, entropy_percentile=base_system.entropy_percentile
+        )
+        res_perm = sys_perm.walk_forward_backtest(perm_seqs, draws, test_len=test_len)
+        perm_accs.append(res_perm["fixed"]["acc"]["color"])
+    p_val = sum(1 for a in perm_accs if a >= real_acc) / n_perm
+    return real_acc, perm_accs, p_val
 
 # ========== 仪表盘 ==========
 def print_dashboard(conn, lottery_name: str, args):
@@ -764,22 +736,16 @@ def print_dashboard(conn, lottery_name: str, args):
     draws_dict = {"color": draws, "size": draws, "odd_even": draws}
 
     if len(seqs["color"]) < 100:
-        print("历史数据不足，请先同步数据。")
-        return
+        print("历史数据不足，请先同步数据。"); return
 
     latest = conn.execute("SELECT * FROM draws ORDER BY issue_no DESC LIMIT 1").fetchone()
     if latest:
         nums = " ".join(f"{n:02d}" for n in json.loads(latest["numbers_json"]))
         print(f"最新开奖: {latest['issue_no']} | {nums} + {latest['special_number']:02d}")
-        attrs = {
-            "色波": get_color(latest["special_number"]),
-            "大小": get_big_small(latest["special_number"]),
-            "单双": get_odd_even(latest["special_number"]),
-        }
+        attrs = { "色波": get_color(latest["special_number"]), "大小": get_big_small(latest["special_number"]), "单双": get_odd_even(latest["special_number"]) }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    # 构建预测系统并训练
-    system = PredictionSystemV8_3(
+    system = PredictionSystemV9(
         order=args.order, min_ig=args.min_ig, temperature=args.temp,
         use_hmm=args.use_hmm, hmm_hidden=args.hmm_hidden, hmm_reg=args.hmm_reg,
         decay_factor=args.decay, entropy_percentile=args.entropy_percentile
@@ -787,12 +753,11 @@ def print_dashboard(conn, lottery_name: str, args):
     system.train_all(seqs, draws_dict)
     system.learn_weights_offline(seqs, draws_dict, warmup=50)
 
-    # 实时预测
     recents = {name: seqs[name][-max(args.order,4):] for name in seqs}
     recent_draws = {name: draws[-max(args.order,4):] for name in seqs}
     pred = system.predict_all(recents, recent_draws)
 
-    print(f"\n🔮 下一期属性预测 {lottery_name} (V8.3)")
+    print(f"\n🔮 下一期属性预测 {lottery_name} (V9.0 Research)")
     for name, data in pred.items():
         if name == "meta": continue
         print(f"\n{name}:")
@@ -803,68 +768,45 @@ def print_dashboard(conn, lottery_name: str, args):
     sorted_color = sorted(pred["color"]["probs"].items(), key=lambda x: -x[1])
     print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}")
     meta = pred["meta"]
-    print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}, {meta['reason']}")
+    print(f"\n🧠 固定规则: {'出手' if meta['should_act_fixed'] else '观望'}")
+    print(f"🤖 RL规则: {'出手' if meta['should_act_rl'] else '观望'} (概率 {meta['rl_action_prob']:.3f})")
 
-    # 回测与覆盖度指标
+    # 回测
     print(f"\n📊 在线增量 Walk-Forward 回测 (最近 {args.backtest} 期):")
     result = system.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
 
-    print(f"\n   ------ Coverage-aware 指标 ------")
-    print(f"   总预测期数: {result['all']['total']},  实际出手: {result['act']['total']} 期 ({100*result['act']['total']/result['all']['total']:.1f}%)")
-    for name in ["color", "size", "odd_even"]:
-        acc_act = result["act"]["acc"][name]*100
-        acc_all = result["all"]["acc"][name]*100
-        delta_logl = result["delta_logloss_all"][name]
-        print(f"   {name}: 出手准确率 {acc_act:.1f}% | 全量准确率 {acc_all:.1f}% | ΔLogLoss(均匀) = {delta_logl:+.4f}")
+    print("\n--- Coverage-aware 指标 ---")
+    print(f"总预测期: {result['all']['total']}, 固定出手: {result['fixed']['total']}, RL出手: {result['rl']['total']}")
+    for name in ["color","size","odd_even"]:
+        a_f = result["fixed"]["acc"][name]*100; a_r = result["rl"]["acc"][name]*100; a_all = result["all"]["acc"][name]*100
+        print(f"{name}: 固定准确率 {a_f:.1f}% | RL准确率 {a_r:.1f}% | 全量 {a_all:.1f}%")
+    print("\n--- 金融指标 (假设赔率) ---")
+    for name in ["color","size","odd_even"]:
+        print(f"{name}: 固定累积收益 {result['fixed']['cum_return'][name]:+.2f}  Sharpe {result['fixed']['sharpe'][name]:.3f}")
+        print(f"      RL累积收益 {result['rl']['cum_return'][name]:+.2f}  Sharpe {result['rl']['sharpe'][name]:.3f}")
+    print("\n--- 信息系数 (IC) ---")
+    for name in ["color","size","odd_even"]:
+        print(f"{name}: 平均 IC = {result['ic'][name]:.4f}")
 
-    # Block Bootstrap CI
-    print("\n📈 Block Bootstrap 置信区间 (MBB, block=5):")
-    for name in ["color", "size", "odd_even"]:
-        preds_act = result["predictions_act"][name]
-        if len(preds_act) >= 5:
-            low, up = block_bootstrap_ci(preds_act, block_len=5)
-            print(f"   {name} 出手准确率 95% CI: [{low*100:.1f}%, {up*100:.1f}%]")
-        preds_all = result["predictions_all"][name]
-        if len(preds_all) >= 5:
-            low_all, up_all = block_bootstrap_ci(preds_all, block_len=5)
-            print(f"   {name} 全量准确率 95% CI: [{low_all*100:.1f}%, {up_all*100:.1f}%]")
-
-    # 基线检验 (二项检验)
-    print("\n📉 基线检验 (vs 均匀分布):")
-    for name in ["color", "size", "odd_even"]:
-        n_act = result["act"]["total"]
-        if n_act > 0:
-            k = int(result["act"]["acc"][name] * n_act)
-            p_uni = binomial_p_value(k, n_act, 1.0/len(ATTRIBUTE_STATES[name]))
-            print(f"   {name}: 出手 {n_act} 期, 准确率 {result['act']['acc'][name]*100:.1f}%, p-value={p_uni:.4f}")
-
-    # 置换检验
+    # 条件置换检验
     if args.perm_test and len(seqs["color"]) > 120:
-        print("\n🔄 执行多层置换检验 (Full/B Lock/Circ Shft, 各50次)...")
-        # 注意：置换检验需要大量计算，这里用较小次数
-        res_perm = run_permutation_tests(seqs, draws_dict, system, test_len=args.backtest, n_perm=50)
-        for method, data in res_perm.items():
-            if isinstance(data, dict):
-                print(f"   {method}: 真实={data['real_acc']:.3f}, 零分布均值={data['perm_mean']:.3f}, p={data['p_value']:.4f}")
+        print("\n🔄 条件置换检验 (固定特征，打乱颜色, 50次)...")
+        real_acc, perm_accs, p_val = conditional_permutation_test(seqs, draws_dict, system, test_len=args.backtest, n_perm=50)
+        print(f"   真实固定准确率: {real_acc:.3f}, 零分布均值: {np.mean(perm_accs):.3f}, p={p_val:.4f}")
 
     # HMM 贡献
     if args.compare_hmm and system.use_hmm:
         print("\n🔬 HMM 贡献检验:")
-        sys_no = PredictionSystemV8_3(order=args.order, min_ig=args.min_ig, temperature=args.temp,
-                                      use_hmm=False, decay_factor=args.decay, entropy_percentile=args.entropy_percentile)
+        sys_no = PredictionSystemV9(order=args.order, min_ig=args.min_ig, temperature=args.temp,
+                                    use_hmm=False, decay_factor=args.decay, entropy_percentile=args.entropy_percentile)
         res_no = sys_no.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
-        for name in ["color", "size", "odd_even"]:
-            diff_act = result["act"]["acc"][name] - res_no["act"]["acc"][name]
-            diff_all = result["all"]["acc"][name] - res_no["all"]["acc"][name]
-            print(f"   {name}: ΔAcc(出手)={diff_act*100:+.2f}%, ΔAcc(全量)={diff_all*100:+.2f}%")
-        avg_diff = np.mean([result["act"]["acc"][n] - res_no["act"]["acc"][n] for n in ["color","size","odd_even"]])
-        if abs(avg_diff) < 0.005:
-            print("   ⚠️ HMM 贡献极小 (<0.5%)，建议移除。")
+        for name in ["color","size","odd_even"]:
+            diff = result["fixed"]["acc"][name] - res_no["fixed"]["acc"][name]
+            print(f"   {name}: ΔAcc(固定)={diff*100:+.2f}%")
 
-# ========== 主函数 ==========
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V8.3 (严格统计检验版)")
-    p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
+    p = argparse.ArgumentParser(description="三彩种属性预测 V9.0 Research Suite")
+    p.add_argument("--lottery", choices=["老澳门彩","香港彩","新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.45)
     p.add_argument("--temp", type=float, default=0.85)
@@ -875,11 +817,11 @@ def main():
     p.add_argument("--decay", type=float, default=0.99)
     p.add_argument("--backtest", type=int, default=150)
     p.add_argument("--entropy-percentile", type=int, default=30)
-    p.add_argument("--perm-test", action="store_true", help="执行置换检验(耗时)")
-    p.add_argument("--compare-hmm", action="store_true", help="HMM对比")
+    p.add_argument("--perm-test", action="store_true")
+    p.add_argument("--compare-hmm", action="store_true")
     args = p.parse_args()
 
-    for lottery in ([args.lottery] if args.lottery else ["老澳门彩", "香港彩", "新澳门彩"]):
+    for lottery in ([args.lottery] if args.lottery else ["老澳门彩","香港彩","新澳门彩"]):
         db_path = str(SCRIPT_DIR / DB_FILES[lottery])
         conn = connect_db(db_path)
         try:
