@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 V7.6 (最终优化版 - 提升命中率)
+# 三彩种属性预测 V7.8 (最终加强版)
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def get_mod7(num: int) -> int:
 def get_cross_distance(prev: int, cur: int) -> int:
     return abs(prev - cur)
 
-# ========== 数据层 ==========
+# ========== 数据层（完整）==========
 @dataclass
 class DrawRecord:
     issue_no: str
@@ -252,7 +252,7 @@ class StableHMM:
 
         return {self.states_list[i]: float(next_probs[i]) for i in range(self.n_obs)}
 
-# ========== 其他模型 ==========
+# ========== 辅助模型 ==========
 class OnlineBayesianWeight:
     def __init__(self, models: List[str], alpha_prior: float = 1.0, beta_prior: float = 1.0):
         self.models = models
@@ -362,9 +362,9 @@ class TemperatureScaling:
         total = sum(scaled.values())
         return {s: p/total for s, p in scaled.items()}
 
-# ========== 集成引擎 V7.6 ==========
-class AttributeEngineV7_6:
-    def __init__(self, name: str, order: int = 3, alpha: float = 1.0, use_hmm: bool = True, temperature: float = 1.0):
+# ========== 集成引擎 V7.8 ==========
+class AttributeEngineV7_8:
+    def __init__(self, name: str, order: int = 4, alpha: float = 1.0, use_hmm: bool = True, temperature: float = 1.0):
         self.name = name
         self.states = ATTRIBUTE_STATES[name]
         self.use_hmm = use_hmm
@@ -436,9 +436,9 @@ class AttributeEngineV7_6:
             for m in self.model_names:
                 fused[s] += weights.get(m, 0) * model_dict[m].get(s, 0)
 
-        # 加强特征权重
+        feature_weight = 0.40 if self.name == "color" else 0.35
         for s in self.states:
-            fused[s] = 0.65 * fused[s] + 0.35 * feature_probs.get(s, 1.0/3)
+            fused[s] = (1 - feature_weight) * fused[s] + feature_weight * feature_probs.get(s, 1.0/3)
 
         total = sum(fused.values()) or 1.0
         fused = {s: p/total for s, p in fused.items()}
@@ -446,16 +446,16 @@ class AttributeEngineV7_6:
         return self.temp_scaler.calibrate(fused)
 
 # ========== 预测系统 ==========
-class PredictionSystemV7_6:
-    def __init__(self, order: int = 3, min_ig: float = 0.01, temperature: float = 1.0, use_hmm: bool = True):
+class PredictionSystemV7_8:
+    def __init__(self, order: int = 4, min_ig: float = 0.01, temperature: float = 1.0, use_hmm: bool = True):
         self.order = order
         self.min_ig = min_ig
         self.temperature = temperature
         self.use_hmm = use_hmm
         self.engines = {
-            "color": AttributeEngineV7_6("color", order, use_hmm=use_hmm, temperature=temperature),
-            "size": AttributeEngineV7_6("size", order, use_hmm=use_hmm, temperature=temperature),
-            "odd_even": AttributeEngineV7_6("odd_even", order, use_hmm=use_hmm, temperature=temperature)
+            "color": AttributeEngineV7_8("color", order, use_hmm=use_hmm, temperature=temperature),
+            "size": AttributeEngineV7_8("size", order, use_hmm=use_hmm, temperature=temperature),
+            "odd_even": AttributeEngineV7_8("odd_even", order, use_hmm=use_hmm, temperature=temperature)
         }
 
     def train_all(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]]):
@@ -488,7 +488,7 @@ class PredictionSystemV7_6:
         start_idx = max(len(seqs["color"]) - test_len, min_len)
 
         for idx in range(start_idx, len(seqs["color"]) - 1):
-            system = PredictionSystemV7_6(order=self.order, min_ig=self.min_ig,
+            system = PredictionSystemV7_8(order=self.order, min_ig=self.min_ig,
                                           temperature=self.temperature, use_hmm=self.use_hmm)
             train_seqs = {name: seqs[name][:idx] for name in seqs}
             train_draws = {name: draws[name][:idx] for name in draws}
@@ -523,7 +523,7 @@ class PredictionSystemV7_6:
         return acc, avg_logloss, color_second_acc, 0.5, avg_kl
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=150):
+def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=150):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
@@ -547,7 +547,7 @@ def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV7_6(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
+    system = PredictionSystemV7_8(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
     system.train_all(seqs, draws_dict)
     recents = {name: seqs[name][-order:] for name in seqs}
     recent_draws = {name: draws[-order:] for name in seqs}
@@ -590,11 +590,11 @@ def process_lottery(lottery_name: str, args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V7.6")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V7.8")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
-    p.add_argument("--order", type=int, default=3)
+    p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.01)
-    p.add_argument("--temp", type=float, default=0.9)
+    p.add_argument("--temp", type=float, default=0.85)
     p.add_argument("--use-hmm", action="store_true", default=True)
     p.add_argument("--no-hmm", dest="use_hmm", action="store_false")
     p.add_argument("--backtest", type=int, default=150)
