@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 V7.8 (推荐两个波色版)
+# 三彩种属性预测 V7.9 (色波重点优化版)
 
 from __future__ import annotations
 
@@ -362,8 +362,8 @@ class TemperatureScaling:
         total = sum(scaled.values())
         return {s: p/total for s, p in scaled.items()}
 
-# ========== 集成引擎 V7.8 ==========
-class AttributeEngineV7_8:
+# ========== 集成引擎 V7.9 ==========
+class AttributeEngineV7_9:
     def __init__(self, name: str, order: int = 4, alpha: float = 1.0, use_hmm: bool = True, temperature: float = 1.0):
         self.name = name
         self.states = ATTRIBUTE_STATES[name]
@@ -436,7 +436,8 @@ class AttributeEngineV7_8:
             for m in self.model_names:
                 fused[s] += weights.get(m, 0) * model_dict[m].get(s, 0)
 
-        feature_weight = 0.40 if self.name == "color" else 0.35
+        # 色波加强特征权重
+        feature_weight = 0.42 if self.name == "color" else 0.35
         for s in self.states:
             fused[s] = (1 - feature_weight) * fused[s] + feature_weight * feature_probs.get(s, 1.0/3)
 
@@ -446,16 +447,16 @@ class AttributeEngineV7_8:
         return self.temp_scaler.calibrate(fused)
 
 # ========== 预测系统 ==========
-class PredictionSystemV7_8:
+class PredictionSystemV7_9:
     def __init__(self, order: int = 4, min_ig: float = 0.01, temperature: float = 1.0, use_hmm: bool = True):
         self.order = order
         self.min_ig = min_ig
         self.temperature = temperature
         self.use_hmm = use_hmm
         self.engines = {
-            "color": AttributeEngineV7_8("color", order, use_hmm=use_hmm, temperature=temperature),
-            "size": AttributeEngineV7_8("size", order, use_hmm=use_hmm, temperature=temperature),
-            "odd_even": AttributeEngineV7_8("odd_even", order, use_hmm=use_hmm, temperature=temperature)
+            "color": AttributeEngineV7_9("color", order, use_hmm=use_hmm, temperature=temperature),
+            "size": AttributeEngineV7_9("size", order, use_hmm=use_hmm, temperature=temperature),
+            "odd_even": AttributeEngineV7_9("odd_even", order, use_hmm=use_hmm, temperature=temperature)
         }
 
     def train_all(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]]):
@@ -489,7 +490,7 @@ class PredictionSystemV7_8:
         start_idx = max(len(seqs["color"]) - test_len, min_len)
 
         for idx in range(start_idx, len(seqs["color"]) - 1):
-            system = PredictionSystemV7_8(order=self.order, min_ig=self.min_ig,
+            system = PredictionSystemV7_9(order=self.order, min_ig=self.min_ig,
                                           temperature=self.temperature, use_hmm=self.use_hmm)
             train_seqs = {name: seqs[name][:idx] for name in seqs}
             train_draws = {name: draws[name][:idx] for name in draws}
@@ -523,7 +524,7 @@ class PredictionSystemV7_8:
         color_second_acc = color_second_correct / total
         return acc, avg_logloss, color_second_acc, 0.5, avg_kl
 
-# ========== 仪表盘（新增两个波色推荐）==========
+# ========== 仪表盘 ==========
 def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=150):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
@@ -548,7 +549,7 @@ def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV7_8(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
+    system = PredictionSystemV7_9(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
     system.train_all(seqs, draws_dict)
     recents = {name: seqs[name][-order:] for name in seqs}
     recent_draws = {name: draws[-order:] for name in seqs}
@@ -562,10 +563,10 @@ def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1
             marker = " ✓" if s == data["best_state"] else ""
             print(f"   {s}: {p*100:.1f}%{marker}")
 
-    # 新增：推荐两个波色
+    # 推荐两个波色
     color_probs = pred["color"]["probs"]
     sorted_color = sorted(color_probs.items(), key=lambda x: -x[1])
-    print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}  (二中一概率较高)")
+    print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}")
 
     meta = pred["meta"]
     print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}")
@@ -596,7 +597,7 @@ def process_lottery(lottery_name: str, args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V7.8 - 推荐两个波色")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V7.9")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.01)
