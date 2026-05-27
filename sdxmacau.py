@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 V7.8 (最终加强版)
+# 三彩种属性预测 V7.8 (推荐两个波色版)
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def get_mod7(num: int) -> int:
 def get_cross_distance(prev: int, cur: int) -> int:
     return abs(prev - cur)
 
-# ========== 数据层（完整）==========
+# ========== 数据层 ==========
 @dataclass
 class DrawRecord:
     issue_no: str
@@ -466,11 +466,12 @@ class PredictionSystemV7_8:
         results = {}
         for name, engine in self.engines.items():
             probs = engine.predict_proba(recents[name], draws[name])
+            sorted_probs = sorted(probs.items(), key=lambda x: -x[1])
             results[name] = {
                 "probs": probs,
-                "max_prob": max(probs.values()),
-                "best_state": max(probs.items(), key=lambda x: x[1])[0],
-                "second_state": sorted(probs.items(), key=lambda x: -x[1])[1][0] if len(probs) >= 2 else None
+                "max_prob": sorted_probs[0][1],
+                "best_state": sorted_probs[0][0],
+                "second_state": sorted_probs[1][0] if len(sorted_probs) >= 2 else None
             }
         avg_max_prob = np.mean([results[name]["max_prob"] for name in self.engines])
         should_act = avg_max_prob >= self.min_ig
@@ -522,7 +523,7 @@ class PredictionSystemV7_8:
         color_second_acc = color_second_correct / total
         return acc, avg_logloss, color_second_acc, 0.5, avg_kl
 
-# ========== 仪表盘 ==========
+# ========== 仪表盘（新增两个波色推荐）==========
 def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=150):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
@@ -561,6 +562,11 @@ def print_dashboard(conn, lottery_name: str, order=4, min_ig=0.01, temperature=1
             marker = " ✓" if s == data["best_state"] else ""
             print(f"   {s}: {p*100:.1f}%{marker}")
 
+    # 新增：推荐两个波色
+    color_probs = pred["color"]["probs"]
+    sorted_color = sorted(color_probs.items(), key=lambda x: -x[1])
+    print(f"\n🎯 【推荐两个波色】: {sorted_color[0][0]} + {sorted_color[1][0]}  (二中一概率较高)")
+
     meta = pred["meta"]
     print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}")
     print(f"   原因: {meta['reason']}")
@@ -590,7 +596,7 @@ def process_lottery(lottery_name: str, args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V7.8")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V7.8 - 推荐两个波色")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.01)
