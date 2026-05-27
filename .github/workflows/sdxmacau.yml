@@ -1,8 +1,10 @@
-name: 三彩种 AI 时序预测 V9 稳定版
+name: V9 AI 时序预测系统
 
 on:
   schedule:
+    # 香港时间每天 22:30 自动运行
     - cron: '30 14 * * *'
+
   workflow_dispatch:
 
 permissions:
@@ -10,6 +12,7 @@ permissions:
 
 jobs:
   predict:
+
     runs-on: ubuntu-latest
 
     steps:
@@ -25,64 +28,44 @@ jobs:
       # Python
       # ==========================================================
 
-      - name: 设置 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       # ==========================================================
-      # 缓存 pip
+      # 显示环境
       # ==========================================================
 
-      - name: 缓存 pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v9
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # ==========================================================
-      # 安装依赖
-      # ==========================================================
-
-      - name: 安装依赖
+      - name: Python Version
         run: |
-          python -m pip install --upgrade pip
-          pip install numpy
+          python --version
+          pip --version
 
       # ==========================================================
-      # 查看文件
+      # 创建数据库（防止首次运行不存在）
       # ==========================================================
 
-      - name: 查看项目文件
+      - name: Create Empty Databases
         run: |
-          pwd
-          ls -lah
+          touch old_macau.db
+          touch hk_macau.db
+          touch xin_macau.db
 
       # ==========================================================
-      # 运行 AI 时序预测
+      # 运行预测
       # ==========================================================
 
-      - name: 运行预测
+      - name: Run V9 AI Prediction
         run: |
           python sdxmacau.py \
-            --order 2 \
-            --backtest 120
+            --order 2
 
       # ==========================================================
-      # 查看数据库
+      # 提交数据库
       # ==========================================================
 
-      - name: 查看数据库文件
-        run: |
-          ls -lh *.db || true
-
-      # ==========================================================
-      # 提交数据库更新
-      # ==========================================================
-
-      - name: 提交数据库更新
+      - name: Commit Database
         run: |
 
           git config user.name "github-actions[bot]"
@@ -90,31 +73,27 @@ jobs:
 
           git add *.db
 
-          git diff --cached --quiet && echo "无变化" && exit 0
-
-          git commit -m "AI预测自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')"
+          git commit -m "V9 AI 自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" \
+          || echo "No changes"
 
           git push
 
       # ==========================================================
-      # 上传数据库备份
+      # 上传备份
       # ==========================================================
 
-      - name: 上传数据库备份
+      - name: Upload Backup
         uses: actions/upload-artifact@v4
         with:
-          name: macau-ai-v9-backup
+          name: v9-ai-backup
           path: |
-            *.db
+            old_macau.db
+            hk_macau.db
+            xin_macau.db
 
       # ==========================================================
-      # 上传日志
+      # 永不失败
       # ==========================================================
 
-      - name: 上传日志
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: workflow-logs
-          path: |
-            *.log
+      - name: Finish
+        run: echo "V9 AI 时序系统运行完成"
