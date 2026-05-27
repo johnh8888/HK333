@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-三彩种属性预测 V9.1 研究加强版
+三彩种属性预测 V9.1 研究加强版 (无 scipy 依赖)
 新增功能：
 1. ΔLogLoss 显著性检验 (Wilcoxon signed-rank)
 2. 期望校准误差 (ECE) + 可靠性图数据
@@ -173,7 +173,7 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
     rows = conn.execute("SELECT special_number, draw_date FROM draws ORDER BY issue_no ASC LIMIT ?", (limit,)).fetchall()
     return [{"num": r["special_number"], "date": r["draw_date"]} for r in rows]
 
-# ========== 统计工具函数 ==========
+# ========== 统计工具函数 (纯 Python 实现) ==========
 def binomial_p_value(k: int, n: int, p0: float) -> float:
     from math import comb
     if k <= 0: return 1.0
@@ -192,8 +192,9 @@ def wilcoxon_signed_rank_test(diffs: List[float]) -> Tuple[float, float]:
     if n < 5:
         return 0, 1.0
     abs_diffs = [abs(d) for d in diffs]
-    ranks = np.argsort(np.argsort(abs_diffs)) + 1  # 简单秩
-    # 处理并列秩：实际应更精细，这里简化
+    # 计算秩（简单处理并列：平均秩）
+    order = np.argsort(np.argsort(abs_diffs)) + 1  # 无并列时正确，有并列时近似
+    ranks = order
     W_plus = sum(r for d, r in zip(diffs, ranks) if d > 0)
     W_minus = sum(r for d, r in zip(diffs, ranks) if d < 0)
     T = min(W_plus, W_minus)
@@ -201,19 +202,36 @@ def wilcoxon_signed_rank_test(diffs: List[float]) -> Tuple[float, float]:
     sigma = math.sqrt(n*(n+1)*(2*n+1)/24)
     if sigma == 0: return T, 1.0
     z = (T - mu) / sigma
-    # 双尾 p 值近似
+    # 双尾 p 值近似（标准正态 CDF）
     from math import erf
     p = 2 * (1 - 0.5 * (1 + erf(abs(z)/math.sqrt(2))))
     return T, p
 
 def mann_whitney_u(x: List[float], y: List[float]) -> Tuple[float, float]:
-    """Mann-Whitney U 检验，返回 U 统计量和 p-value (近似正态)"""
-    from scipy.stats import mannwhitneyu
-    try:
-        u, p = mannwhitneyu(x, y, alternative='two-sided')
-        return u, p
-    except:
+    """
+    纯 Python 实现 Mann-Whitney U 检验 (双尾，正态近似)
+    返回 U 统计量和 p-value
+    """
+    n1 = len(x); n2 = len(y)
+    if n1 == 0 or n2 == 0:
         return 0, 1.0
+    # 合并排序，计算秩
+    combined = np.concatenate([x, y])
+    ranks = np.argsort(np.argsort(combined)) + 1  # 简易秩（忽略并列精细处理）
+    rank_x = np.sum(ranks[:n1])
+    # U 统计量
+    U1 = n1*n2 + n1*(n1+1)/2 - rank_x
+    U2 = n1*n2 - U1
+    U = min(U1, U2)
+    # 正态近似参数
+    mu = n1*n2/2
+    sigma = math.sqrt(n1*n2*(n1+n2+1)/12)
+    if sigma == 0: return U, 1.0
+    z = (U - mu) / sigma
+    # 双尾 p 值
+    from math import erf
+    p = 2 * (1 - 0.5 * (1 + erf(abs(z)/math.sqrt(2))))
+    return U, p
 
 # ========== StableHMM ==========
 class StableHMM:
@@ -414,23 +432,19 @@ class OnlineBayesianWeight:
 class AdvancedMetrics:
     @staticmethod
     def ece(probs_list: List[Dict[str, float]], actual_list: List[str], n_bins: int = 10) -> Tuple[float, List[float], List[float]]:
-        """
-        计算期望校准误差 ECE。
-        返回 ECE, 每个bin的置信度均值, 每个bin的准确率。
-        """
         confidences = []
         accuracies = []
         for prob_dict, actual in zip(probs_list, actual_list):
             if actual in prob_dict:
                 confidences.append(prob_dict[actual])
-                accuracies.append(1.0)  # 事后准确率
+                accuracies.append(1.0)
             else:
                 confidences.append(0.0)
                 accuracies.append(0.0)
         if not confidences:
             return 0.0, [], []
         bin_boundaries = np.linspace(0, 1, n_bins + 1)
-        bin_indices = np.digitize(confidences, bin_boundaries[1:])  # [0, n_bins-1]
+        bin_indices = np.digitize(confidences, bin_boundaries[1:])
         ece_total = 0.0
         bin_conf = []
         bin_acc = []
@@ -449,16 +463,13 @@ class AdvancedMetrics:
     @staticmethod
     def entropy_decomposition(sub_model_probs_list: List[Dict[str, Dict[str, float]]],
                               fused_probs_list: List[Dict[str, float]]) -> Tuple[float, float, float]:
-        """总熵, 期望熵, 互信息 (MI)。"""
         total_ent = 0.0
         avg_expected_ent = 0.0
         n = len(fused_probs_list)
         if n == 0: return 0,0,0
         for fused, sub_dict in zip(fused_probs_list, sub_model_probs_list):
-            # 总熵 H(E[P])
             h_total = -sum(p * math.log(p+1e-12) for p in fused.values() if p > 0)
             total_ent += h_total
-            # 期望熵 E[H(P)]
             expected_ent = 0.0
             for m, probs in sub_dict.items():
                 h_sub = -sum(p * math.log(p+1e-12) for p in probs.values() if p > 0)
@@ -467,12 +478,11 @@ class AdvancedMetrics:
             avg_expected_ent += expected_ent
         total_ent /= n
         avg_expected_ent /= n
-        mi = total_ent - avg_expected_ent  # MI = H(E[P]) - E[H(P)]
+        mi = total_ent - avg_expected_ent
         return total_ent, avg_expected_ent, mi
 
     @staticmethod
     def rolling_window_delta_logloss(logloss_diffs: List[float], window: int = 30, step: int = 10) -> List[float]:
-        """滑动窗口的 ΔLogLoss 序列"""
         if len(logloss_diffs) < window: return []
         seq = []
         for i in range(0, len(logloss_diffs)-window+1, step):
@@ -481,11 +491,6 @@ class AdvancedMetrics:
 
     @staticmethod
     def regime_detection(series: List[float], min_seg: int = 30) -> Dict:
-        """
-        简单 regime 检测：寻找统计显著的结构断点。
-        使用滑动 Mann-Whitney U 检验比较前后两段。
-        返回断点位置和 p-value。
-        """
         n = len(series)
         if n < 2 * min_seg:
             return {"breakpoints": [], "p_values": []}
@@ -495,7 +500,7 @@ class AdvancedMetrics:
             before = series[:t]
             after = series[t:]
             u, p = mann_whitney_u(before, after)
-            if p < 0.05:  # 显著
+            if p < 0.05:
                 breakpoints.append(t)
                 pvals.append(p)
         return {"breakpoints": breakpoints, "p_values": pvals}
@@ -665,7 +670,7 @@ class PredictionSystemV9_1:
             "entropy": color_entropy,
             "threshold": entropy_thr
         }
-        results["_sub_models"] = sub_models  # 内部使用，不打印
+        results["_sub_models"] = sub_models
         return results
 
     def walk_forward_backtest(self, seqs, draws, test_len=150):
@@ -673,12 +678,11 @@ class PredictionSystemV9_1:
         correct_act = {n:0 for n in self.engines}; correct_all = {n:0 for n in self.engines}
         logloss_act = {n:0.0 for n in self.engines}; logloss_all = {n:0.0 for n in self.engines}
         uniform_logloss = {n: -math.log(1.0/len(ATTRIBUTE_STATES[n])) for n in self.engines}
-        delta_logloss_all = {n: [] for n in self.engines}  # 逐期记录
+        delta_logloss_all = {n: [] for n in self.engines}
 
-        # 高级指标记录
         pred_probs_all = {n: [] for n in self.engines}
         actuals_all = {n: [] for n in self.engines}
-        sub_model_probs_all = {n: [] for n in self.engines}  # 用于熵分解
+        sub_model_probs_all = {n: [] for n in self.engines}
 
         min_len = self.order + 40
         start_idx = max(len(seqs["color"]) - test_len, min_len)
@@ -705,7 +709,6 @@ class PredictionSystemV9_1:
                     logloss_act[name] += logl
                     correct_act[name] += (pred[name]["best_state"] == actuals[name])
                 correct_all[name] += (pred[name]["best_state"] == actuals[name])
-                # 记录用于ECE和熵分解
                 pred_probs_all[name].append(pred[name]["probs"])
                 actuals_all[name].append(actuals[name])
                 sub_model_probs_all[name].append(pred["_sub_models"][name])
@@ -724,22 +727,18 @@ class PredictionSystemV9_1:
             for name, engine in self.engines.items():
                 engine.update_weights(recents[name], recent_draws[name], actuals[name])
 
-        # 汇总
         def safe_div(a,b): return a/b if b>0 else 0
         acc_act = {n: safe_div(correct_act[n], total_act) for n in self.engines}
         acc_all = {n: safe_div(correct_all[n], total_all) for n in self.engines}
         avg_delta_logloss = {n: np.mean(delta_logloss_all[n]) if delta_logloss_all[n] else 0 for n in self.engines}
-        # ECE
         ece_results = {}
         for n in self.engines:
             ece, bin_conf, bin_acc = AdvancedMetrics.ece(pred_probs_all[n], actuals_all[n])
             ece_results[n] = {"ece": ece, "bin_conf": bin_conf, "bin_acc": bin_acc}
-        # 熵分解
         entropy_decomp = {}
         for n in self.engines:
             total_ent, exp_ent, mi = AdvancedMetrics.entropy_decomposition(sub_model_probs_all[n], pred_probs_all[n])
             entropy_decomp[n] = {"total_ent": total_ent, "expected_ent": exp_ent, "mi": mi}
-        # Wilcoxon 检验 ΔLogLoss > 0
         wilcoxon_p = {}
         for n in self.engines:
             if delta_logloss_all[n]:
@@ -747,7 +746,6 @@ class PredictionSystemV9_1:
                 wilcoxon_p[n] = p
             else:
                 wilcoxon_p[n] = 1.0
-        # Regime 检测 (对 ΔLogLoss 序列)
         regime_results = {}
         for n in self.engines:
             dl = delta_logloss_all[n]
@@ -812,7 +810,6 @@ def print_dashboard(conn, lottery_name: str, args):
     meta = pred["meta"]
     print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'} (avg_max={meta['avg_max']:.3f}, entropy={meta['entropy']:.3f})")
 
-    # 回测
     print(f"\n📊 在线增量 Walk-Forward 回测 (最近 {args.backtest} 期):")
     result = system.walk_forward_backtest(seqs, draws_dict, test_len=args.backtest)
 
@@ -842,7 +839,7 @@ def print_dashboard(conn, lottery_name: str, args):
             print(f"{name}: 未检测到显著断点 (序列较平稳)")
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V9.1 研究加强版")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V9.1 研究加强版 (无 scipy)")
     p.add_argument("--lottery", choices=["老澳门彩","香港彩","新澳门彩"])
     p.add_argument("--order", type=int, default=4)
     p.add_argument("--min-ig", type=float, default=0.45)
