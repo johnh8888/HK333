@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 三彩种属性预测 V7.3 Final Fixed (HMM 形状彻底修复)
+# 三彩种属性预测 V7.4 (完整回测 + 准确率优化版)
 
 from __future__ import annotations
 
@@ -173,9 +173,9 @@ def load_full_draws(conn, limit: int = 500) -> List[Dict]:
     rows = conn.execute("SELECT special_number, draw_date FROM draws ORDER BY draw_date ASC, issue_no ASC LIMIT ?", (limit,)).fetchall()
     return [{"num": r["special_number"], "date": r["draw_date"]} for r in rows]
 
-# ========== 稳定 HMM (最终修复) ==========
+# ========== StableHMM (优化版) ==========
 class StableHMM:
-    def __init__(self, n_states: int = 3, n_obs: int = 3, states_list: List[str] = None, reg_factor: float = 0.2):
+    def __init__(self, n_states: int = 3, n_obs: int = 3, states_list: List[str] = None, reg_factor: float = 0.18):
         self.n_states = n_states
         self.n_obs = n_obs
         self.states_list = states_list
@@ -187,37 +187,31 @@ class StableHMM:
         self.A = np.ones((n_states, n_states)) / n_states
         self.B = np.ones((n_states, n_obs)) / n_obs
 
-    def train(self, obs_seq: List[str], max_iter: int = 40):
-        if len(obs_seq) < 20:
+    def train(self, obs_seq: List[str], max_iter: int = 60):
+        if len(obs_seq) < 25:
             return
         obs_idx = np.array([self.obs_to_idx[o] for o in obs_seq])
         T = len(obs_idx)
 
         for _ in range(max_iter):
-            # Forward
             log_alpha = np.full((T, self.n_states), -np.inf)
             log_alpha[0] = np.log(self.pi + self.eps) + np.log(self.B[:, obs_idx[0]] + self.eps)
             for t in range(1, T):
                 tmp = log_alpha[t-1][:, None] + np.log(self.A + self.eps)
                 log_alpha[t] = np.logaddexp.reduce(tmp, axis=0) + np.log(self.B[:, obs_idx[t]] + self.eps)
 
-            # Backward
             log_beta = np.full((T, self.n_states), -np.inf)
             log_beta[-1] = 0.0
             for t in range(T-2, -1, -1):
                 tmp = np.log(self.A + self.eps) + np.log(self.B[:, obs_idx[t+1]] + self.eps) + log_beta[t+1]
                 log_beta[t] = np.logaddexp.reduce(tmp, axis=1)
 
-            # Gamma
             log_gamma = log_alpha + log_beta
             log_gamma -= np.logaddexp.reduce(log_gamma, axis=1, keepdims=True)
             gamma = np.exp(log_gamma)
 
-            # Update pi
-            self.pi = gamma[0]
-            self.pi /= np.sum(self.pi) + self.eps
+            self.pi = gamma[0] / (np.sum(gamma[0]) + self.eps)
 
-            # Update A (关键修复 - 避免广播错误)
             xi_sum = np.zeros((self.n_states, self.n_states))
             for t in range(T-1):
                 tmp = log_alpha[t][:, None] + np.log(self.A + self.eps) + np.log(self.B[:, obs_idx[t+1]] + self.eps) + log_beta[t+1]
@@ -229,7 +223,6 @@ class StableHMM:
             self.A = (1 - self.reg_factor) * self.A + self.reg_factor * uniform
             self.A /= np.sum(self.A, axis=1, keepdims=True) + self.eps
 
-            # Update B
             self.B = np.zeros((self.n_states, self.n_obs))
             for t in range(T):
                 self.B[:, obs_idx[t]] += gamma[t]
@@ -255,7 +248,6 @@ class StableHMM:
 
         next_hidden = gamma @ self.A
         next_probs = next_hidden @ self.B
-
         next_probs = np.clip(next_probs, self.eps, 1.0)
         next_probs /= np.sum(next_probs)
 
@@ -372,7 +364,7 @@ class TemperatureScaling:
         return {s: p/total for s, p in scaled.items()}
 
 # ========== 集成引擎 ==========
-class AttributeEngineV7_3:
+class AttributeEngineV7_4:
     def __init__(self, name: str, order: int = 3, alpha: float = 1.0, use_hmm: bool = True, temperature: float = 1.0):
         self.name = name
         self.states = ATTRIBUTE_STATES[name]
@@ -445,24 +437,29 @@ class AttributeEngineV7_3:
                 fused[s] += weights.get(m, 0) * model_dict[m].get(s, 0)
 
         for s in self.states:
-            fused[s] = 0.75 * fused[s] + 0.25 * feature_probs.get(s, 1.0/3)
+            fused[s] = 0.72 * fused[s] + 0.28 * feature_probs.get(s, 1.0/3)
 
         total = sum(fused.values()) or 1.0
         fused = {s: p/total for s, p in fused.items()}
 
         return self.temp_scaler.calibrate(fused)
 
+    def update_feedback(self, predicted_probs: Dict[str, float], actual: str):
+        prob_actual = predicted_probs.get(actual, 1e-10)
+        for m in self.model_names:
+            self.bayes_weight.update(m, prob_actual)
+
 # ========== 预测系统 ==========
-class PredictionSystemV7_3:
+class PredictionSystemV7_4:
     def __init__(self, order: int = 3, min_ig: float = 0.01, temperature: float = 1.0, use_hmm: bool = True):
         self.order = order
         self.min_ig = min_ig
         self.temperature = temperature
         self.use_hmm = use_hmm
         self.engines = {
-            "color": AttributeEngineV7_3("color", order, use_hmm=use_hmm, temperature=temperature),
-            "size": AttributeEngineV7_3("size", order, use_hmm=use_hmm, temperature=temperature),
-            "odd_even": AttributeEngineV7_3("odd_even", order, use_hmm=use_hmm, temperature=temperature)
+            "color": AttributeEngineV7_4("color", order, use_hmm=use_hmm, temperature=temperature),
+            "size": AttributeEngineV7_4("size", order, use_hmm=use_hmm, temperature=temperature),
+            "odd_even": AttributeEngineV7_4("odd_even", order, use_hmm=use_hmm, temperature=temperature)
         }
 
     def train_all(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]]):
@@ -484,11 +481,57 @@ class PredictionSystemV7_3:
         results["meta"] = {"should_act": should_act, "reason": f"avg_max_prob={avg_max_prob:.3f}"}
         return results
 
-    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], test_len: int = 100):
-        return ({name: 0.42 for name in self.engines}, {name: 0.85 for name in self.engines}, 0.65, 0.5, {name: 0.025 for name in self.engines}, {name: 0.13 for name in self.engines})
+    def walk_forward_backtest(self, seqs: Dict[str, List[str]], draws: Dict[str, List[Dict]], test_len: int = 120):
+        total = 0
+        correct = {name: 0 for name in self.engines}
+        logloss_sum = {name: 0.0 for name in self.engines}
+        kl_sum = {name: 0.0 for name in self.engines}
+        color_second_correct = 0
+        actuals_list = []
+        preds_list = []
+
+        min_len = self.order + 30
+        start_idx = max(len(seqs["color"]) - test_len, min_len)
+
+        for idx in range(start_idx, len(seqs["color"]) - 1):
+            system = PredictionSystemV7_4(order=self.order, min_ig=self.min_ig,
+                                          temperature=self.temperature, use_hmm=self.use_hmm)
+            train_seqs = {name: seqs[name][:idx] for name in seqs}
+            train_draws = {name: draws[name][:idx] for name in draws}
+            system.train_all(train_seqs, train_draws)
+
+            recents = {name: seqs[name][idx-self.order:idx] if idx >= self.order else seqs[name][:idx] for name in self.engines}
+            recent_draws = {name: draws[name][idx-self.order:idx] if idx >= self.order else draws[name][:idx] for name in self.engines}
+
+            pred = system.predict_all(recents, recent_draws)
+            actuals = {name: seqs[name][idx] for name in self.engines}
+
+            if pred["meta"]["should_act"]:
+                for name in self.engines:
+                    prob_actual = pred[name]["probs"].get(actuals[name], 1e-15)
+                    logloss_sum[name] += -math.log(prob_actual)
+                    baseline = system.engines[name].freq.probs
+                    kl = sum(p * math.log(p / baseline.get(s, 1e-15) + 1e-15) for s, p in pred[name]["probs"].items() if p > 0)
+                    kl_sum[name] += kl
+                    if pred[name]["best_state"] == actuals[name]:
+                        correct[name] += 1
+                if pred["color"]["best_state"] == actuals["color"] or pred["color"]["second_state"] == actuals["color"]:
+                    color_second_correct += 1
+                actuals_list.append(actuals["color"])
+                preds_list.append(pred["color"]["best_state"])
+                total += 1
+
+        if total == 0:
+            return {name:0.0 for name in self.engines}, {name:0.0 for name in self.engines}, 0.0, 1.0, {name:0.0 for name in self.engines}
+
+        acc = {name: correct[name]/total for name in self.engines}
+        avg_logloss = {name: logloss_sum[name]/total for name in self.engines}
+        avg_kl = {name: kl_sum[name]/total for name in self.engines}
+        color_second_acc = color_second_correct / total
+        return acc, avg_logloss, color_second_acc, 0.5, avg_kl
 
 # ========== 仪表盘 ==========
-def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=100):
+def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1.0, use_hmm=True, backtest_len=150):
     seqs = {
         "color": load_sequence(conn, get_color, limit=500),
         "size": load_sequence(conn, get_big_small, limit=500),
@@ -497,7 +540,7 @@ def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1
     draws = load_full_draws(conn, limit=500)
     draws_dict = {"color": draws, "size": draws, "odd_even": draws}
 
-    if len(seqs["color"]) < order + 20:
+    if len(seqs["color"]) < order + 30:
         print("历史数据不足，请先同步数据。")
         return
 
@@ -512,7 +555,7 @@ def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1
         }
         print(f"特码属性: {attrs['单双']} {attrs['大小']} {attrs['色波']}")
 
-    system = PredictionSystemV7_3(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
+    system = PredictionSystemV7_4(order=order, min_ig=min_ig, temperature=temperature, use_hmm=use_hmm)
     system.train_all(seqs, draws_dict)
     recents = {name: seqs[name][-order:] for name in seqs}
     recent_draws = {name: draws[-order:] for name in seqs}
@@ -530,8 +573,14 @@ def print_dashboard(conn, lottery_name: str, order=3, min_ig=0.01, temperature=1
     print(f"\n🧠 元决策: {'出手' if meta['should_act'] else '观望'}")
     print(f"   原因: {meta['reason']}")
 
-    print(f"\n📊 回测 (简化): 波色二中一准确率 ≈ 65%")
+    print(f"\n📊 无泄漏 Walk-Forward 回测 (最近 {backtest_len} 期):")
+    acc, logloss, color_second_acc, p_value, avg_kl = system.walk_forward_backtest(seqs, draws_dict, test_len=backtest_len)
+    for name in acc:
+        print(f"   {name} 准确率: {acc[name]*100:.1f}%   LogLoss: {logloss[name]:.4f}   KL: {avg_kl[name]:.4f}")
+    print(f"   波色二中一准确率: {color_second_acc*100:.1f}%")
+    print(f"   平均准确率: {np.mean(list(acc.values()))*100:.1f}%")
 
+# ========== 主函数 ==========
 def process_lottery(lottery_name: str, args):
     db_path = str(SCRIPT_DIR / DB_FILES[lottery_name])
     print(f"\n{'='*60}\n处理彩种: {lottery_name}\n数据库: {db_path}\n{'='*60}")
@@ -549,14 +598,14 @@ def process_lottery(lottery_name: str, args):
         conn.close()
 
 def main():
-    p = argparse.ArgumentParser(description="三彩种属性预测 V7.3 Final Fixed")
+    p = argparse.ArgumentParser(description="三彩种属性预测 V7.4")
     p.add_argument("--lottery", choices=["老澳门彩", "香港彩", "新澳门彩"])
     p.add_argument("--order", type=int, default=3)
     p.add_argument("--min-ig", type=float, default=0.01)
-    p.add_argument("--temp", type=float, default=1.0)
+    p.add_argument("--temp", type=float, default=0.9)
     p.add_argument("--use-hmm", action="store_true", default=True)
     p.add_argument("--no-hmm", dest="use_hmm", action="store_false")
-    p.add_argument("--backtest", type=int, default=100)
+    p.add_argument("--backtest", type=int, default=150)
     args = p.parse_args()
 
     if args.lottery:
