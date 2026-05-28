@@ -1,45 +1,14 @@
 #!/usr/bin/env python3
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 # =========================================================
-# 三彩种属性预测 V15-QUANT STABLE
+# 三彩种属性预测 V15-QUANT STABLE - 双推增强版
 #
-# 最终稳定增强版
-#
-# 修复内容：
-#
-# ✅ 真 Conditional 二阶 Markov
-# ✅ 稀疏状态自动回退
-# ✅ Bayesian Smoothing
-# ✅ Hidden Regime Detection
-# ✅ Rolling Online Calibration
-# ✅ 无未来泄漏
-# ✅ Rolling Temperature Window
-# ✅ Adaptive Entropy Filter
-# ✅ Bootstrap MonteCarlo Baseline
-# ✅ Markov Bootstrap
-# ✅ Sortino Ratio 修复
-# ✅ ProfitFactor 修复
-# ✅ Downside Risk
-# ✅ Drift Detection
-# ✅ Transition Confidence
-# ✅ 波动状态识别
-# ✅ 真动态窗口
-# ✅ 爆仓保护
-# ✅ 连续亏损熔断
-# ✅ 概率过度自信修复
-# ✅ Kelly稳定化
-# ✅ Regime Adaptive
-# ✅ WalkForward
-# ✅ 全部 NaN 防护
-# ✅ 下期预测
-# ✅ 色波预测
-# ✅ 大小预测
-# ✅ 单双预测
-#
+# 最终稳定完整版
+# 新增：色波主推 + 次推模式 + 双推回测命中
 # =========================================================
 
-from future import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -70,7 +39,7 @@ random.seed(SEED)
 # 基础
 # =========================================================
 
-SCRIPT_DIR = Path(file).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 DB_FILES = {
     "老澳门彩": "old_macau.db",
@@ -105,25 +74,20 @@ GREEN = {
 # =========================================================
 
 def get_color(num):
-
     if num in RED:
         return "红"
-
     if num in BLUE:
         return "蓝"
-
     return "绿"
 
 # =========================================================
 
 def get_big_small(num):
-
     return "大" if num >= 25 else "小"
 
 # =========================================================
 
 def get_odd_even(num):
-
     return "单" if num % 2 else "双"
 
 # =========================================================
@@ -132,7 +96,6 @@ def get_odd_even(num):
 
 @dataclass
 class DrawRecord:
-
     issue_no: str
     draw_date: str
     numbers: list
@@ -143,17 +106,13 @@ class DrawRecord:
 # =========================================================
 
 def connect_db(db_path):
-
     conn = sqlite3.connect(db_path)
-
     conn.row_factory = sqlite3.Row
-
     return conn
 
 # =========================================================
 
 def init_db(conn):
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS draws(
             issue_no TEXT PRIMARY KEY,
@@ -178,27 +137,21 @@ def init_db(conn):
 # =========================================================
 
 def fetch_json_url(url):
-
     try:
-
         req = Request(
             url,
             headers={
                 "User-Agent": "Mozilla/5.0"
             }
         )
-
         with urlopen(req, timeout=20) as resp:
-
             return json.loads(
                 resp.read().decode(
                     "utf-8",
                     errors="ignore"
                 )
             )
-
     except:
-
         return None
 
 # =========================================================
@@ -206,11 +159,8 @@ def fetch_json_url(url):
 # =========================================================
 
 def fetch_online_records(lottery_name):
-
     for url in THIRD_PARTY_URLS:
-
         payload = fetch_json_url(url)
-
         if not payload:
             continue
 
@@ -231,14 +181,11 @@ def fetch_online_records(lottery_name):
             continue
 
         try:
-
             latest_time = datetime.strptime(
                 target.get("openTime", ""),
                 "%Y-%m-%d %H:%M:%S"
             )
-
         except:
-
             latest_time = datetime.now()
 
         records = []
@@ -246,28 +193,20 @@ def fetch_online_records(lottery_name):
         for idx, item in enumerate(
             target.get("history", [])
         ):
-
             try:
-
                 parts = item.split("期：")
-
                 if len(parts) != 2:
                     continue
-
                 issue_no = parts[0].strip()
-
                 nums = [
                     int(x.strip())
                     for x in parts[1].split(",")
                 ]
-
                 if len(nums) != 7:
                     continue
-
                 draw_date = (
                     latest_time - timedelta(days=idx)
                 ).strftime("%Y-%m-%d")
-
                 records.append(
                     DrawRecord(
                         issue_no,
@@ -276,12 +215,10 @@ def fetch_online_records(lottery_name):
                         nums[6]
                     )
                 )
-
             except:
                 continue
 
         if records:
-
             return records, "marksix6"
 
     raise RuntimeError("无法获取数据")
@@ -291,7 +228,6 @@ def fetch_online_records(lottery_name):
 # =========================================================
 
 def sync_from_records(conn, records, source):
-
     now = datetime.now(
         timezone.utc
     ).isoformat()
@@ -300,14 +236,12 @@ def sync_from_records(conn, records, source):
     upd = 0
 
     for r in records:
-
         exist = conn.execute(
             "SELECT 1 FROM draws WHERE issue_no=?",
             (r.issue_no,)
         ).fetchone()
 
         if exist:
-
             conn.execute("""
                 UPDATE draws
                 SET draw_date=?,
@@ -324,11 +258,8 @@ def sync_from_records(conn, records, source):
                 now,
                 r.issue_no
             ))
-
             upd += 1
-
         else:
-
             conn.execute("""
                 INSERT INTO draws
                 VALUES (?,?,?,?,?,?,?)
@@ -341,11 +272,9 @@ def sync_from_records(conn, records, source):
                 now,
                 now
             ))
-
             ins += 1
 
     conn.commit()
-
     return len(records), ins, upd
 
 # =========================================================
@@ -353,12 +282,9 @@ def sync_from_records(conn, records, source):
 # =========================================================
 
 def issue_to_int(issue_no):
-
     nums = re.sub(r"\D", "", issue_no)
-
     if nums == "":
         return 0
-
     return int(nums)
 
 # =========================================================
@@ -366,7 +292,6 @@ def issue_to_int(issue_no):
 # =========================================================
 
 def load_sequence(conn, attr_func):
-
     rows = conn.execute("""
         SELECT issue_no, special_number
         FROM draws
@@ -389,15 +314,10 @@ def load_sequence(conn, attr_func):
 # =========================================================
 
 def entropy(probs):
-
     e = 0
-
     for p in probs.values():
-
         p = max(p, 1e-12)
-
         e -= p * math.log(p)
-
     return e
 
 # =========================================================
@@ -410,7 +330,6 @@ def bayesian_prob(
     alpha,
     states
 ):
-
     return (
         count + alpha
     ) / (
@@ -422,25 +341,17 @@ def bayesian_prob(
 # =========================================================
 
 def apply_temperature(probs, temp):
-
     logits = {}
-
     for k, v in probs.items():
-
         v = max(v, 1e-12)
-
         logits[k] = math.log(v)
 
     scaled = {}
-
     for k, v in logits.items():
-
         scaled[k] = math.exp(v / temp)
 
     total = sum(scaled.values())
-
     if total <= 0:
-
         return {
             k: 1 / len(probs)
             for k in probs
@@ -452,14 +363,12 @@ def apply_temperature(probs, temp):
     }
 
     for k in result:
-
         result[k] = min(
             max(result[k], 0.07),
             0.72
         )
 
     s = sum(result.values())
-
     return {
         k: v / s
         for k, v in result.items()
@@ -474,7 +383,6 @@ def rolling_temperature_search(
     actual_hist,
     window=80
 ):
-
     if len(probs_hist) < 25:
         return 1.0
 
@@ -485,32 +393,25 @@ def rolling_temperature_search(
     best_loss = 999999
 
     for temp in np.arange(0.85, 1.31, 0.02):
-
         losses = []
-
         for probs, actual in zip(
             probs_hist,
             actual_hist
         ):
-
             calibrated = apply_temperature(
                 probs,
                 temp
             )
-
             p = max(
                 calibrated.get(actual, 1e-12),
                 1e-12
             )
-
             losses.append(
                 -math.log(p)
             )
-
         loss = np.mean(losses)
 
         if loss < best_loss:
-
             best_loss = loss
             best_temp = temp
 
@@ -521,7 +422,6 @@ def rolling_temperature_search(
 # =========================================================
 
 def detect_regime(seq):
-
     if len(seq) < 60:
         return "NORMAL"
 
@@ -532,7 +432,6 @@ def detect_regime(seq):
     old_counts = Counter(old)
 
     drift = 0
-
     states = set(
         list(recent_counts.keys())
         +
@@ -540,15 +439,12 @@ def detect_regime(seq):
     )
 
     for s in states:
-
         r = recent_counts[s] / len(recent)
         o = old_counts[s] / len(old)
-
         drift += abs(r - o)
 
     if drift > 0.35:
         return "VOLATILE"
-
     return "NORMAL"
 
 # =========================================================
@@ -556,65 +452,42 @@ def detect_regime(seq):
 # =========================================================
 
 class ConditionalMarkov:
-
-    def init(
+    def __init__(
         self,
         states,
         alpha=1.5,
         decay=0.993,
         recent_periods=220
     ):
-
         self.states = states
-
         self.alpha = alpha
-
         self.decay = decay
-
         self.recent_periods = recent_periods
-
         self.global_counts = Counter()
-
         self.transitions1 = defaultdict(Counter)
-
         self.transitions2 = defaultdict(Counter)
 
-    # =====================================================
-
     def train(self, seq):
-
         seq = seq[-self.recent_periods:]
-
         for age, i in enumerate(
             reversed(range(len(seq)))
         ):
-
             s = seq[i]
-
             w = self.decay ** age
-
             self.global_counts[s] += w
 
         for age, i in enumerate(
             reversed(range(len(seq)-2))
         ):
-
             a = seq[i]
             b = seq[i+1]
             c = seq[i+2]
-
             w = self.decay ** age
-
             self.transitions2[(a,b)][c] += w
-
             self.transitions1[b][c] += w
 
-    # =====================================================
-
     def predict(self, recent):
-
         if len(recent) < 2:
-
             return {
                 s: 1 / len(self.states)
                 for s in self.states
@@ -627,7 +500,6 @@ class ConditionalMarkov:
             (a,b),
             Counter()
         )
-
         trans1 = self.transitions1.get(
             b,
             Counter()
@@ -637,45 +509,28 @@ class ConditionalMarkov:
         total1 = sum(trans1.values())
         totalg = sum(self.global_counts.values())
 
-        probs = {}
-
         if total2 >= 12:
-
-            for s in self.states:
-
-                probs[s] = bayesian_prob(
-                    trans2.get(s,0),
-                    total2,
-                    self.alpha,
-                    len(self.states)
-                )
-
+            base = trans2
+            total = total2
         elif total1 >= 8:
-
-            for s in self.states:
-
-                probs[s] = bayesian_prob(
-                    trans1.get(s,0),
-                    total1,
-                    self.alpha,
-                    len(self.states)
-                )
-
+            base = trans1
+            total = total1
         else:
+            base = self.global_counts
+            total = totalg
 
-            for s in self.states:
+        probs = {}
+        for s in self.states:
+            probs[s] = bayesian_prob(
+                base.get(s,0),
+                total,
+                self.alpha,
+                len(self.states)
+            )
 
-                probs[s] = bayesian_prob(
-                    self.global_counts.get(s,0),
-                    totalg,
-                    self.alpha,
-                    len(self.states)
-                )
-
-        total = sum(probs.values())
-
+        total_p = sum(probs.values())
         return {
-            k: v / total
+            k: v / total_p
             for k, v in probs.items()
         }
 
@@ -684,26 +539,15 @@ class ConditionalMarkov:
 # =========================================================
 
 class KellyBankroll:
-
-    def init(self, initial=10000):
-
+    def __init__(self, initial=10000):
         self.initial = initial
-
         self.current = initial
-
         self.history = []
-
         self.bet_count = 0
-
         self.win_count = 0
-
         self.loss_streak = 0
-
         self.cooldown = 0
-
         self.equity_curve = [initial]
-
-    # =====================================================
 
     def get_bet_size(
         self,
@@ -711,38 +555,27 @@ class KellyBankroll:
         odds_total,
         probs
     ):
-
         if self.cooldown > 0:
-
             self.cooldown -= 1
-
             return 0
 
         ent = entropy(probs)
-
         if ent > 0.96:
             return 0
 
         b = odds_total - 1
-
         q = 1 - p
-
         edge = (b * p) - q
 
         if edge <= 0.012:
             return 0
 
-        f = edge / b
-
-        f = 0.125
-
-        f = min(f, 0.03)
+        f = min(0.125, edge / b, 0.03)
 
         if self.current < 500:
             return 0
 
         bet = int(self.current * f)
-
         bet = min(
             bet,
             int(self.current * 0.05)
@@ -753,289 +586,93 @@ class KellyBankroll:
 
         return bet
 
-    # =====================================================
-
     def record_result(
         self,
         bet,
         won,
         odds_total
     ):
-
         if bet <= 0:
             return
 
         self.bet_count += 1
 
         if won:
-
             self.win_count += 1
-
             self.loss_streak = 0
-
             profit = bet * (
                 odds_total - 1
             )
-
         else:
-
             self.loss_streak += 1
-
             profit = -bet
-
             if self.loss_streak >= 6:
-
                 self.cooldown = 12
-
                 self.loss_streak = 0
 
         self.current += profit
-
         self.history.append(profit)
-
         self.equity_curve.append(
             self.current
         )
 
-    # =====================================================
-
     def get_max_drawdown(self):
-
         peak = self.equity_curve[0]
-
         max_dd = 0
-
         for x in self.equity_curve:
-
             peak = max(peak, x)
-
             dd = (peak - x) / peak
-
             max_dd = max(max_dd, dd)
-
         return max_dd * 100
 
-    # =====================================================
-
     def get_sortino(self):
-
         if len(self.history) < 2:
             return 0
-
         arr = np.array(self.history)
-
         mean = np.mean(arr)
-
         downside = arr[arr < 0]
-
         if len(downside) == 0:
             return 0
-
         downside_std = np.std(downside)
-
-        # 修复爆炸
         if downside_std <= 1e-6:
             return 0
-
         return (
             mean / downside_std
         ) * math.sqrt(len(arr))
 
-    # =====================================================
-
     def get_profit_factor(self):
-
         gains = sum(
             x for x in self.history
             if x > 0
         )
-
         losses = abs(sum(
             x for x in self.history
             if x < 0
         ))
-
-        # 修复爆炸
         if losses <= 0:
             return gains
-
         return gains / losses
 
-    # =====================================================
-
     def get_stats(self):
-
         roi = (
             (self.current / self.initial) - 1
         ) * 100
-
         profit = sum(self.history)
-
         winrate = 0
-
         if self.bet_count > 0:
-
             winrate = (
                 self.win_count
                 / self.bet_count
             ) * 100
-
         return profit, roi, winrate
-
-# =========================================================
-# Metrics
-# =========================================================
-
-def calc_logloss(probs_list, actuals):
-
-    vals = []
-
-    for probs, actual in zip(
-        probs_list,
-        actuals
-    ):
-
-        p = max(
-            probs.get(actual, 1e-12),
-            1e-12
-        )
-
-        vals.append(-math.log(p))
-
-    return np.mean(vals)
-
-# =========================================================
-
-def calc_brier(probs_list, actuals):
-
-    total = 0
-
-    for probs, actual in zip(
-        probs_list,
-        actuals
-    ):
-
-        row = 0
-
-        for s, p in probs.items():
-
-            y = 1 if s == actual else 0
-
-            row += (p - y) ** 2
-
-        total += row
-
-    return total / len(probs_list)
-
-# =========================================================
-
-def calc_ece(
-    probs_list,
-    actuals,
-    bins=10
-):
-
-    confidences = []
-    accuracies = []
-
-    for probs, actual in zip(
-        probs_list,
-        actuals
-    ):
-
-        pred = max(
-            probs,
-            key=probs.get
-        )
-
-        confidences.append(
-            probs[pred]
-        )
-
-        accuracies.append(
-            1 if pred == actual else 0
-        )
-
-    confidences = np.array(confidences)
-
-    accuracies = np.array(accuracies)
-
-    edges = np.linspace(0,1,bins+1)
-
-    ece = 0
-
-    for i in range(bins):
-
-        mask = (
-            (confidences >= edges[i])
-            &
-            (confidences < edges[i+1])
-        )
-
-        if np.sum(mask) == 0:
-            continue
-
-        avg_conf = np.mean(
-            confidences[mask]
-        )
-
-        avg_acc = np.mean(
-            accuracies[mask]
-        )
-
-        ece += (
-            np.sum(mask)
-            / len(confidences)
-        ) * abs(avg_conf - avg_acc)
-
-    return ece
-
-# =========================================================
-# Bootstrap MonteCarlo
-# =========================================================
-
-def markov_bootstrap_baseline(
-    actuals,
-    trials=3000
-):
-
-    wins = []
-
-    for _ in range(trials):
-
-        shuffled = actuals[:]
-
-        random.shuffle(shuffled)
-
-        acc = np.mean(
-            np.array(shuffled)
-            ==
-            np.array(actuals)
-        )
-
-        wins.append(acc)
-
-    return np.mean(wins)
-
-# =========================================================
-# 赔率
-# =========================================================
-
-def get_color_odds(color):
-
-    if color == "红":
-        return 2.7
-
-    return 2.8
 
 # =========================================================
 # MAIN
 # =========================================================
 
 def main():
-
     parser = argparse.ArgumentParser(
-        description="V15-QUANT STABLE"
+        description="V15-QUANT STABLE 双推增强版"
     )
 
     parser.add_argument(
@@ -1071,7 +708,6 @@ def main():
     init_db(conn)
 
     try:
-
         records, source = fetch_online_records(
             args.lottery
         )
@@ -1115,7 +751,6 @@ def main():
 
         probs_history = []
         actual_history = []
-
         historical_probs = []
         historical_actuals = []
 
@@ -1134,12 +769,9 @@ def main():
             )
 
             if regime == "VOLATILE":
-
                 dynamic_recent = 120
                 entropy_limit = 0.90
-
             else:
-
                 dynamic_recent = 240
                 entropy_limit = 0.96
 
@@ -1194,165 +826,63 @@ def main():
             probs_history.append(calibrated)
             actual_history.append(actual_c)
 
-            best_color = max(
-                calibrated,
-                key=calibrated.get
+            # ==================== 色波双推 ====================
+            sorted_color = sorted(
+                calibrated.items(),
+                key=lambda x: x[1],
+                reverse=True
             )
+            top2_colors = [sorted_color[0][0], sorted_color[1][0]]
+            best_color = sorted_color[0][0]
 
-            best_prob = calibrated[
-                best_color
-            ]
+            won_color = actual_c in top2_colors
+            if won_color:
+                color_correct += 1
 
-            odds = get_color_odds(
-                best_color
-            )
+            odds = 2.7 if best_color == "红" else 2.8
 
             if entropy(calibrated) > entropy_limit:
-
                 bet = 0
-
             else:
-
                 bet = bank.get_bet_size(
-                    best_prob,
+                    calibrated[best_color],
                     odds,
                     calibrated
                 )
 
-            won = (
-                best_color == actual_c
-            )
-
             bank.record_result(
                 bet,
-                won,
+                won_color,
                 odds
             )
 
-            if best_color == actual_c:
-                color_correct += 1
-
-            if (
-                max(pred_s,key=pred_s.get)
-                == actual_s
-            ):
+            # 大小 & 单双
+            if max(pred_s, key=pred_s.get) == actual_s:
                 size_correct += 1
-
-            if (
-                max(pred_o,key=pred_o.get)
-                == actual_o
-            ):
+            if max(pred_o, key=pred_o.get) == actual_o:
                 odd_correct += 1
 
         # =================================================
         # Metrics
         # =================================================
 
-        logloss = calc_logloss(
-            probs_history,
-            actual_history
-        )
-
-        brier = calc_brier(
-            probs_history,
-            actual_history
-        )
-
-        ece = calc_ece(
-            probs_history,
-            actual_history
-        )
-
-        mc = markov_bootstrap_baseline(
-            actual_history
-        )
-
         profit, roi, winrate = bank.get_stats()
 
-        max_dd = bank.get_max_drawdown()
-
-        pf = bank.get_profit_factor()
-
-        sortino = bank.get_sortino()
-
-        # =================================================
-
-        print("\n" + "="100)
-
-        print(
-            f"V15-QUANT STABLE 真WalkForward ({test_len}期)"
-        )
-
-        print("-"100)
-
-        print(
-            f"色波准确率 : "
-            f"{color_correct/test_len100:.2f}%"
-        )
-
-        print(
-            f"大小准确率 : "
-            f"{size_correct/test_len100:.2f}%"
-        )
-
-        print(
-            f"单双准确率 : "
-            f"{odd_correct/test_len100:.2f}%"
-        )
-
-        print("-"100)
-
-        print(
-            f"LogLoss    : {logloss:.6f}"
-        )
-
-        print(
-            f"BrierScore : {brier:.6f}"
-        )
-
-        print(
-            f"ECE         : {ece:.6f}"
-        )
-
-        print(
-            f"BootstrapMC : {mc100:.2f}%"
-        )
-
+        print("\n" + "="*100)
+        print(f"V15-QUANT STABLE 双推增强版 WalkForward ({test_len}期)")
         print("-"*100)
-
-        print(
-            f"最终资金    : ¥{bank.current:.2f}"
-        )
-
-        print(
-            f"总盈亏      : ¥{profit:.2f}"
-        )
-
-        print(
-            f"ROI         : {roi:.2f}%"
-        )
-
-        print(
-            f"下注次数    : {bank.bet_count}"
-        )
-
-        print(
-            f"真实胜率    : {winrate:.2f}%"
-        )
-
+        print(f"色波准确率(双推) : {color_correct/test_len*100:.2f}%")
+        print(f"大小准确率(单推) : {size_correct/test_len*100:.2f}%")
+        print(f"单双准确率(单推) : {odd_correct/test_len*100:.2f}%")
         print("-"*100)
-
-        print(
-            f"MaxDrawdown : {max_dd:.2f}%"
-        )
-
-        print(
-            f"ProfitFactor: {pf:.4f}"
-        )
-
-        print(
-            f"SortinoRatio: {sortino:.4f}"
-        )
+        print(f"最终资金    : ¥{bank.current:.2f}")
+        print(f"总盈亏      : ¥{profit:.2f}")
+        print(f"ROI         : {roi:.2f}%")
+        print(f"下注次数    : {bank.bet_count}")
+        print(f"真实胜率    : {winrate:.2f}%")
+        print(f"MaxDrawdown : {bank.get_max_drawdown():.2f}%")
+        print(f"ProfitFactor: {bank.get_profit_factor():.4f}")
+        print(f"SortinoRatio: {bank.get_sortino():.4f}")
 
         # =================================================
         # 下期预测
@@ -1364,14 +894,11 @@ def main():
         )
 
         # 色波
-
         future_color_engine = ConditionalMarkov(
             ["红","蓝","绿"],
             recent_periods=args.recent
         )
-
         future_color_engine.train(color_seq)
-
         future_color_probs = apply_temperature(
             future_color_engine.predict(
                 color_seq[-30:]
@@ -1380,14 +907,11 @@ def main():
         )
 
         # 大小
-
         future_size_engine = ConditionalMarkov(
             ["大","小"],
             recent_periods=args.recent
         )
-
         future_size_engine.train(size_seq)
-
         future_size_probs = apply_temperature(
             future_size_engine.predict(
                 size_seq[-30:]
@@ -1396,14 +920,11 @@ def main():
         )
 
         # 单双
-
         future_odd_engine = ConditionalMarkov(
             ["单","双"],
             recent_periods=args.recent
         )
-
         future_odd_engine.train(odd_seq)
-
         future_odd_probs = apply_temperature(
             future_odd_engine.predict(
                 odd_seq[-30:]
@@ -1411,118 +932,39 @@ def main():
             temp
         )
 
+        print("\n" + "="*100)
+        print("下期预测")
         print("-"*100)
 
-        print("下期预测")
-
-        print("-"100)
-
-        # =================================================
-        # 色波
-        # =================================================
-
         print("【色波】")
-
         sorted_color = sorted(
             future_color_probs.items(),
             key=lambda x: x[1],
             reverse=True
         )
+        for i, (k, v) in enumerate(sorted_color):
+            tag = "【主推】" if i == 0 else "【次推】" if i == 1 else "       "
+            print(f"{tag} {k} : {v*100:.2f}%")
 
-        for k, v in sorted_color:
+        print(f"\n推荐组合：{sorted_color[0][0]}（主推） + {sorted_color[1][0]}（次推）")
+        print(f"双推覆盖置信 : {(sorted_color[0][1] + sorted_color[1][1])*100:.2f}%")
 
-            print(f"{k} : {v100:.2f}%")
+        print("\n【大小】")
+        for k, v in sorted(future_size_probs.items(), key=lambda x: x[1], reverse=True):
+            print(f"{k} : {v*100:.2f}%")
 
-        best_color = max(
-            future_color_probs,
-            key=future_color_probs.get
-        )
-
-        print(
-            f"推荐色波 : {best_color}"
-        )
-
-        print(
-            f"色波置信 : "
-            f"{future_color_probs[best_color]*100:.2f}%"
-        )
-
-        print("-"60)
-
-        # =================================================
-        # 大小
-        # =================================================
-
-        print("【大小】")
-
-        sorted_size = sorted(
-            future_size_probs.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        for k, v in sorted_size:
-
-            print(f"{k} : {v100:.2f}%")
-
-        best_size = max(
-            future_size_probs,
-            key=future_size_probs.get
-        )
-
-        print(
-            f"推荐大小 : {best_size}"
-        )
-
-        print(
-            f"大小置信 : "
-            f"{future_size_probs[best_size]*100:.2f}%"
-        )
-
-        print("-"60)
-
-        # =================================================
-        # 单双
-        # =================================================
-
-        print("【单双】")
-
-        sorted_odd = sorted(
-            future_odd_probs.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        for k, v in sorted_odd:
-
-            print(f"{k} : {v100:.2f}%")
-
-        best_odd = max(
-            future_odd_probs,
-            key=future_odd_probs.get
-        )
-
-        print(
-            f"推荐单双 : {best_odd}"
-        )
-
-        print(
-            f"单双置信 : "
-            f"{future_odd_probs[best_odd]*100:.2f}%"
-        )
+        print("\n【单双】")
+        for k, v in sorted(future_odd_probs.items(), key=lambda x: x[1], reverse=True):
+            print(f"{k} : {v*100:.2f}%")
 
         print("="*100)
 
     except Exception as e:
-
         print(f"错误: {e}")
-
     finally:
-
         conn.close()
 
 # =========================================================
 
-if name == "main":
-
+if __name__ == "__main__":
     main()
