@@ -2,7 +2,7 @@ name: 三彩种属性预测
 
 on:
   schedule:
-    # 北京时间每天 22:30
+    # 北京时间每天 22:30（UTC 14:30）
     - cron: '30 14 * * *'
 
   workflow_dispatch:
@@ -11,27 +11,24 @@ permissions:
   contents: write
 
 jobs:
-
   predict:
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
 
-      # =====================================================
-      # Checkout
-      # =====================================================
+      # ==================================================
+      # 检出代码
+      # ==================================================
 
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # =====================================================
+      # ==================================================
       # Python
-      # =====================================================
+      # ==================================================
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -39,20 +36,20 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # =====================================================
-      # Install
-      # =====================================================
+      # ==================================================
+      # 安装依赖
+      # ==================================================
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install numpy
 
-      # =====================================================
-      # Run Prediction
-      # =====================================================
+      # ==================================================
+      # 运行预测
+      # ==================================================
 
-      - name: 运行 V14-QUANT FINAL
+      - name: 运行预测引擎
         run: |
 
           echo "=================================================="
@@ -63,7 +60,7 @@ jobs:
             --lottery 香港彩 \
             --recent 240 \
             --bankroll 10000 \
-            --test 100
+            --test 10
 
           echo "=================================================="
           echo "老澳门彩"
@@ -73,7 +70,7 @@ jobs:
             --lottery 老澳门彩 \
             --recent 240 \
             --bankroll 10000 \
-            --test 100
+            --test 10
 
           echo "=================================================="
           echo "新澳门彩"
@@ -83,62 +80,46 @@ jobs:
             --lottery 新澳门彩 \
             --recent 240 \
             --bankroll 10000 \
-            --test 100
+            --test 10
 
-      # =====================================================
-      # Check DB Changes
-      # =====================================================
+      # ==================================================
+      # 检查数据库变化
+      # ==================================================
 
       - name: 检查数据库变化
         id: changes
         run: |
 
-          git add old_macau.db hk_macau.db xin_macau.db
-
-          if git diff --cached --quiet; then
+          if git diff --quiet old_macau.db hk_macau.db xin_macau.db; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      # =====================================================
-      # Commit
-      # =====================================================
+      # ==================================================
+      # 提交数据库
+      # ==================================================
 
-      - name: 提交数据库更新
+      - name: 提交并推送数据库
         if: steps.changes.outputs.changed == 'true'
         run: |
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git commit -m "📊 自动更新数据 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')"
+          git add old_macau.db hk_macau.db xin_macau.db
 
-      # =====================================================
-      # Pull/Rebase
-      # =====================================================
+          git commit -m "📊 自动更新数据 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "没有变更"
 
-      - name: 拉取远程最新
-        if: steps.changes.outputs.changed == 'true'
-        run: |
+          git pull --rebase origin main || true
 
-          git pull --rebase origin main
+          git push
 
-      # =====================================================
-      # Push
-      # =====================================================
+      # ==================================================
+      # Artifact 备份
+      # ==================================================
 
-      - name: 推送更新
-        if: steps.changes.outputs.changed == 'true'
-        run: |
-
-          git push origin HEAD:main
-
-      # =====================================================
-      # Artifact Backup
-      # =====================================================
-
-      - name: 上传数据库备份
+      - name: 备份数据库
         uses: actions/upload-artifact@v4
         with:
           name: macau-dbs
