@@ -2,61 +2,148 @@ name: 三彩种属性预测
 
 on:
   schedule:
-    # 北京时间每天 22:30（UTC 14:30）运行，可在 Actions 页面手动触发
+    # 北京时间每天 22:30
     - cron: '30 14 * * *'
-  workflow_dispatch:   # 允许手动执行
+
+  workflow_dispatch:
 
 permissions:
-  contents: write      # 允许推送提交
+  contents: write
 
 jobs:
+
   predict:
+
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # 超时保护
+
+    timeout-minutes: 20
 
     steps:
+
+      # =====================================================
+      # Checkout
+      # =====================================================
+
       - name: 检出代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 获取完整历史，避免推送冲突
+          fetch-depth: 0
 
-      - name: 设置 Python 环境
+      # =====================================================
+      # Python
+      # =====================================================
+
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'       # 启用依赖缓存，加速后续运行
+          cache: 'pip'
+
+      # =====================================================
+      # Install
+      # =====================================================
 
       - name: 安装依赖
-        run: pip install numpy
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
 
-      - name: 运行预测引擎（三个彩种，回测最近 100 期）
-        run: python sdxmacau.py --order 3 --min-ig 0.01 --temp 1.0 --backtest 100
+      # =====================================================
+      # Run Prediction
+      # =====================================================
+
+      - name: 运行 V14-QUANT FINAL
+        run: |
+
+          echo "=================================================="
+          echo "香港彩"
+          echo "=================================================="
+
+          python sdxmacau.py \
+            --lottery 香港彩 \
+            --recent 240 \
+            --bankroll 10000 \
+            --test 100
+
+          echo "=================================================="
+          echo "老澳门彩"
+          echo "=================================================="
+
+          python sdxmacau.py \
+            --lottery 老澳门彩 \
+            --recent 240 \
+            --bankroll 10000 \
+            --test 100
+
+          echo "=================================================="
+          echo "新澳门彩"
+          echo "=================================================="
+
+          python sdxmacau.py \
+            --lottery 新澳门彩 \
+            --recent 240 \
+            --bankroll 10000 \
+            --test 100
+
+      # =====================================================
+      # Check DB Changes
+      # =====================================================
 
       - name: 检查数据库变化
         id: changes
         run: |
-          if git diff --quiet old_macau.db hk_macau.db xin_macau.db; then
+
+          git add old_macau.db hk_macau.db xin_macau.db
+
+          if git diff --cached --quiet; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: 提交并推送数据库更新
+      # =====================================================
+      # Commit
+      # =====================================================
+
+      - name: 提交数据库更新
         if: steps.changes.outputs.changed == 'true'
         run: |
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add old_macau.db hk_macau.db xin_macau.db
-          git commit -m "📊 自动更新数据 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')"
-          git pull --rebase   # 先拉取远程更新，避免推送冲突
-          git push
 
-      - name: 备份数据库（Artifact 存档）
+          git commit -m "📊 自动更新数据 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')"
+
+      # =====================================================
+      # Pull/Rebase
+      # =====================================================
+
+      - name: 拉取远程最新
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+
+          git pull --rebase origin main
+
+      # =====================================================
+      # Push
+      # =====================================================
+
+      - name: 推送更新
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+
+          git push origin HEAD:main
+
+      # =====================================================
+      # Artifact Backup
+      # =====================================================
+
+      - name: 上传数据库备份
         uses: actions/upload-artifact@v4
         with:
-          name: macau-dbs-$(date +'%Y%m%d-%H%M')
+          name: macau-dbs
           path: |
             old_macau.db
             hk_macau.db
             xin_macau.db
-          retention-days: 30   # 备份保留 30 天
+          retention-days: 30
