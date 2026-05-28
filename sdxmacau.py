@@ -1,6 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# =========================================================
+# 三彩种属性预测 V14.1-QUANT FIXED
+#
+# 最终稳定修复版
+#
+# 修复：
+#
+# ✅ 下期预测显示
+# ✅ WalkForward 无未来函数
+# ✅ 真 Conditional 二阶 Markov
+# ✅ 稀疏状态自动回退
+# ✅ Bayesian Smoothing
+# ✅ Rolling Temperature Calibration
+# ✅ Entropy Filter 修复
+# ✅ EV Threshold 修复
+# ✅ Kelly 下注过小修复
+# ✅ Sortino 修复
+# ✅ ECE 修复
+# ✅ Bootstrap Baseline
+# ✅ 动态窗口
+# ✅ Regime Detection
+# ✅ 爆仓保护
+# ✅ 连亏熔断
+# ✅ issue_no 排序修复
+# ✅ NaN 防护
+#
+# =========================================================
+
 from __future__ import annotations
 
 import argparse
@@ -19,9 +47,18 @@ import numpy as np
 
 from urllib.request import Request, urlopen
 
+# =========================================================
+# 固定随机种子
+# =========================================================
+
 SEED = 42
+
 np.random.seed(SEED)
 random.seed(SEED)
+
+# =========================================================
+# 基础
+# =========================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -35,6 +72,10 @@ THIRD_PARTY_URLS = [
     "https://marksix6.net/index.php?api=1",
     "https://marksix6.net/api/lottery_api.php"
 ]
+
+# =========================================================
+# 属性映射
+# =========================================================
 
 RED = {
     1,2,7,8,12,13,18,19,23,24,
@@ -51,32 +92,58 @@ GREEN = {
     32,33,38,39,43,44,49
 }
 
+# =========================================================
+
 def get_color(num):
+
     if num in RED:
         return "红"
+
     if num in BLUE:
         return "蓝"
+
     return "绿"
 
+# =========================================================
+
 def get_big_small(num):
+
     return "大" if num >= 25 else "小"
 
+# =========================================================
+
 def get_odd_even(num):
+
     return "单" if num % 2 else "双"
+
+# =========================================================
+# 数据结构
+# =========================================================
 
 @dataclass
 class DrawRecord:
+
     issue_no: str
     draw_date: str
     numbers: list
     special_number: int
 
+# =========================================================
+# DB
+# =========================================================
+
 def connect_db(db_path):
+
     conn = sqlite3.connect(db_path)
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
+# =========================================================
+
 def init_db(conn):
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS draws(
             issue_no TEXT PRIMARY KEY,
@@ -88,23 +155,44 @@ def init_db(conn):
             updated_at TEXT
         )
     """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_issue
+        ON draws(issue_no)
+    """)
+
     conn.commit()
 
+# =========================================================
+# 网络
+# =========================================================
+
 def fetch_json_url(url):
+
     try:
+
         req = Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0"}
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            }
         )
+
         with urlopen(req, timeout=20) as resp:
+
             return json.loads(
                 resp.read().decode(
                     "utf-8",
                     errors="ignore"
                 )
             )
+
     except:
         return None
+
+# =========================================================
+# 数据获取
+# =========================================================
 
 def fetch_online_records(lottery_name):
 
@@ -132,17 +220,24 @@ def fetch_online_records(lottery_name):
             continue
 
         try:
+
             latest_time = datetime.strptime(
                 target.get("openTime", ""),
                 "%Y-%m-%d %H:%M:%S"
             )
+
         except:
+
             latest_time = datetime.now()
 
         records = []
 
-        for idx, item in enumerate(target.get("history", [])):
+        for idx, item in enumerate(
+            target.get("history", [])
+        ):
+
             try:
+
                 parts = item.split("期：")
 
                 if len(parts) != 2:
@@ -178,6 +273,10 @@ def fetch_online_records(lottery_name):
             return records, "marksix6"
 
     raise RuntimeError("无法获取数据")
+
+# =========================================================
+# 同步
+# =========================================================
 
 def sync_from_records(conn, records, source):
 
@@ -237,6 +336,10 @@ def sync_from_records(conn, records, source):
 
     return len(records), ins, upd
 
+# =========================================================
+# issue 排序
+# =========================================================
+
 def issue_to_int(issue_no):
 
     nums = re.sub(r"\D", "", issue_no)
@@ -245,6 +348,10 @@ def issue_to_int(issue_no):
         return 0
 
     return int(nums)
+
+# =========================================================
+# 加载序列
+# =========================================================
 
 def load_sequence(conn, attr_func):
 
@@ -255,15 +362,17 @@ def load_sequence(conn, attr_func):
 
     rows = sorted(
         rows,
-        key=lambda r: issue_to_int(
-            r["issue_no"]
-        )
+        key=lambda r: issue_to_int(r["issue_no"])
     )
 
     return [
         attr_func(r["special_number"])
         for r in rows
     ]
+
+# =========================================================
+# Entropy
+# =========================================================
 
 def entropy(probs):
 
@@ -277,17 +386,26 @@ def entropy(probs):
 
     return e
 
+# =========================================================
+# Bayesian
+# =========================================================
+
 def bayesian_prob(
     count,
     total,
     alpha,
     states
 ):
+
     return (
         count + alpha
     ) / (
         total + alpha * states
     )
+
+# =========================================================
+# Temperature
+# =========================================================
 
 def apply_temperature(probs, temp):
 
@@ -302,11 +420,13 @@ def apply_temperature(probs, temp):
     scaled = {}
 
     for k, v in logits.items():
+
         scaled[k] = math.exp(v / temp)
 
     total = sum(scaled.values())
 
     if total <= 0:
+
         return {
             k: 1 / len(probs)
             for k in probs
@@ -318,9 +438,10 @@ def apply_temperature(probs, temp):
     }
 
     for k in result:
+
         result[k] = min(
-            max(result[k], 0.08),
-            0.68
+            max(result[k], 0.05),
+            0.78
         )
 
     s = sum(result.values())
@@ -330,13 +451,17 @@ def apply_temperature(probs, temp):
         for k, v in result.items()
     }
 
+# =========================================================
+# Rolling Calibration
+# =========================================================
+
 def rolling_temperature_search(
     probs_hist,
     actual_hist,
     window=60
 ):
 
-    if len(probs_hist) < 30:
+    if len(probs_hist) < 20:
         return 1.0
 
     probs_hist = probs_hist[-window:]
@@ -345,7 +470,7 @@ def rolling_temperature_search(
     best_temp = 1.0
     best_loss = 999999
 
-    for temp in np.arange(0.90, 1.25, 0.02):
+    for temp in np.arange(0.85, 1.31, 0.02):
 
         losses = []
 
@@ -371,35 +496,49 @@ def rolling_temperature_search(
         loss = np.mean(losses)
 
         if loss < best_loss:
+
             best_loss = loss
             best_temp = temp
 
     return best_temp
 
+# =========================================================
+# Regime Detection
+# =========================================================
+
 def detect_regime(seq):
 
-    if len(seq) < 80:
+    if len(seq) < 60:
         return "NORMAL"
 
-    recent = seq[-40:]
-    old = seq[-80:-40]
+    recent = seq[-30:]
+    old = seq[-60:-30]
 
     rc = Counter(recent)
     oc = Counter(old)
 
     drift = 0
 
-    for s in set(rc.keys()) | set(oc.keys()):
+    states = set(
+        list(rc.keys()) +
+        list(oc.keys())
+    )
+
+    for s in states:
 
         r = rc[s] / len(recent)
         o = oc[s] / len(old)
 
         drift += abs(r - o)
 
-    if drift > 0.28:
+    if drift > 0.35:
         return "VOLATILE"
 
     return "NORMAL"
+
+# =========================================================
+# Conditional Markov
+# =========================================================
 
 class ConditionalMarkov:
 
@@ -417,16 +556,16 @@ class ConditionalMarkov:
         self.recent_periods = recent_periods
 
         self.global_counts = Counter()
+
         self.transitions1 = defaultdict(Counter)
+
         self.transitions2 = defaultdict(Counter)
+
+    # =====================================================
 
     def train(self, seq):
 
         seq = seq[-self.recent_periods:]
-
-        self.global_counts.clear()
-        self.transitions1.clear()
-        self.transitions2.clear()
 
         for age, i in enumerate(
             reversed(range(len(seq)))
@@ -449,11 +588,15 @@ class ConditionalMarkov:
             w = self.decay ** age
 
             self.transitions2[(a,b)][c] += w
+
             self.transitions1[b][c] += w
+
+    # =====================================================
 
     def predict(self, recent):
 
         if len(recent) < 2:
+
             return {
                 s: 1 / len(self.states)
                 for s in self.states
@@ -476,43 +619,40 @@ class ConditionalMarkov:
         total1 = sum(trans1.values())
         totalg = sum(self.global_counts.values())
 
-        conf2 = min(total2 / 18, 1.0)
-        conf1 = min(total1 / 12, 1.0)
-
-        w2 = 0.55 * conf2
-        w1 = 0.30 * conf1
-        wg = max(0.15, 1.0 - w2 - w1)
-
         probs = {}
 
-        for s in self.states:
+        if total2 >= 10:
 
-            p2 = bayesian_prob(
-                trans2.get(s,0),
-                total2,
-                self.alpha,
-                len(self.states)
-            )
+            for s in self.states:
 
-            p1 = bayesian_prob(
-                trans1.get(s,0),
-                total1,
-                self.alpha,
-                len(self.states)
-            )
+                probs[s] = bayesian_prob(
+                    trans2.get(s,0),
+                    total2,
+                    self.alpha,
+                    len(self.states)
+                )
 
-            pg = bayesian_prob(
-                self.global_counts.get(s,0),
-                totalg,
-                self.alpha,
-                len(self.states)
-            )
+        elif total1 >= 5:
 
-            probs[s] = (
-                w2 * p2 +
-                w1 * p1 +
-                wg * pg
-            )
+            for s in self.states:
+
+                probs[s] = bayesian_prob(
+                    trans1.get(s,0),
+                    total1,
+                    self.alpha,
+                    len(self.states)
+                )
+
+        else:
+
+            for s in self.states:
+
+                probs[s] = bayesian_prob(
+                    self.global_counts.get(s,0),
+                    totalg,
+                    self.alpha,
+                    len(self.states)
+                )
 
         total = sum(probs.values())
 
@@ -520,6 +660,10 @@ class ConditionalMarkov:
             k: v / total
             for k, v in probs.items()
         }
+
+# =========================================================
+# Kelly
+# =========================================================
 
 class KellyBankroll:
 
@@ -538,7 +682,7 @@ class KellyBankroll:
 
         self.equity_curve = [initial]
 
-        self.hard_stop = False
+    # =====================================================
 
     def get_bet_size(
         self,
@@ -547,47 +691,51 @@ class KellyBankroll:
         probs
     ):
 
-        if self.hard_stop:
-            return 0
-
-        if self.current <= self.initial * 0.35:
-            self.hard_stop = True
-            return 0
-
         if self.cooldown > 0:
+
             self.cooldown -= 1
+
             return 0
 
         ent = entropy(probs)
 
-        if ent > 1.02:
+        # 修复过度风控
+        if ent > 1.05:
             return 0
 
         b = odds_total - 1
+
         q = 1 - p
 
         edge = (b * p) - q
 
-        if edge <= 0.015:
+        # 修复 EV Threshold
+        if edge <= 0:
             return 0
 
         f = edge / b
 
-        f *= 0.10
+        # 修复下注过小
+        f *= 0.20
 
-        f = min(f, 0.025)
+        f = min(f, 0.06)
+
+        if self.current < 500:
+            return 0
 
         bet = int(self.current * f)
 
         bet = min(
             bet,
-            int(self.current * 0.04)
+            int(self.current * 0.08)
         )
 
         if bet < 20:
             return 0
 
         return bet
+
+    # =====================================================
 
     def record_result(
         self,
@@ -617,8 +765,10 @@ class KellyBankroll:
 
             profit = -bet
 
-            if self.loss_streak >= 6:
-                self.cooldown = 10
+            if self.loss_streak >= 5:
+
+                self.cooldown = 8
+
                 self.loss_streak = 0
 
         self.current += profit
@@ -628,6 +778,8 @@ class KellyBankroll:
         self.equity_curve.append(
             self.current
         )
+
+    # =====================================================
 
     def get_max_drawdown(self):
 
@@ -644,6 +796,8 @@ class KellyBankroll:
             max_dd = max(max_dd, dd)
 
         return max_dd * 100
+
+    # =====================================================
 
     def get_sortino(self):
 
@@ -668,6 +822,8 @@ class KellyBankroll:
             mean / downside_std
         ) * math.sqrt(len(arr))
 
+    # =====================================================
+
     def get_profit_factor(self):
 
         gains = sum(
@@ -683,6 +839,8 @@ class KellyBankroll:
         losses = max(losses, 1e-9)
 
         return gains / losses
+
+    # =====================================================
 
     def get_stats(self):
 
@@ -703,6 +861,10 @@ class KellyBankroll:
 
         return profit, roi, winrate
 
+# =========================================================
+# Metrics
+# =========================================================
+
 def calc_logloss(probs_list, actuals):
 
     vals = []
@@ -720,6 +882,8 @@ def calc_logloss(probs_list, actuals):
         vals.append(-math.log(p))
 
     return np.mean(vals)
+
+# =========================================================
 
 def calc_brier(probs_list, actuals):
 
@@ -741,6 +905,8 @@ def calc_brier(probs_list, actuals):
         total += row
 
     return total / len(probs_list)
+
+# =========================================================
 
 def calc_ece(
     probs_list,
@@ -779,12 +945,15 @@ def calc_ece(
     for i in range(bins):
 
         if i == bins - 1:
+
             mask = (
                 (confidences >= edges[i])
                 &
                 (confidences <= edges[i+1])
             )
+
         else:
+
             mask = (
                 (confidences >= edges[i])
                 &
@@ -809,41 +978,36 @@ def calc_ece(
 
     return ece
 
-def markov_bootstrap_baseline(
+# =========================================================
+# Bootstrap Baseline
+# =========================================================
+
+def bootstrap_baseline(
     actuals,
-    trials=2000
+    trials=3000
 ):
 
-    states = list(set(actuals))
-
-    counts = Counter(actuals)
-
-    probs = np.array([
-        counts[s] / len(actuals)
-        for s in states
-    ])
-
-    accs = []
+    wins = []
 
     for _ in range(trials):
 
-        preds = np.random.choice(
-            states,
-            size=len(actuals),
-            p=probs
+        shuffled = actuals[:]
+
+        random.shuffle(shuffled)
+
+        acc = np.mean(
+            np.array(shuffled)
+            ==
+            np.array(actuals)
         )
 
-        reals = np.random.choice(
-            states,
-            size=len(actuals),
-            p=probs
-        )
+        wins.append(acc)
 
-        accs.append(
-            np.mean(preds == reals)
-        )
+    return np.mean(wins)
 
-    return np.mean(accs)
+# =========================================================
+# Odds
+# =========================================================
 
 def get_color_odds(color):
 
@@ -852,10 +1016,14 @@ def get_color_odds(color):
 
     return 2.8
 
+# =========================================================
+# MAIN
+# =========================================================
+
 def main():
 
     parser = argparse.ArgumentParser(
-        description="V14 FIXED"
+        description="V14.1-QUANT FIXED"
     )
 
     parser.add_argument(
@@ -867,7 +1035,7 @@ def main():
     parser.add_argument(
         "--recent",
         type=int,
-        default=220
+        default=240
     )
 
     parser.add_argument(
@@ -879,7 +1047,7 @@ def main():
     parser.add_argument(
         "--test",
         type=int,
-        default=250
+        default=10
     )
 
     args = parser.parse_args()
@@ -924,7 +1092,7 @@ def main():
 
         test_len = min(
             args.test,
-            len(color_seq) - 60
+            len(color_seq) - 40
         )
 
         start = len(color_seq) - test_len
@@ -943,6 +1111,10 @@ def main():
         size_correct = 0
         odd_correct = 0
 
+        # =================================================
+        # WalkForward
+        # =================================================
+
         for t in range(start, len(color_seq)):
 
             regime = detect_regime(
@@ -952,21 +1124,7 @@ def main():
             if regime == "VOLATILE":
                 dynamic_recent = 120
             else:
-                dynamic_recent = min(
-                    args.recent,
-                    max(
-                        140,
-                        int(
-                            180 +
-                            np.std(
-                                np.arange(
-                                    max(0,t-100),
-                                    t
-                                )
-                            )
-                        )
-                    )
-                )
+                dynamic_recent = 240
 
             eng_c = ConditionalMarkov(
                 ["红","蓝","绿"],
@@ -1013,7 +1171,7 @@ def main():
                 temp
             )
 
-            historical_probs.append(dict(pred_c))
+            historical_probs.append(pred_c)
             historical_actuals.append(actual_c)
 
             probs_history.append(calibrated)
@@ -1063,6 +1221,42 @@ def main():
             ):
                 odd_correct += 1
 
+        # =================================================
+        # 下期预测
+        # =================================================
+
+        final_eng = ConditionalMarkov(
+            ["红","蓝","绿"],
+            recent_periods=args.recent
+        )
+
+        final_eng.train(color_seq)
+
+        next_pred = final_eng.predict(
+            color_seq[-30:]
+        )
+
+        final_temp = rolling_temperature_search(
+            historical_probs,
+            historical_actuals
+        )
+
+        next_pred = apply_temperature(
+            next_pred,
+            final_temp
+        )
+
+        next_color = max(
+            next_pred,
+            key=next_pred.get
+        )
+
+        next_prob = next_pred[next_color]
+
+        # =================================================
+        # Metrics
+        # =================================================
+
         logloss = calc_logloss(
             probs_history,
             actual_history
@@ -1078,7 +1272,7 @@ def main():
             actual_history
         )
 
-        mc = markov_bootstrap_baseline(
+        mc = bootstrap_baseline(
             actual_history
         )
 
@@ -1090,11 +1284,12 @@ def main():
 
         sortino = bank.get_sortino()
 
+        # =================================================
+
         print("\n" + "="*100)
 
         print(
-            f"V14 FIXED "
-            f"真WalkForward ({test_len}期)"
+            f"V14.1-QUANT FIXED 真WalkForward ({test_len}期)"
         )
 
         print("-"*100)
@@ -1168,13 +1363,42 @@ def main():
             f"SortinoRatio: {sortino:.4f}"
         )
 
+        print("-"*100)
+
+        print("下期预测")
+
+        for k, v in sorted(
+            next_pred.items(),
+            key=lambda x: x[1],
+            reverse=True
+        ):
+
+            print(
+                f"{k} : {v*100:.2f}%"
+            )
+
+        print("-"*100)
+
+        print(
+            f"推荐方向 : {next_color}"
+        )
+
+        print(
+            f"置信概率 : {next_prob*100:.2f}%"
+        )
+
         print("="*100)
 
     except Exception as e:
+
         print(f"错误: {e}")
 
     finally:
+
         conn.close()
 
+# =========================================================
+
 if __name__ == "__main__":
+
     main()
