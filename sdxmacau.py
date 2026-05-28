@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -- coding: utf-8 --
 
 # =========================================================
-# 三彩种属性预测 V14.1-QUANT FIXED
+# 三彩种属性预测 V15-QUANT STABLE
 #
-# 最终稳定修复版
+# 最终稳定增强版
 #
-# 修复：
+# 修复内容：
 #
-# ✅ 下期预测显示
-# ✅ WalkForward 无未来函数
 # ✅ 真 Conditional 二阶 Markov
 # ✅ 稀疏状态自动回退
 # ✅ Bayesian Smoothing
-# ✅ Rolling Temperature Calibration
-# ✅ Entropy Filter 修复
-# ✅ EV Threshold 修复
-# ✅ Kelly 下注过小修复
-# ✅ Sortino 修复
-# ✅ ECE 修复
-# ✅ Bootstrap Baseline
-# ✅ 动态窗口
-# ✅ Regime Detection
+# ✅ Hidden Regime Detection
+# ✅ Rolling Online Calibration
+# ✅ 无未来泄漏
+# ✅ Rolling Temperature Window
+# ✅ Adaptive Entropy Filter
+# ✅ Bootstrap MonteCarlo Baseline
+# ✅ Markov Bootstrap
+# ✅ Sortino Ratio 修复
+# ✅ ProfitFactor 修复
+# ✅ Downside Risk
+# ✅ Drift Detection
+# ✅ Transition Confidence
+# ✅ 波动状态识别
+# ✅ 真动态窗口
 # ✅ 爆仓保护
-# ✅ 连亏熔断
-# ✅ issue_no 排序修复
-# ✅ NaN 防护
+# ✅ 连续亏损熔断
+# ✅ 概率过度自信修复
+# ✅ Kelly稳定化
+# ✅ Regime Adaptive
+# ✅ WalkForward
+# ✅ 全部 NaN 防护
+# ✅ 下期预测
+# ✅ 色波预测
+# ✅ 大小预测
+# ✅ 单双预测
 #
 # =========================================================
 
-from __future__ import annotations
+from future import annotations
 
 import argparse
 import json
@@ -60,7 +70,7 @@ random.seed(SEED)
 # 基础
 # =========================================================
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(file).resolve().parent
 
 DB_FILES = {
     "老澳门彩": "old_macau.db",
@@ -74,7 +84,7 @@ THIRD_PARTY_URLS = [
 ]
 
 # =========================================================
-# 属性映射
+# 属性
 # =========================================================
 
 RED = {
@@ -188,6 +198,7 @@ def fetch_json_url(url):
             )
 
     except:
+
         return None
 
 # =========================================================
@@ -270,6 +281,7 @@ def fetch_online_records(lottery_name):
                 continue
 
         if records:
+
             return records, "marksix6"
 
     raise RuntimeError("无法获取数据")
@@ -337,7 +349,7 @@ def sync_from_records(conn, records, source):
     return len(records), ins, upd
 
 # =========================================================
-# issue 排序
+# issue_no 修复
 # =========================================================
 
 def issue_to_int(issue_no):
@@ -362,7 +374,9 @@ def load_sequence(conn, attr_func):
 
     rows = sorted(
         rows,
-        key=lambda r: issue_to_int(r["issue_no"])
+        key=lambda r: issue_to_int(
+            r["issue_no"]
+        )
     )
 
     return [
@@ -387,7 +401,7 @@ def entropy(probs):
     return e
 
 # =========================================================
-# Bayesian
+# Bayesian smoothing
 # =========================================================
 
 def bayesian_prob(
@@ -404,7 +418,7 @@ def bayesian_prob(
     )
 
 # =========================================================
-# Temperature
+# 温度校准
 # =========================================================
 
 def apply_temperature(probs, temp):
@@ -440,8 +454,8 @@ def apply_temperature(probs, temp):
     for k in result:
 
         result[k] = min(
-            max(result[k], 0.05),
-            0.78
+            max(result[k], 0.07),
+            0.72
         )
 
     s = sum(result.values())
@@ -452,16 +466,16 @@ def apply_temperature(probs, temp):
     }
 
 # =========================================================
-# Rolling Calibration
+# Rolling calibration
 # =========================================================
 
 def rolling_temperature_search(
     probs_hist,
     actual_hist,
-    window=60
+    window=80
 ):
 
-    if len(probs_hist) < 20:
+    if len(probs_hist) < 25:
         return 1.0
 
     probs_hist = probs_hist[-window:]
@@ -514,20 +528,21 @@ def detect_regime(seq):
     recent = seq[-30:]
     old = seq[-60:-30]
 
-    rc = Counter(recent)
-    oc = Counter(old)
+    recent_counts = Counter(recent)
+    old_counts = Counter(old)
 
     drift = 0
 
     states = set(
-        list(rc.keys()) +
-        list(oc.keys())
+        list(recent_counts.keys())
+        +
+        list(old_counts.keys())
     )
 
     for s in states:
 
-        r = rc[s] / len(recent)
-        o = oc[s] / len(old)
+        r = recent_counts[s] / len(recent)
+        o = old_counts[s] / len(old)
 
         drift += abs(r - o)
 
@@ -537,12 +552,12 @@ def detect_regime(seq):
     return "NORMAL"
 
 # =========================================================
-# Conditional Markov
+# 真 Conditional Markov
 # =========================================================
 
 class ConditionalMarkov:
 
-    def __init__(
+    def init(
         self,
         states,
         alpha=1.5,
@@ -551,8 +566,11 @@ class ConditionalMarkov:
     ):
 
         self.states = states
+
         self.alpha = alpha
+
         self.decay = decay
+
         self.recent_periods = recent_periods
 
         self.global_counts = Counter()
@@ -621,7 +639,7 @@ class ConditionalMarkov:
 
         probs = {}
 
-        if total2 >= 10:
+        if total2 >= 12:
 
             for s in self.states:
 
@@ -632,7 +650,7 @@ class ConditionalMarkov:
                     len(self.states)
                 )
 
-        elif total1 >= 5:
+        elif total1 >= 8:
 
             for s in self.states:
 
@@ -667,17 +685,20 @@ class ConditionalMarkov:
 
 class KellyBankroll:
 
-    def __init__(self, initial=10000):
+    def init(self, initial=10000):
 
         self.initial = initial
+
         self.current = initial
 
         self.history = []
 
         self.bet_count = 0
+
         self.win_count = 0
 
         self.loss_streak = 0
+
         self.cooldown = 0
 
         self.equity_curve = [initial]
@@ -699,8 +720,7 @@ class KellyBankroll:
 
         ent = entropy(probs)
 
-        # 修复过度风控
-        if ent > 1.05:
+        if ent > 0.96:
             return 0
 
         b = odds_total - 1
@@ -709,16 +729,14 @@ class KellyBankroll:
 
         edge = (b * p) - q
 
-        # 修复 EV Threshold
-        if edge <= 0:
+        if edge <= 0.012:
             return 0
 
         f = edge / b
 
-        # 修复下注过小
-        f *= 0.20
+        f = 0.125
 
-        f = min(f, 0.06)
+        f = min(f, 0.03)
 
         if self.current < 500:
             return 0
@@ -727,7 +745,7 @@ class KellyBankroll:
 
         bet = min(
             bet,
-            int(self.current * 0.08)
+            int(self.current * 0.05)
         )
 
         if bet < 20:
@@ -765,9 +783,9 @@ class KellyBankroll:
 
             profit = -bet
 
-            if self.loss_streak >= 5:
+            if self.loss_streak >= 6:
 
-                self.cooldown = 8
+                self.cooldown = 12
 
                 self.loss_streak = 0
 
@@ -815,7 +833,8 @@ class KellyBankroll:
 
         downside_std = np.std(downside)
 
-        if downside_std <= 0:
+        # 修复爆炸
+        if downside_std <= 1e-6:
             return 0
 
         return (
@@ -836,7 +855,9 @@ class KellyBankroll:
             if x < 0
         ))
 
-        losses = max(losses, 1e-9)
+        # 修复爆炸
+        if losses <= 0:
+            return gains
 
         return gains / losses
 
@@ -936,6 +957,7 @@ def calc_ece(
         )
 
     confidences = np.array(confidences)
+
     accuracies = np.array(accuracies)
 
     edges = np.linspace(0,1,bins+1)
@@ -944,21 +966,11 @@ def calc_ece(
 
     for i in range(bins):
 
-        if i == bins - 1:
-
-            mask = (
-                (confidences >= edges[i])
-                &
-                (confidences <= edges[i+1])
-            )
-
-        else:
-
-            mask = (
-                (confidences >= edges[i])
-                &
-                (confidences < edges[i+1])
-            )
+        mask = (
+            (confidences >= edges[i])
+            &
+            (confidences < edges[i+1])
+        )
 
         if np.sum(mask) == 0:
             continue
@@ -979,10 +991,10 @@ def calc_ece(
     return ece
 
 # =========================================================
-# Bootstrap Baseline
+# Bootstrap MonteCarlo
 # =========================================================
 
-def bootstrap_baseline(
+def markov_bootstrap_baseline(
     actuals,
     trials=3000
 ):
@@ -1006,7 +1018,7 @@ def bootstrap_baseline(
     return np.mean(wins)
 
 # =========================================================
-# Odds
+# 赔率
 # =========================================================
 
 def get_color_odds(color):
@@ -1023,7 +1035,7 @@ def get_color_odds(color):
 def main():
 
     parser = argparse.ArgumentParser(
-        description="V14.1-QUANT FIXED"
+        description="V15-QUANT STABLE"
     )
 
     parser.add_argument(
@@ -1122,9 +1134,14 @@ def main():
             )
 
             if regime == "VOLATILE":
+
                 dynamic_recent = 120
+                entropy_limit = 0.90
+
             else:
+
                 dynamic_recent = 240
+                entropy_limit = 0.96
 
             eng_c = ConditionalMarkov(
                 ["红","蓝","绿"],
@@ -1190,11 +1207,17 @@ def main():
                 best_color
             )
 
-            bet = bank.get_bet_size(
-                best_prob,
-                odds,
-                calibrated
-            )
+            if entropy(calibrated) > entropy_limit:
+
+                bet = 0
+
+            else:
+
+                bet = bank.get_bet_size(
+                    best_prob,
+                    odds,
+                    calibrated
+                )
 
             won = (
                 best_color == actual_c
@@ -1222,38 +1245,6 @@ def main():
                 odd_correct += 1
 
         # =================================================
-        # 下期预测
-        # =================================================
-
-        final_eng = ConditionalMarkov(
-            ["红","蓝","绿"],
-            recent_periods=args.recent
-        )
-
-        final_eng.train(color_seq)
-
-        next_pred = final_eng.predict(
-            color_seq[-30:]
-        )
-
-        final_temp = rolling_temperature_search(
-            historical_probs,
-            historical_actuals
-        )
-
-        next_pred = apply_temperature(
-            next_pred,
-            final_temp
-        )
-
-        next_color = max(
-            next_pred,
-            key=next_pred.get
-        )
-
-        next_prob = next_pred[next_color]
-
-        # =================================================
         # Metrics
         # =================================================
 
@@ -1272,7 +1263,7 @@ def main():
             actual_history
         )
 
-        mc = bootstrap_baseline(
+        mc = markov_bootstrap_baseline(
             actual_history
         )
 
@@ -1286,30 +1277,30 @@ def main():
 
         # =================================================
 
-        print("\n" + "="*100)
+        print("\n" + "="100)
 
         print(
-            f"V14.1-QUANT FIXED 真WalkForward ({test_len}期)"
+            f"V15-QUANT STABLE 真WalkForward ({test_len}期)"
         )
 
-        print("-"*100)
+        print("-"100)
 
         print(
             f"色波准确率 : "
-            f"{color_correct/test_len*100:.2f}%"
+            f"{color_correct/test_len100:.2f}%"
         )
 
         print(
             f"大小准确率 : "
-            f"{size_correct/test_len*100:.2f}%"
+            f"{size_correct/test_len100:.2f}%"
         )
 
         print(
             f"单双准确率 : "
-            f"{odd_correct/test_len*100:.2f}%"
+            f"{odd_correct/test_len100:.2f}%"
         )
 
-        print("-"*100)
+        print("-"100)
 
         print(
             f"LogLoss    : {logloss:.6f}"
@@ -1324,7 +1315,7 @@ def main():
         )
 
         print(
-            f"BootstrapMC : {mc*100:.2f}%"
+            f"BootstrapMC : {mc100:.2f}%"
         )
 
         print("-"*100)
@@ -1363,28 +1354,161 @@ def main():
             f"SortinoRatio: {sortino:.4f}"
         )
 
+        # =================================================
+        # 下期预测
+        # =================================================
+
+        temp = rolling_temperature_search(
+            historical_probs,
+            historical_actuals
+        )
+
+        # 色波
+
+        future_color_engine = ConditionalMarkov(
+            ["红","蓝","绿"],
+            recent_periods=args.recent
+        )
+
+        future_color_engine.train(color_seq)
+
+        future_color_probs = apply_temperature(
+            future_color_engine.predict(
+                color_seq[-30:]
+            ),
+            temp
+        )
+
+        # 大小
+
+        future_size_engine = ConditionalMarkov(
+            ["大","小"],
+            recent_periods=args.recent
+        )
+
+        future_size_engine.train(size_seq)
+
+        future_size_probs = apply_temperature(
+            future_size_engine.predict(
+                size_seq[-30:]
+            ),
+            temp
+        )
+
+        # 单双
+
+        future_odd_engine = ConditionalMarkov(
+            ["单","双"],
+            recent_periods=args.recent
+        )
+
+        future_odd_engine.train(odd_seq)
+
+        future_odd_probs = apply_temperature(
+            future_odd_engine.predict(
+                odd_seq[-30:]
+            ),
+            temp
+        )
+
         print("-"*100)
 
         print("下期预测")
 
-        for k, v in sorted(
-            next_pred.items(),
+        print("-"100)
+
+        # =================================================
+        # 色波
+        # =================================================
+
+        print("【色波】")
+
+        sorted_color = sorted(
+            future_color_probs.items(),
             key=lambda x: x[1],
             reverse=True
-        ):
+        )
 
-            print(
-                f"{k} : {v*100:.2f}%"
-            )
+        for k, v in sorted_color:
 
-        print("-"*100)
+            print(f"{k} : {v100:.2f}%")
 
-        print(
-            f"推荐方向 : {next_color}"
+        best_color = max(
+            future_color_probs,
+            key=future_color_probs.get
         )
 
         print(
-            f"置信概率 : {next_prob*100:.2f}%"
+            f"推荐色波 : {best_color}"
+        )
+
+        print(
+            f"色波置信 : "
+            f"{future_color_probs[best_color]*100:.2f}%"
+        )
+
+        print("-"60)
+
+        # =================================================
+        # 大小
+        # =================================================
+
+        print("【大小】")
+
+        sorted_size = sorted(
+            future_size_probs.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        for k, v in sorted_size:
+
+            print(f"{k} : {v100:.2f}%")
+
+        best_size = max(
+            future_size_probs,
+            key=future_size_probs.get
+        )
+
+        print(
+            f"推荐大小 : {best_size}"
+        )
+
+        print(
+            f"大小置信 : "
+            f"{future_size_probs[best_size]*100:.2f}%"
+        )
+
+        print("-"60)
+
+        # =================================================
+        # 单双
+        # =================================================
+
+        print("【单双】")
+
+        sorted_odd = sorted(
+            future_odd_probs.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        for k, v in sorted_odd:
+
+            print(f"{k} : {v100:.2f}%")
+
+        best_odd = max(
+            future_odd_probs,
+            key=future_odd_probs.get
+        )
+
+        print(
+            f"推荐单双 : {best_odd}"
+        )
+
+        print(
+            f"单双置信 : "
+            f"{future_odd_probs[best_odd]*100:.2f}%"
         )
 
         print("="*100)
@@ -1399,6 +1523,6 @@ def main():
 
 # =========================================================
 
-if __name__ == "__main__":
+if name == "main":
 
     main()
