@@ -2,8 +2,8 @@ name: 新澳门六合彩自动预测
 
 on:
   schedule:
-    # 北京时间晚上23:00 (UTC 15:00) 运行，可根据实际开奖时间调整
-    - cron: '0 15 * * *'
+    # 新澳门彩每天约 21:30 开奖，UTC+8 → UTC 13:30，设定 14:00 运行
+    - cron: '0 14 * * *'
   workflow_dispatch:
 
 permissions:
@@ -15,29 +15,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 设置 Python 环境
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 安装依赖
-        run: |
-          pip install --upgrade pip
-          pip install numpy scikit-learn lightgbm xgboost catboost
 
       - name: 运行同步、回测、调优与预测
         run: python new_macau.py sync --with-backtest --auto-tune
 
       - name: 提交数据库更新
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add xinmacau.db
-          git commit -m "🤖 新澳门六合彩自动更新 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
+          git add new_macau.db
+          export TZ='Asia/Hong_Kong'
+          git commit -m "🤖 新澳门自动更新 $(date +'%Y-%m-%d %H:%M')" || echo "Nothing to commit"
           git push
 
-      - name: 保存 Artifact（数据库备份）
+      - name: 保存 Artifact（备查）
         uses: actions/upload-artifact@v4
         with:
-          name: xinmacau-db-backup
-          path: xinmacau.db
+          name: new-macau-db-backup
+          path: new_macau.db
