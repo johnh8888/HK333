@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 # =========================================================
-# 三彩种属性预测 V16-FINAL
+# 三彩种属性预测 V16-PRO FINAL
 #
-# 修复内容：
-# 1. 修复期数错误
-# 2. 修复日期错误
-# 3. 在线实时获取最新数据
-# 4. 最近10期真实回测
-# 5. 波色单双大小预测
-# 6. 动态窗口
-# 7. 双推增强
+# 修复版：
+# 1. 修复香港彩年份期号错误
+# 2. 修复最近10期日期错误
+# 3. 修复数据库脏数据
+# 4. 真实线上数据排序
+# 5. 波色单双大小完整回测
+# 6. 主推 + 次推 + 双推覆盖
+# 7. Conditional Markov
+# 8. 动态窗口
 # =========================================================
 
 from __future__ import annotations
@@ -20,19 +21,23 @@ import argparse
 import json
 import math
 import random
+import re
 import sqlite3
-from pathlib import Path
-from collections import Counter, defaultdict
+
+from collections import defaultdict, Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 import numpy as np
 
 # =========================================================
-# 随机种子
+# 固定随机种子
 # =========================================================
 
 SEED = 42
+
 random.seed(SEED)
 np.random.seed(SEED)
 
@@ -48,13 +53,13 @@ DB_FILES = {
     "新澳门彩": "xin_macau.db"
 }
 
-API_URLS = [
+URLS = [
     "https://marksix6.net/index.php?api=1",
     "https://marksix6.net/api/lottery_api.php"
 ]
 
 # =========================================================
-# 色波
+# 波色
 # =========================================================
 
 RED = {
@@ -81,12 +86,18 @@ def get_color(num):
         return "蓝"
     return "绿"
 
+# =========================================================
+
 def get_big_small(num):
     return "大" if num >= 25 else "小"
+
+# =========================================================
 
 def get_odd_even(num):
     return "单" if num % 2 else "双"
 
+# =========================================================
+# 数据结构
 # =========================================================
 
 @dataclass
@@ -96,7 +107,7 @@ class DrawRecord:
     special_number: int
 
 # =========================================================
-# 数据库
+# DB
 # =========================================================
 
 def connect_db(path):
@@ -104,14 +115,17 @@ def connect_db(path):
     conn.row_factory = sqlite3.Row
     return conn
 
+# =========================================================
+
 def init_db(conn):
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS draws(
-        issue_no TEXT PRIMARY KEY,
-        draw_date TEXT,
-        special_number INTEGER
-    )
+        CREATE TABLE IF NOT EXISTS draws(
+            issue_no TEXT PRIMARY KEY,
+            draw_date TEXT,
+            special_number INTEGER,
+            created_at TEXT
+        )
     """)
 
     conn.commit()
@@ -123,6 +137,7 @@ def init_db(conn):
 def fetch_json(url):
 
     try:
+
         req = Request(
             url,
             headers={
@@ -130,40 +145,72 @@ def fetch_json(url):
             }
         )
 
-        with urlopen(req, timeout=20) as r:
+        with urlopen(req, timeout=20) as resp:
             return json.loads(
-                r.read().decode("utf-8", errors="ignore")
+                resp.read().decode(
+                    "utf-8",
+                    errors="ignore"
+                )
             )
 
     except:
         return None
 
 # =========================================================
-# 在线获取真实数据
+# 获取线上数据
+# =========================================================
+
+def normalize_issue(issue):
+
+    issue = str(issue).strip()
+
+    nums = re.findall(r"\d+", issue)
+
+    if not nums:
+        return issue
+
+    n = nums[0]
+
+    if len(n) >= 7:
+        return n
+
+    year = datetime.now().year
+
+    return f"{year}-{int(n):03d}"
+
 # =========================================================
 
 def fetch_online_records(lottery_name):
 
-    for url in API_URLS:
+    for url in URLS:
 
-        data = fetch_json(url)
+        payload = fetch_json(url)
 
-        if not data:
+        if not payload:
             continue
 
-        lottery_data = data.get("lottery_data", [])
+        lottery_data = payload.get(
+            "lottery_data",
+            []
+        )
 
-        target = None
-
-        for x in lottery_data:
-            if x.get("name") == lottery_name:
-                target = x
-                break
+        target = next(
+            (
+                x for x in lottery_data
+                if x.get("name") == lottery_name
+            ),
+            None
+        )
 
         if not target:
             continue
 
         history = target.get("history", [])
+
+        open_time = target.get(
+            "openTime",
+            ""
+        )
 
         records = []
 
@@ -171,39 +218,34 @@ def fetch_online_records(lottery_name):
 
             try:
 
-                # 真实格式:
-                # 2026048期：12,15,22,33,41,48,16
+                parts = item.split("期：")
 
-                if "期：" not in item:
+                if len(parts) != 2:
                     continue
 
-                left, right = item.split("期：")
+                issue_raw = parts[0].strip()
 
-                issue_no = left.strip()
+                issue_no = normalize_issue(
+                    issue_raw
+                )
 
                 nums = [
                     int(x.strip())
-                    for x in right.split(",")
+                    for x in parts[1].split(",")
                 ]
 
                 if len(nums) != 7:
                     continue
 
-                special = nums[-1]
+                special = nums[6]
 
-                # 自动推导年份日期
-                # issue: 2026048
-
-                year = issue_no[:4]
-                seq = issue_no[4:]
-
-                draw_date = f"{year}-第{seq}期"
+                draw_date = open_time[:10]
 
                 records.append(
                     DrawRecord(
-                        issue_no=issue_no,
-                        draw_date=draw_date,
-                        special_number=special
+                        issue_no,
+                        draw_date,
+                        special
                     )
                 )
 
@@ -213,42 +255,71 @@ def fetch_online_records(lottery_name):
         if records:
             return records
 
-    raise RuntimeError("无法获取在线数据")
+    raise RuntimeError("无法获取线上数据")
 
 # =========================================================
-# 保存
+# 同步
 # =========================================================
 
-def save_records(conn, records):
+def sync_records(conn, records):
+
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     for r in records:
 
         conn.execute("""
-        INSERT OR REPLACE INTO draws(
-            issue_no,
-            draw_date,
-            special_number
-        )
-        VALUES(?,?,?)
+            INSERT OR REPLACE INTO draws
+            VALUES (?,?,?,?)
         """, (
             r.issue_no,
             r.draw_date,
-            r.special_number
+            r.special_number,
+            now
         ))
 
     conn.commit()
 
 # =========================================================
-# 加载
+# 排序
 # =========================================================
 
-def load_records(conn):
+def issue_sort_key(issue):
+
+    nums = re.findall(r"\d+", issue)
+
+    if len(nums) >= 2:
+        return (
+            int(nums[0]),
+            int(nums[1])
+        )
+
+    if len(nums) == 1:
+        return (
+            datetime.now().year,
+            int(nums[0])
+        )
+
+    return (0, 0)
+
+# =========================================================
+# 加载数据
+# =========================================================
+
+def load_draws(conn):
 
     rows = conn.execute("""
-    SELECT *
-    FROM draws
-    ORDER BY issue_no
+        SELECT *
+        FROM draws
     """).fetchall()
+
+    rows = sorted(
+        rows,
+        key=lambda r: issue_sort_key(
+            r["issue_no"]
+        )
+    )
 
     return rows
 
@@ -261,21 +332,24 @@ class ConditionalMarkov:
     def __init__(
         self,
         states,
-        decay=0.992,
         alpha=1.2,
-        recent=240
+        decay=0.992,
+        recent_periods=240
     ):
 
         self.states = states
-        self.decay = decay
         self.alpha = alpha
-        self.recent = recent
+        self.decay = decay
+        self.recent_periods = recent_periods
 
-        self.trans = defaultdict(Counter)
+        self.global_counts = Counter()
+        self.transitions = defaultdict(Counter)
+
+    # =====================================================
 
     def train(self, seq):
 
-        seq = seq[-self.recent:]
+        seq = seq[-self.recent_periods:]
 
         for age, i in enumerate(
             reversed(range(len(seq)-1))
@@ -286,7 +360,10 @@ class ConditionalMarkov:
 
             w = self.decay ** age
 
-            self.trans[a][b] += w
+            self.transitions[a][b] += w
+            self.global_counts[b] += w
+
+    # =====================================================
 
     def predict(self, recent):
 
@@ -298,26 +375,59 @@ class ConditionalMarkov:
 
         last = recent[-1]
 
-        c = self.trans.get(last, Counter())
+        trans = self.transitions.get(
+            last,
+            Counter()
+        )
 
-        total = sum(c.values())
+        total = sum(trans.values())
+
+        if total < 3:
+            trans = self.global_counts
+            total = sum(trans.values())
 
         probs = {}
 
         for s in self.states:
 
             probs[s] = (
-                c.get(s, 0) + self.alpha
+                trans.get(s, 0) + self.alpha
             ) / (
                 total + self.alpha * len(self.states)
             )
 
-        sm = sum(probs.values())
+        total_p = sum(probs.values())
 
         return {
-            k: v / sm
+            k: v / total_p
             for k, v in probs.items()
         }
+
+# =========================================================
+# 温度校准
+# =========================================================
+
+def apply_temperature(probs, temp=1.0):
+
+    logits = {}
+
+    for k, v in probs.items():
+
+        v = max(v, 1e-12)
+
+        logits[k] = math.log(v)
+
+    scaled = {}
+
+    for k, v in logits.items():
+        scaled[k] = math.exp(v / temp)
+
+    total = sum(scaled.values())
+
+    return {
+        k: v / total
+        for k, v in scaled.items()
+    }
 
 # =========================================================
 # 主程序
@@ -329,6 +439,7 @@ def main():
 
     parser.add_argument(
         "--lottery",
+        choices=["香港彩","老澳门彩","新澳门彩"],
         default="香港彩"
     )
 
@@ -346,13 +457,9 @@ def main():
 
     args = parser.parse_args()
 
-    print("=" * 50)
+    print("="*60)
     print(args.lottery)
-    print("=" * 50)
-
-    # =====================================================
-    # DB
-    # =====================================================
+    print("="*60)
 
     conn = connect_db(
         SCRIPT_DIR / DB_FILES[args.lottery]
@@ -361,38 +468,52 @@ def main():
     init_db(conn)
 
     # =====================================================
-    # 获取在线最新数据
+    # 线上同步
     # =====================================================
 
-    records = fetch_online_records(args.lottery)
+    records = fetch_online_records(
+        args.lottery
+    )
 
-    save_records(conn, records)
+    sync_records(conn, records)
 
-    rows = load_records(conn)
+    rows = load_draws(conn)
 
     # =====================================================
-    # 构建序列
+    # 自动过滤脏数据
     # =====================================================
 
-    color_seq = []
-    size_seq = []
-    odd_seq = []
+    clean_rows = []
 
     for r in rows:
 
-        num = r["special_number"]
+        issue = r["issue_no"]
 
-        color_seq.append(
-            get_color(num)
-        )
+        if "-" not in issue:
+            continue
 
-        size_seq.append(
-            get_big_small(num)
-        )
+        clean_rows.append(r)
 
-        odd_seq.append(
-            get_odd_even(num)
-        )
+    rows = clean_rows
+
+    # =====================================================
+    # 序列
+    # =====================================================
+
+    color_seq = [
+        get_color(r["special_number"])
+        for r in rows
+    ]
+
+    size_seq = [
+        get_big_small(r["special_number"])
+        for r in rows
+    ]
+
+    odd_seq = [
+        get_odd_even(r["special_number"])
+        for r in rows
+    ]
 
     # =====================================================
     # 动态窗口
@@ -400,28 +521,34 @@ def main():
 
     recent20 = color_seq[-20:]
 
-    c = Counter(recent20)
+    rc = Counter(recent20)
 
-    if max(c.values()) >= 11:
+    dynamic_recent = 240
+
+    if rc["红"] >= 12:
         dynamic_recent = 180
-    else:
-        dynamic_recent = 240
 
     print(f"动态窗口: {dynamic_recent}")
 
-    print("\n最近20期趋势:")
-
-    print(f"红: {c['红']}")
-    print(f"蓝: {c['蓝']}")
-    print(f"绿: {c['绿']}")
-
     # =====================================================
-    # 回测
+    # 最近20期趋势
     # =====================================================
 
-    print("\n" + "=" * 50)
-    print(f"最近{args.test}期回测")
-    print("=" * 50)
+    print()
+    print("最近20期趋势:")
+
+    print(f"红: {rc['红']}")
+    print(f"蓝: {rc['蓝']}")
+    print(f"绿: {rc['绿']}")
+
+    # =====================================================
+    # 最近10期回测
+    # =====================================================
+
+    print()
+    print("="*60)
+    print("最近10期回测")
+    print("="*60)
 
     single_hit = 0
     double_hit = 0
@@ -437,69 +564,55 @@ def main():
         train_size = size_seq[:t]
         train_odd = odd_seq[:t]
 
-        # 波色
-        eng_color = ConditionalMarkov(
+        model_color = ConditionalMarkov(
             ["红","蓝","绿"],
-            recent=dynamic_recent
+            recent_periods=dynamic_recent
         )
 
-        eng_color.train(train_color)
-
-        probs = eng_color.predict(
-            train_color[-30:]
+        model_size = ConditionalMarkov(
+            ["大","小"],
+            recent_periods=dynamic_recent
         )
 
-        sorted_probs = sorted(
-            probs.items(),
+        model_odd = ConditionalMarkov(
+            ["单","双"],
+            recent_periods=dynamic_recent
+        )
+
+        model_color.train(train_color)
+        model_size.train(train_size)
+        model_odd.train(train_odd)
+
+        probs_color = apply_temperature(
+            model_color.predict(
+                train_color[-30:]
+            ),
+            1.0
+        )
+
+        probs_size = model_size.predict(
+            train_size[-30:]
+        )
+
+        probs_odd = model_odd.predict(
+            train_odd[-30:]
+        )
+
+        sorted_color = sorted(
+            probs_color.items(),
             key=lambda x: x[1],
             reverse=True
         )
 
-        main_color = sorted_probs[0][0]
-        second_color = sorted_probs[1][0]
+        main_color = sorted_color[0][0]
+        second_color = sorted_color[1][0]
 
         actual_color = color_seq[t]
 
-        # 大小
-        eng_size = ConditionalMarkov(
-            ["大","小"],
-            recent=dynamic_recent
-        )
-
-        eng_size.train(train_size)
-
-        size_probs = eng_size.predict(
-            train_size[-30:]
-        )
-
-        size_pred = max(
-            size_probs,
-            key=size_probs.get
-        )
-
         actual_size = size_seq[t]
-
-        # 单双
-        eng_odd = ConditionalMarkov(
-            ["单","双"],
-            recent=dynamic_recent
-        )
-
-        eng_odd.train(train_odd)
-
-        odd_probs = eng_odd.predict(
-            train_odd[-30:]
-        )
-
-        odd_pred = max(
-            odd_probs,
-            key=odd_probs.get
-        )
-
         actual_odd = odd_seq[t]
 
-        # 命中
-        single_ok = main_color == actual_color
+        single_ok = actual_color == main_color
         double_ok = actual_color in [
             main_color,
             second_color
@@ -511,82 +624,97 @@ def main():
         if double_ok:
             double_hit += 1
 
-        if size_pred == actual_size:
+        pred_size = max(
+            probs_size,
+            key=probs_size.get
+        )
+
+        pred_odd = max(
+            probs_odd,
+            key=probs_odd.get
+        )
+
+        if pred_size == actual_size:
             size_hit += 1
 
-        if odd_pred == actual_odd:
+        if pred_odd == actual_odd:
             odd_hit += 1
 
-        issue = rows[t]["issue_no"]
+        row = rows[t]
 
         print(
-            f"{issue}期 "
+            f"{row['issue_no']} "
+            f"{row['draw_date']} "
+            f"特码:{row['special_number']:02d} "
             f"主推:{main_color} "
             f"次推:{second_color} "
             f"开奖:{actual_color} "
             f"| 单推:{'√' if single_ok else '×'} "
             f"| 双推:{'√' if double_ok else '×'} "
-            f"| 大小:{'√' if size_pred == actual_size else '×'} "
-            f"| 单双:{'√' if odd_pred == actual_odd else '×'}"
+            f"| 大小:{pred_size}/{actual_size} "
+            f"| 单双:{pred_odd}/{actual_odd}"
         )
 
     # =====================================================
-    # 回测结果
+    # 回测统计
     # =====================================================
 
-    print("\n" + "-" * 50)
+    print()
+    print("-"*60)
 
     print(
         f"波色单推命中率: "
-        f"{single_hit / args.test * 100:.2f}%"
+        f"{single_hit/args.test*100:.2f}%"
     )
 
     print(
         f"波色双推命中率: "
-        f"{double_hit / args.test * 100:.2f}%"
+        f"{double_hit/args.test*100:.2f}%"
     )
 
     print(
         f"大小命中率: "
-        f"{size_hit / args.test * 100:.2f}%"
+        f"{size_hit/args.test*100:.2f}%"
     )
 
     print(
         f"单双命中率: "
-        f"{odd_hit / args.test * 100:.2f}%"
+        f"{odd_hit/args.test*100:.2f}%"
     )
 
     # =====================================================
     # 下期预测
     # =====================================================
 
-    print("\n" + "=" * 50)
+    print()
+    print("="*60)
     print("下期预测")
-    print("=" * 50)
+    print("="*60)
 
-    # 波色
-    eng_color = ConditionalMarkov(
+    final_model = ConditionalMarkov(
         ["红","蓝","绿"],
-        recent=dynamic_recent
+        recent_periods=dynamic_recent
     )
 
-    eng_color.train(color_seq)
+    final_model.train(color_seq)
 
-    probs = eng_color.predict(
-        color_seq[-30:]
+    final_probs = apply_temperature(
+        final_model.predict(
+            color_seq[-30:]
+        ),
+        1.0
     )
 
-    sorted_probs = sorted(
-        probs.items(),
+    sorted_final = sorted(
+        final_probs.items(),
         key=lambda x: x[1],
         reverse=True
     )
 
-    print("\n【波色】")
+    print()
+    print("【色波】")
 
-    for i, (k, v) in enumerate(sorted_probs):
-
-        tag = ""
+    for i, (k, v) in enumerate(sorted_final):
 
         if i == 0:
             tag = "【主推】"
@@ -594,69 +722,95 @@ def main():
         elif i == 1:
             tag = "【次推】"
 
+        else:
+            tag = "        "
+
         print(
             f"{tag} {k} : {v*100:.2f}%"
         )
 
-    print(
-        f"\n双推组合: "
-        f"{sorted_probs[0][0]} + {sorted_probs[1][0]}"
+    cover = (
+        sorted_final[0][1]
+        +
+        sorted_final[1][1]
     )
+
+    print()
+
+    if sorted_final[0][1] >= 0.45:
+        stars = "★★★★★"
+    elif sorted_final[0][1] >= 0.40:
+        stars = "★★★★☆"
+    elif sorted_final[0][1] >= 0.35:
+        stars = "★★★☆☆"
+    else:
+        stars = "★★☆☆☆"
+
+    print(f"主推强度: {stars}")
 
     print(
         f"双推覆盖: "
-        f"{(sorted_probs[0][1] + sorted_probs[1][1]) * 100:.2f}%"
+        f"{cover*100:.2f}%"
     )
 
+    print(
+        f"推荐组合: "
+        f"{sorted_final[0][0]} + "
+        f"{sorted_final[1][0]}"
+    )
+
+    # =====================================================
     # 大小
-    eng_size = ConditionalMarkov(
+    # =====================================================
+
+    print()
+    print("【大小】")
+
+    model_size = ConditionalMarkov(
         ["大","小"],
-        recent=dynamic_recent
+        recent_periods=dynamic_recent
     )
 
-    eng_size.train(size_seq)
+    model_size.train(size_seq)
 
-    size_probs = eng_size.predict(
+    probs_size = model_size.predict(
         size_seq[-30:]
     )
 
-    print("\n【大小】")
-
     for k, v in sorted(
-        size_probs.items(),
+        probs_size.items(),
         key=lambda x: x[1],
         reverse=True
     ):
+        print(f"{k} : {v*100:.2f}%")
 
-        print(
-            f"{k} : {v*100:.2f}%"
-        )
-
+    # =====================================================
     # 单双
-    eng_odd = ConditionalMarkov(
+    # =====================================================
+
+    print()
+    print("【单双】")
+
+    model_odd = ConditionalMarkov(
         ["单","双"],
-        recent=dynamic_recent
+        recent_periods=dynamic_recent
     )
 
-    eng_odd.train(odd_seq)
+    model_odd.train(odd_seq)
 
-    odd_probs = eng_odd.predict(
+    probs_odd = model_odd.predict(
         odd_seq[-30:]
     )
 
-    print("\n【单双】")
-
     for k, v in sorted(
-        odd_probs.items(),
+        probs_odd.items(),
         key=lambda x: x[1],
         reverse=True
     ):
+        print(f"{k} : {v*100:.2f}%")
 
-        print(
-            f"{k} : {v*100:.2f}%"
-        )
-
-    print("\n" + "=" * 50)
+    print()
+    print("="*60)
 
     conn.close()
 
