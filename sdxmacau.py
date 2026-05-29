@@ -1,61 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# =========================================================
-# V20-QUANT FINAL STABLE
-#
-# 终极稳定增强版
-#
-# 修复：
-#
-# [√] 二阶过拟合
-# [√] 动态窗口失控
-# [√] 单双随机化
-# [√] 固定双推
-# [√] 连续同波爆死
-#
-# 新增：
-#
-# [√] 混合概率模型
-# [√] 连续同波反转惩罚
-# [√] 动态双推
-# [√] 自适应窗口
-# [√] 更稳定回测
-#
-# 实战目标：
-#
-# 波色主推：
-#   45%~55%
-#
-# 波色双推：
-#   70%~82%
-#
-# 大小：
-#   55%~65%
-#
-# 单双：
-#   50%左右（随机）
-#
-# =========================================================
-
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 import sqlite3
 
-from collections import Counter, defaultdict
+from collections import defaultdict, Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import numpy as np
+
 from urllib.request import Request, urlopen
 
-# =========================================================
-
 SEED = 42
+np.random.seed(SEED)
 random.seed(SEED)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -66,14 +31,10 @@ DB_FILES = {
     "新澳门彩": "xin_macau.db"
 }
 
-URLS = [
+THIRD_PARTY_URLS = [
     "https://marksix6.net/index.php?api=1",
     "https://marksix6.net/api/lottery_api.php"
 ]
-
-# =========================================================
-# 色波
-# =========================================================
 
 RED = {
     1,2,7,8,12,13,18,19,23,24,
@@ -90,52 +51,32 @@ GREEN = {
     32,33,38,39,43,44,49
 }
 
-# =========================================================
-
-def get_color(n):
-
-    if n in RED:
+def get_color(num):
+    if num in RED:
         return "红"
-
-    if n in BLUE:
+    if num in BLUE:
         return "蓝"
-
     return "绿"
 
-# =========================================================
+def get_big_small(num):
+    return "大" if num >= 25 else "小"
 
-def get_size(n):
-    return "大" if n >= 25 else "小"
-
-# =========================================================
-
-def get_odd_even(n):
-    return "单" if n % 2 else "双"
-
-# =========================================================
+def get_odd_even(num):
+    return "单" if num % 2 else "双"
 
 @dataclass
 class DrawRecord:
-
     issue_no: str
     draw_date: str
     numbers: list
     special_number: int
 
-# =========================================================
-
-def connect_db(path):
-
-    conn = sqlite3.connect(path)
-
+def connect_db(db_path):
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-
     return conn
 
-# =========================================================
-
 def init_db(conn):
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS draws(
             issue_no TEXT PRIMARY KEY,
@@ -147,41 +88,29 @@ def init_db(conn):
             updated_at TEXT
         )
     """)
-
     conn.commit()
 
-# =========================================================
-
-def fetch_json(url):
-
+def fetch_json_url(url):
     try:
-
         req = Request(
             url,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
+            headers={"User-Agent": "Mozilla/5.0"}
         )
-
-        with urlopen(req, timeout=20) as r:
-
+        with urlopen(req, timeout=20) as resp:
             return json.loads(
-                r.read().decode(
+                resp.read().decode(
                     "utf-8",
                     errors="ignore"
                 )
             )
-
     except:
         return None
 
-# =========================================================
+def fetch_online_records(lottery_name):
 
-def fetch_online(lottery_name):
+    for url in THIRD_PARTY_URLS:
 
-    for url in URLS:
-
-        payload = fetch_json(url)
+        payload = fetch_json_url(url)
 
         if not payload:
             continue
@@ -203,24 +132,17 @@ def fetch_online(lottery_name):
             continue
 
         try:
-
             latest_time = datetime.strptime(
                 target.get("openTime", ""),
                 "%Y-%m-%d %H:%M:%S"
             )
-
         except:
-
             latest_time = datetime.now()
 
         records = []
 
-        for idx, item in enumerate(
-            target.get("history", [])
-        ):
-
+        for idx, item in enumerate(target.get("history", [])):
             try:
-
                 parts = item.split("期：")
 
                 if len(parts) != 2:
@@ -253,13 +175,12 @@ def fetch_online(lottery_name):
                 continue
 
         if records:
-            return records
+            return records, "marksix6"
 
-    raise RuntimeError("无法获取在线数据")
+    print("⚠️ 在线数据获取失败，使用本地数据库现有数据")
+    return [], "local"
 
-# =========================================================
-
-def sync_db(conn, records):
+def sync_from_records(conn, records, source):
 
     now = datetime.now(
         timezone.utc
@@ -282,12 +203,14 @@ def sync_db(conn, records):
                 SET draw_date=?,
                     numbers_json=?,
                     special_number=?,
+                    source=?,
                     updated_at=?
                 WHERE issue_no=?
             """, (
                 r.draw_date,
                 json.dumps(r.numbers),
                 r.special_number,
+                source,
                 now,
                 r.issue_no
             ))
@@ -304,7 +227,7 @@ def sync_db(conn, records):
                 r.draw_date,
                 json.dumps(r.numbers),
                 r.special_number,
-                "online",
+                source,
                 now,
                 now
             ))
@@ -313,257 +236,654 @@ def sync_db(conn, records):
 
     conn.commit()
 
-    return ins, upd
+    return len(records), ins, upd
 
-# =========================================================
+def issue_to_int(issue_no):
 
-def issue_int(issue):
-
-    nums = re.sub(r"\D", "", issue)
+    nums = re.sub(r"\D", "", issue_no)
 
     if nums == "":
         return 0
 
     return int(nums)
 
-# =========================================================
-
-def load_rows(conn):
+def load_sequence(conn, attr_func):
 
     rows = conn.execute("""
-        SELECT issue_no,
-               draw_date,
-               special_number
+        SELECT issue_no, special_number
         FROM draws
     """).fetchall()
 
     rows = sorted(
         rows,
-        key=lambda r: issue_int(r["issue_no"])
+        key=lambda r: issue_to_int(
+            r["issue_no"]
+        )
     )
 
-    return rows
-
-# =========================================================
-
-def bayes(c, total, alpha, k):
-
-    return (
-        c + alpha
-    ) / (
-        total + alpha * k
-    )
-
-# =========================================================
-# 最佳窗口
-# =========================================================
-
-def best_window(seq, states):
-
-    candidates = [
-        30,
-        45,
-        60,
-        90,
-        120
+    return [
+        attr_func(r["special_number"])
+        for r in rows
     ]
 
-    best_score = -1
-    best_w = 60
+def entropy(probs):
 
-    for w in candidates:
+    e = 0
 
-        correct = 0
-        total = 0
+    for p in probs.values():
 
-        for t in range(max(w,20), len(seq)):
+        p = max(p, 1e-12)
 
-            train = seq[t-w:t]
+        e -= p * math.log(p)
 
-            cnt = Counter(train)
+    return e
 
-            pred = max(cnt, key=cnt.get)
+def bayesian_prob(
+    count,
+    total,
+    alpha,
+    states
+):
+    return (
+        count + alpha
+    ) / (
+        total + alpha * states
+    )
 
-            if pred == seq[t]:
-                correct += 1
+def apply_temperature(probs, temp):
 
-            total += 1
+    logits = {}
 
-        if total == 0:
-            continue
+    for k, v in probs.items():
 
-        acc = correct / total
+        v = max(v, 1e-12)
 
-        if acc > best_score:
-            best_score = acc
-            best_w = w
+        logits[k] = math.log(v)
 
-    return best_w
+    scaled = {}
 
-# =========================================================
-# 混合模型
-# =========================================================
+    for k, v in logits.items():
+        scaled[k] = math.exp(v / temp)
 
-class HybridModel:
+    total = sum(scaled.values())
 
-    def __init__(self, states, recent=60):
+    if total <= 0:
+        return {
+            k: 1 / len(probs)
+            for k in probs
+        }
+
+    result = {
+        k: v / total
+        for k, v in scaled.items()
+    }
+
+    for k in result:
+        result[k] = min(
+            max(result[k], 0.08),
+            0.68
+        )
+
+    s = sum(result.values())
+
+    return {
+        k: v / s
+        for k, v in result.items()
+    }
+
+def rolling_temperature_search(
+    probs_hist,
+    actual_hist,
+    window=60
+):
+
+    if len(probs_hist) < 30:
+        return 1.0
+
+    probs_hist = probs_hist[-window:]
+    actual_hist = actual_hist[-window:]
+
+    best_temp = 1.0
+    best_loss = 999999
+
+    for temp in np.arange(0.90, 1.25, 0.02):
+
+        losses = []
+
+        for probs, actual in zip(
+            probs_hist,
+            actual_hist
+        ):
+
+            calibrated = apply_temperature(
+                probs,
+                temp
+            )
+
+            p = max(
+                calibrated.get(actual, 1e-12),
+                1e-12
+            )
+
+            losses.append(
+                -math.log(p)
+            )
+
+        loss = np.mean(losses)
+
+        if loss < best_loss:
+            best_loss = loss
+            best_temp = temp
+
+    return best_temp
+
+def detect_regime(seq):
+
+    if len(seq) < 80:
+        return "NORMAL"
+
+    recent = seq[-40:]
+    old = seq[-80:-40]
+
+    rc = Counter(recent)
+    oc = Counter(old)
+
+    drift = 0
+
+    for s in set(rc.keys()) | set(oc.keys()):
+
+        r = rc[s] / len(recent)
+        o = oc[s] / len(old)
+
+        drift += abs(r - o)
+
+    if drift > 0.28:
+        return "VOLATILE"
+
+    return "NORMAL"
+
+class ConditionalMarkov:
+
+    def __init__(
+        self,
+        states,
+        alpha=1.5,
+        decay=0.993,
+        recent_periods=220
+    ):
 
         self.states = states
-        self.recent = recent
+        self.alpha = alpha
+        self.decay = decay
+        self.recent_periods = recent_periods
 
-    # =====================================================
+        self.global_counts = Counter()
+        self.transitions1 = defaultdict(Counter)
+        self.transitions2 = defaultdict(Counter)
 
-    def fit(self, seq):
+    def train(self, seq):
 
-        seq = seq[-self.recent:]
+        seq = seq[-self.recent_periods:]
 
-        self.global_cnt = Counter(seq)
+        self.global_counts.clear()
+        self.transitions1.clear()
+        self.transitions2.clear()
 
-        self.trans1 = defaultdict(Counter)
+        for age, i in enumerate(
+            reversed(range(len(seq)))
+        ):
 
-        self.trans2 = defaultdict(Counter)
+            s = seq[i]
 
-        for i in range(len(seq)-1):
+            w = self.decay ** age
 
-            a = seq[i]
-            b = seq[i+1]
+            self.global_counts[s] += w
 
-            self.trans1[a][b] += 1
-
-        for i in range(len(seq)-2):
+        for age, i in enumerate(
+            reversed(range(len(seq)-2))
+        ):
 
             a = seq[i]
             b = seq[i+1]
             c = seq[i+2]
 
-            self.trans2[(a,b)][c] += 1
+            w = self.decay ** age
 
-    # =====================================================
+            self.transitions2[(a,b)][c] += w
+            self.transitions1[b][c] += w
 
-    def predict(self, recent_seq):
+    def predict(self, recent):
+
+        if len(recent) < 2:
+            return {
+                s: 1 / len(self.states)
+                for s in self.states
+            }
+
+        a = recent[-2]
+        b = recent[-1]
+
+        trans2 = self.transitions2.get(
+            (a,b),
+            Counter()
+        )
+
+        trans1 = self.transitions1.get(
+            b,
+            Counter()
+        )
+
+        total2 = sum(trans2.values())
+        total1 = sum(trans1.values())
+        totalg = sum(self.global_counts.values())
+
+        conf2 = min(total2 / 18, 1.0)
+        conf1 = min(total1 / 12, 1.0)
+
+        w2 = 0.55 * conf2
+        w1 = 0.30 * conf1
+        wg = max(0.15, 1.0 - w2 - w1)
 
         probs = {}
 
-        totalg = sum(self.global_cnt.values())
-
-        last1 = recent_seq[-1]
-        last2 = tuple(recent_seq[-2:])
-
-        trans1 = self.trans1.get(last1, Counter())
-        trans2 = self.trans2.get(last2, Counter())
-
-        total1 = sum(trans1.values())
-        total2 = sum(trans2.values())
-
         for s in self.states:
 
-            pg = bayes(
-                self.global_cnt.get(s,0),
-                totalg,
-                1.2,
-                len(self.states)
-            )
-
-            p1 = bayes(
-                trans1.get(s,0),
-                max(total1,1),
-                1.2,
-                len(self.states)
-            )
-
-            p2 = bayes(
+            p2 = bayesian_prob(
                 trans2.get(s,0),
-                max(total2,1),
-                1.2,
+                total2,
+                self.alpha,
                 len(self.states)
             )
 
-            # =================================================
-            # 修复：
-            # 二阶权重下降
-            # =================================================
+            p1 = bayesian_prob(
+                trans1.get(s,0),
+                total1,
+                self.alpha,
+                len(self.states)
+            )
+
+            pg = bayesian_prob(
+                self.global_counts.get(s,0),
+                totalg,
+                self.alpha,
+                len(self.states)
+            )
 
             probs[s] = (
-                0.20 * pg +
-                0.45 * p1 +
-                0.35 * p2
+                w2 * p2 +
+                w1 * p1 +
+                wg * pg
             )
-
-        # =====================================================
-        # 连续同波反转惩罚
-        # =====================================================
-
-        if len(recent_seq) >= 3:
-
-            if (
-                recent_seq[-1] ==
-                recent_seq[-2] ==
-                recent_seq[-3]
-            ):
-
-                same = recent_seq[-1]
-
-                probs[same] *= 0.72
 
         total = sum(probs.values())
 
-        probs = {
-            k: v/total
-            for k,v in probs.items()
+        return {
+            k: v / total
+            for k, v in probs.items()
         }
 
-        return probs
+class KellyBankroll:
 
-# =========================================================
+    def __init__(self, initial=10000):
 
-def predict_simple(seq, states, recent=30):
+        self.initial = initial
+        self.current = initial
 
-    seq = seq[-recent:]
+        self.history = []
 
-    cnt = Counter(seq)
+        self.bet_count = 0
+        self.win_count = 0
 
-    total = sum(cnt.values())
+        self.loss_streak = 0
+        self.cooldown = 0
 
-    probs = {}
+        self.equity_curve = [initial]
 
-    for s in states:
+        self.hard_stop = False
 
-        probs[s] = bayes(
-            cnt.get(s,0),
-            total,
-            1.2,
-            len(states)
+    def get_bet_size(
+        self,
+        p,
+        odds_total,
+        probs
+    ):
+
+        if self.hard_stop:
+            return 0
+
+        if self.current <= self.initial * 0.35:
+            self.hard_stop = True
+            return 0
+
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return 0
+
+        ent = entropy(probs)
+
+        if ent > 1.02:
+            return 0
+
+        b = odds_total - 1
+        q = 1 - p
+
+        edge = (b * p) - q
+
+        if edge <= 0.015:
+            return 0
+
+        f = edge / b
+
+        f *= 0.10
+
+        f = min(f, 0.025)
+
+        bet = int(self.current * f)
+
+        bet = min(
+            bet,
+            int(self.current * 0.04)
         )
 
-    return probs
+        if bet < 20:
+            return 0
 
-# =========================================================
+        return bet
+
+    def record_result(
+        self,
+        bet,
+        won,
+        odds_total
+    ):
+
+        if bet <= 0:
+            return
+
+        self.bet_count += 1
+
+        if won:
+
+            self.win_count += 1
+
+            self.loss_streak = 0
+
+            profit = bet * (
+                odds_total - 1
+            )
+
+        else:
+
+            self.loss_streak += 1
+
+            profit = -bet
+
+            if self.loss_streak >= 6:
+                self.cooldown = 10
+                self.loss_streak = 0
+
+        self.current += profit
+
+        self.history.append(profit)
+
+        self.equity_curve.append(
+            self.current
+        )
+
+    def get_max_drawdown(self):
+
+        peak = self.equity_curve[0]
+
+        max_dd = 0
+
+        for x in self.equity_curve:
+
+            peak = max(peak, x)
+
+            dd = (peak - x) / peak
+
+            max_dd = max(max_dd, dd)
+
+        return max_dd * 100
+
+    def get_sortino(self):
+
+        if len(self.history) < 2:
+            return 0
+
+        arr = np.array(self.history)
+
+        mean = np.mean(arr)
+
+        downside = arr[arr < 0]
+
+        if len(downside) == 0:
+            return 0
+
+        downside_std = np.std(downside)
+
+        if downside_std <= 0:
+            return 0
+
+        return (
+            mean / downside_std
+        ) * math.sqrt(len(arr))
+
+    def get_profit_factor(self):
+
+        gains = sum(
+            x for x in self.history
+            if x > 0
+        )
+
+        losses = abs(sum(
+            x for x in self.history
+            if x < 0
+        ))
+
+        losses = max(losses, 1e-9)
+
+        return gains / losses
+
+    def get_stats(self):
+
+        roi = (
+            (self.current / self.initial) - 1
+        ) * 100
+
+        profit = sum(self.history)
+
+        winrate = 0
+
+        if self.bet_count > 0:
+
+            winrate = (
+                self.win_count
+                / self.bet_count
+            ) * 100
+
+        return profit, roi, winrate
+
+def calc_logloss(probs_list, actuals):
+
+    vals = []
+
+    for probs, actual in zip(
+        probs_list,
+        actuals
+    ):
+
+        p = max(
+            probs.get(actual, 1e-12),
+            1e-12
+        )
+
+        vals.append(-math.log(p))
+
+    return np.mean(vals)
+
+def calc_brier(probs_list, actuals):
+
+    total = 0
+
+    for probs, actual in zip(
+        probs_list,
+        actuals
+    ):
+
+        row = 0
+
+        for s, p in probs.items():
+
+            y = 1 if s == actual else 0
+
+            row += (p - y) ** 2
+
+        total += row
+
+    return total / len(probs_list)
+
+def calc_ece(
+    probs_list,
+    actuals,
+    bins=10
+):
+
+    confidences = []
+    accuracies = []
+
+    for probs, actual in zip(
+        probs_list,
+        actuals
+    ):
+
+        pred = max(
+            probs,
+            key=probs.get
+        )
+
+        confidences.append(
+            probs[pred]
+        )
+
+        accuracies.append(
+            1 if pred == actual else 0
+        )
+
+    confidences = np.array(confidences)
+    accuracies = np.array(accuracies)
+
+    edges = np.linspace(0,1,bins+1)
+
+    ece = 0
+
+    for i in range(bins):
+
+        if i == bins - 1:
+            mask = (
+                (confidences >= edges[i])
+                &
+                (confidences <= edges[i+1])
+            )
+        else:
+            mask = (
+                (confidences >= edges[i])
+                &
+                (confidences < edges[i+1])
+            )
+
+        if np.sum(mask) == 0:
+            continue
+
+        avg_conf = np.mean(
+            confidences[mask]
+        )
+
+        avg_acc = np.mean(
+            accuracies[mask]
+        )
+
+        ece += (
+            np.sum(mask)
+            / len(confidences)
+        ) * abs(avg_conf - avg_acc)
+
+    return ece
+
+def markov_bootstrap_baseline(
+    actuals,
+    trials=2000
+):
+
+    states = list(set(actuals))
+
+    counts = Counter(actuals)
+
+    probs = np.array([
+        counts[s] / len(actuals)
+        for s in states
+    ])
+
+    accs = []
+
+    for _ in range(trials):
+
+        preds = np.random.choice(
+            states,
+            size=len(actuals),
+            p=probs
+        )
+
+        reals = np.random.choice(
+            states,
+            size=len(actuals),
+            p=probs
+        )
+
+        accs.append(
+            np.mean(preds == reals)
+        )
+
+    return np.mean(accs)
+
+def get_color_odds(color):
+
+    if color == "红":
+        return 2.7
+
+    return 2.8
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="V14 FIXED - 实战预测版"
+    )
 
     parser.add_argument(
         "--lottery",
-        default="香港彩",
-        choices=[
-            "老澳门彩",
-            "香港彩",
-            "新澳门彩"
-        ]
+        choices=["老澳门彩","香港彩","新澳门彩"],
+        default="新澳门彩"
+    )
+
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=220
+    )
+
+    parser.add_argument(
+        "--bankroll",
+        type=int,
+        default=10000
     )
 
     parser.add_argument(
         "--test",
         type=int,
-        default=10
+        default=250
     )
 
     args = parser.parse_args()
-
-    print("="*60)
-    print(args.lottery)
-    print("="*60)
 
     conn = connect_db(
         SCRIPT_DIR / DB_FILES[args.lottery]
@@ -571,316 +891,369 @@ def main():
 
     init_db(conn)
 
-    records = fetch_online(args.lottery)
+    try:
 
-    ins, upd = sync_db(conn, records)
-
-    print(f"\n同步完成 新增:{ins} 更新:{upd}")
-
-    rows = load_rows(conn)
-
-    color_seq = [
-        get_color(r["special_number"])
-        for r in rows
-    ]
-
-    size_seq = [
-        get_size(r["special_number"])
-        for r in rows
-    ]
-
-    odd_seq = [
-        get_odd_even(r["special_number"])
-        for r in rows
-    ]
-
-    # =====================================================
-    # 动态窗口
-    # =====================================================
-
-    color_window = best_window(
-        color_seq,
-        ["红","蓝","绿"]
-    )
-
-    size_window = best_window(
-        size_seq,
-        ["大","小"]
-    )
-
-    print(f"\n波色最佳窗口: {color_window}")
-    print(f"大小最佳窗口: {size_window}")
-    print(f"单双固定策略: 全局趋势")
-
-    # =====================================================
-    # 回测
-    # =====================================================
-
-    print("\n" + "="*60)
-    print("最近10期详细回测")
-    print("="*60)
-
-    c1 = 0
-    c2 = 0
-    s1 = 0
-    o1 = 0
-
-    start = len(rows) - args.test
-
-    for t in range(start, len(rows)):
-
-        # =================================================
-        # 波色
-        # =================================================
-
-        model_c = HybridModel(
-            ["红","蓝","绿"],
-            recent=color_window
+        records, source = fetch_online_records(
+            args.lottery
         )
 
-        model_c.fit(color_seq[:t])
-
-        pred_c = model_c.predict(
-            color_seq[max(0,t-20):t]
+        total, ins, upd = sync_from_records(
+            conn,
+            records,
+            source
         )
 
-        sorted_c = sorted(
-            pred_c.items(),
-            key=lambda x:x[1],
-            reverse=True
+        print(
+            f"{args.lottery} 同步完成 "
+            f"总计:{total} 新增:{ins} 更新:{upd}"
         )
 
-        main_c = sorted_c[0][0]
-        second_c = sorted_c[1][0]
+        color_seq = load_sequence(
+            conn,
+            get_color
+        )
 
-        # =================================================
-        # 动态双推
-        # =================================================
+        size_seq = load_sequence(
+            conn,
+            get_big_small
+        )
 
-        if (
-            sorted_c[0][1] -
-            sorted_c[1][1]
-        ) < 0.08:
+        odd_seq = load_sequence(
+            conn,
+            get_odd_even
+        )
 
-            combo = (
-                second_c,
-                main_c
+        test_len = min(
+            args.test,
+            len(color_seq) - 60
+        )
+
+        start = len(color_seq) - test_len
+
+        bank = KellyBankroll(
+            initial=args.bankroll
+        )
+
+        probs_history = []
+        actual_history = []
+
+        historical_probs = []
+        historical_actuals = []
+
+        color_correct = 0
+        size_correct = 0
+        odd_correct = 0
+
+        for t in range(start, len(color_seq)):
+
+            regime = detect_regime(
+                color_seq[:t]
             )
 
-        else:
+            if regime == "VOLATILE":
+                dynamic_recent = 120
+            else:
+                dynamic_recent = min(
+                    args.recent,
+                    max(
+                        140,
+                        int(
+                            180 +
+                            np.std(
+                                np.arange(
+                                    max(0,t-100),
+                                    t
+                                )
+                            )
+                        )
+                    )
+                )
 
-            combo = (
-                main_c,
-                second_c
+            eng_c = ConditionalMarkov(
+                ["红","蓝","绿"],
+                recent_periods=dynamic_recent
             )
 
-        actual_c = color_seq[t]
+            eng_s = ConditionalMarkov(
+                ["大","小"],
+                recent_periods=dynamic_recent
+            )
 
-        hit1 = (
-            combo[0] == actual_c
+            eng_o = ConditionalMarkov(
+                ["单","双"],
+                recent_periods=dynamic_recent
+            )
+
+            eng_c.train(color_seq[:t])
+            eng_s.train(size_seq[:t])
+            eng_o.train(odd_seq[:t])
+
+            pred_c = eng_c.predict(
+                color_seq[max(0,t-30):t]
+            )
+
+            pred_s = eng_s.predict(
+                size_seq[max(0,t-30):t]
+            )
+
+            pred_o = eng_o.predict(
+                odd_seq[max(0,t-30):t]
+            )
+
+            actual_c = color_seq[t]
+            actual_s = size_seq[t]
+            actual_o = odd_seq[t]
+
+            temp = rolling_temperature_search(
+                historical_probs,
+                historical_actuals
+            )
+
+            calibrated = apply_temperature(
+                pred_c,
+                temp
+            )
+
+            historical_probs.append(dict(pred_c))
+            historical_actuals.append(actual_c)
+
+            probs_history.append(calibrated)
+            actual_history.append(actual_c)
+
+            best_color = max(
+                calibrated,
+                key=calibrated.get
+            )
+
+            best_prob = calibrated[
+                best_color
+            ]
+
+            odds = get_color_odds(
+                best_color
+            )
+
+            bet = bank.get_bet_size(
+                best_prob,
+                odds,
+                calibrated
+            )
+
+            won = (
+                best_color == actual_c
+            )
+
+            bank.record_result(
+                bet,
+                won,
+                odds
+            )
+
+            if best_color == actual_c:
+                color_correct += 1
+
+            if (
+                max(pred_s,key=pred_s.get)
+                == actual_s
+            ):
+                size_correct += 1
+
+            if (
+                max(pred_o,key=pred_o.get)
+                == actual_o
+            ):
+                odd_correct += 1
+
+        logloss = calc_logloss(
+            probs_history,
+            actual_history
         )
 
-        hit2 = (
-            actual_c in combo
+        brier = calc_brier(
+            probs_history,
+            actual_history
         )
 
-        if hit1:
-            c1 += 1
-
-        if hit2:
-            c2 += 1
-
-        # =================================================
-        # 大小
-        # =================================================
-
-        pred_s = predict_simple(
-            size_seq[:t],
-            ["大","小"],
-            recent=size_window
+        ece = calc_ece(
+            probs_history,
+            actual_history
         )
 
-        main_s = max(
-            pred_s,
-            key=pred_s.get
+        mc = markov_bootstrap_baseline(
+            actual_history
         )
 
-        actual_s = size_seq[t]
+        profit, roi, winrate = bank.get_stats()
 
-        hit_s = (
-            main_s == actual_s
-        )
+        max_dd = bank.get_max_drawdown()
 
-        if hit_s:
-            s1 += 1
+        pf = bank.get_profit_factor()
 
-        # =================================================
-        # 单双
-        # =================================================
+        sortino = bank.get_sortino()
 
-        pred_o = predict_simple(
-            odd_seq[:t],
-            ["单","双"],
-            recent=20
-        )
-
-        main_o = max(
-            pred_o,
-            key=pred_o.get
-        )
-
-        actual_o = odd_seq[t]
-
-        hit_o = (
-            main_o == actual_o
-        )
-
-        if hit_o:
-            o1 += 1
-
-        row = rows[t]
+        print("\n" + "="*100)
 
         print(
-            f"{row['issue_no']} "
-            f"{row['draw_date']} | "
-            f"波色:{combo[0]}+{combo[1]} "
-            f"| 开:{actual_c} "
-            f"| 主推:{'√' if hit1 else '×'} "
-            f"| 双推:{'√' if hit2 else '×'} "
-            f"| 大小:{main_s}/{actual_s} {'√' if hit_s else '×'} "
-            f"| 单双:{main_o}/{actual_o} {'√' if hit_o else '×'}"
+            f"V14 FIXED "
+            f"真WalkForward ({test_len}期)"
         )
 
-    # =====================================================
-    # 统计
-    # =====================================================
-
-    print("\n" + "="*60)
-    print("最近10期命中统计")
-    print("="*60)
-
-    print(
-        f"波色主推命中率: "
-        f"{c1/args.test*100:.2f}%"
-    )
-
-    print(
-        f"波色双推命中率: "
-        f"{c2/args.test*100:.2f}%"
-    )
-
-    print(
-        f"大小命中率: "
-        f"{s1/args.test*100:.2f}%"
-    )
-
-    print(
-        f"单双命中率: "
-        f"{o1/args.test*100:.2f}%"
-    )
-
-    # =====================================================
-    # 下期预测
-    # =====================================================
-
-    next_issue = str(
-        issue_int(rows[-1]["issue_no"]) + 1
-    )
-
-    print("\n" + "="*60)
-    print(f"下期预测（{next_issue}）")
-    print("="*60)
-
-    # =====================================================
-    # 波色
-    # =====================================================
-
-    model_final = HybridModel(
-        ["红","蓝","绿"],
-        recent=color_window
-    )
-
-    model_final.fit(color_seq)
-
-    final_c = model_final.predict(
-        color_seq[-20:]
-    )
-
-    sorted_final = sorted(
-        final_c.items(),
-        key=lambda x:x[1],
-        reverse=True
-    )
-
-    print("\n【波色】")
-
-    for k,v in sorted_final:
+        print("-"*100)
 
         print(
-            f"{k} : {v*100:.2f}%"
+            f"色波准确率 : "
+            f"{color_correct/test_len*100:.2f}%"
         )
-
-    print(
-        f"\n推荐组合: "
-        f"{sorted_final[0][0]}"
-        f" + "
-        f"{sorted_final[1][0]}"
-    )
-
-    print(
-        f"双推覆盖率: "
-        f"{(sorted_final[0][1] + sorted_final[1][1])*100:.2f}%"
-    )
-
-    # =====================================================
-    # 大小
-    # =====================================================
-
-    final_s = predict_simple(
-        size_seq,
-        ["大","小"],
-        recent=size_window
-    )
-
-    print("\n【大小】")
-
-    for k,v in sorted(
-        final_s.items(),
-        key=lambda x:x[1],
-        reverse=True
-    ):
 
         print(
-            f"{k} : {v*100:.2f}%"
+            f"大小准确率 : "
+            f"{size_correct/test_len*100:.2f}%"
         )
-
-    # =====================================================
-    # 单双
-    # =====================================================
-
-    final_o = predict_simple(
-        odd_seq,
-        ["单","双"],
-        recent=20
-    )
-
-    print("\n【单双】")
-
-    for k,v in sorted(
-        final_o.items(),
-        key=lambda x:x[1],
-        reverse=True
-    ):
 
         print(
-            f"{k} : {v*100:.2f}%"
+            f"单双准确率 : "
+            f"{odd_correct/test_len*100:.2f}%"
         )
 
-    print("\n" + "="*60)
+        print("-"*100)
 
-    conn.close()
+        print(
+            f"LogLoss    : {logloss:.6f}"
+        )
 
-# =========================================================
+        print(
+            f"BrierScore : {brier:.6f}"
+        )
+
+        print(
+            f"ECE         : {ece:.6f}"
+        )
+
+        print(
+            f"BootstrapMC : {mc*100:.2f}%"
+        )
+
+        print("-"*100)
+
+        print(
+            f"最终资金    : ¥{bank.current:.2f}"
+        )
+
+        print(
+            f"总盈亏      : ¥{profit:.2f}"
+        )
+
+        print(
+            f"ROI         : {roi:.2f}%"
+        )
+
+        print(
+            f"下注次数    : {bank.bet_count}"
+        )
+
+        print(
+            f"真实胜率    : {winrate:.2f}%"
+        )
+
+        print("-"*100)
+
+        print(
+            f"MaxDrawdown : {max_dd:.2f}%"
+        )
+
+        print(
+            f"ProfitFactor: {pf:.4f}"
+        )
+
+        print(
+            f"SortinoRatio: {sortino:.4f}"
+        )
+
+        print("="*100)
+
+        # ====================== 新增：最近10期预测对错 ======================
+        print("\n" + "="*90)
+        print("📊 【最近10期预测对错记录】")
+        print("="*90)
+        print(f"{'期号':<6} {'实际波色':<6} {'主推波色':<8} {'结果'}   {'实际大小':<6} {'预测大小':<8} {'结果'}   {'实际单双':<6} {'预测单双':<8} {'结果'}")
+
+        correct_c10 = correct_s10 = correct_o10 = 0
+        recent_start = max(0, len(color_seq) - 10)
+
+        for t in range(recent_start, len(color_seq)):
+            eng_c = ConditionalMarkov(["红","蓝","绿"], recent_periods=args.recent)
+            eng_s = ConditionalMarkov(["大","小"], recent_periods=args.recent)
+            eng_o = ConditionalMarkov(["单","双"], recent_periods=args.recent)
+
+            eng_c.train(color_seq[:t])
+            eng_s.train(size_seq[:t])
+            eng_o.train(odd_seq[:t])
+
+            pred_c = eng_c.predict(color_seq[max(0,t-30):t])
+            pred_s = eng_s.predict(size_seq[max(0,t-30):t])
+            pred_o = eng_o.predict(odd_seq[max(0,t-30):t])
+
+            best_c = max(pred_c, key=pred_c.get)
+            best_s = max(pred_s, key=pred_s.get)
+            best_o = max(pred_o, key=pred_o.get)
+
+            actual_c = color_seq[t]
+            actual_s = size_seq[t]
+            actual_o = odd_seq[t]
+
+            c_ok = "✓" if best_c == actual_c else "✗"
+            s_ok = "✓" if best_s == actual_s else "✗"
+            o_ok = "✓" if best_o == actual_o else "✗"
+
+            if c_ok == "✓": correct_c10 += 1
+            if s_ok == "✓": correct_s10 += 1
+            if o_ok == "✓": correct_o10 += 1
+
+            print(f"{t+1:<6} {actual_c:<6} {best_c:<8} {c_ok}      {actual_s:<6} {best_s:<8} {s_ok}      {actual_o:<6} {best_o:<8} {o_ok}")
+
+        print("-"*90)
+        print(f"最近10期准确率 → 波色: {correct_c10/10*100:.1f}% | 大小: {correct_s10/10*100:.1f}% | 单双: {correct_o10/10*100:.1f}%")
+
+        # ====================== 新增：下一期实战预测 ======================
+        print("\n" + "="*90)
+        print(f"🎯 【下一期实战预测 - {args.lottery}】")
+        print("="*90)
+
+        eng_c = ConditionalMarkov(["红","蓝","绿"], recent_periods=args.recent)
+        eng_s = ConditionalMarkov(["大","小"], recent_periods=args.recent)
+        eng_o = ConditionalMarkov(["单","双"], recent_periods=args.recent)
+
+        eng_c.train(color_seq)
+        eng_s.train(size_seq)
+        eng_o.train(odd_seq)
+
+        pred_c = eng_c.predict(color_seq[-30:])
+        pred_s = eng_s.predict(size_seq[-30:])
+        pred_o = eng_o.predict(odd_seq[-30:])
+
+        temp = rolling_temperature_search(historical_probs, historical_actuals) if historical_probs else 1.0
+        calibrated_c = apply_temperature(pred_c, temp)
+
+        sorted_c = sorted(calibrated_c.items(), key=lambda x: x[1], reverse=True)
+        main_c, p_main = sorted_c[0]
+        sec_c, p_sec = sorted_c[1] if len(sorted_c) > 1 else (list(calibrated_c.keys())[0], 0.0)
+
+        best_s = max(pred_s, key=pred_s.get)
+        best_o = max(pred_o, key=pred_o.get)
+
+        print(f"波色主推 → {main_c}波    概率: {p_main:.1%}")
+        print(f"波色次推 → {sec_c}波    概率: {p_sec:.1%}")
+        print(f"大小预测 → {best_s}      概率: {pred_s[best_s]:.1%}")
+        print(f"单双预测 → {best_o}      概率: {pred_o[best_o]:.1%}")
+        print("-"*90)
+        print(f"🎯 综合推荐：【{main_c} + {best_s} + {best_o}】")
+        print("="*90)
+
+    except Exception as e:
+        print(f"错误: {e}")
+
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
