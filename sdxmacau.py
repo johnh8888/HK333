@@ -4,27 +4,10 @@
 # =========================================================
 # 三彩种智能预测系统 V16 REAL API FINAL
 #
-# 功能：
-# - 新澳门彩
-# - 老澳门彩
-# - 香港彩
-#
-# 核心：
-# - 动态状态机
-# - 熵检测
-# - 连续同波检测
-# - 高频反转检测
-# - 趋势惯性
-# - 单双联动
-# - 动态单双/大小
-# - 指数衰减权重
-#
-# 新增：
-# - 香港真实数据源
-# - marksix6.net 数据源
-# - HKJC 官方数据源
-# - 自动API切换
-# - 自动解析开奖号
+# 已修复：
+# - 删除失效 HKJC 官方数据源
+# - 仅保留 marksix6.net
+# - 其它逻辑完全不改
 #
 # Python 3.11+
 # =========================================================
@@ -34,9 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import urllib.request
-from collections import Counter
 from datetime import datetime
 
 # =========================================================
@@ -60,13 +41,8 @@ GREEN = {
 }
 
 # =========================================================
-# 真实数据源
+# 唯一真实数据源
 # =========================================================
-
-HKJC_URL = (
-    "https://bet.hkjc.com/contentserver/"
-    "jcbw/cmc/last30draw.json"
-)
 
 MARKSIX_URL = (
     "https://marksix6.net/index.php?api=1"
@@ -107,9 +83,7 @@ def fetch_json(url):
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0"
-                )
+                "User-Agent": "Mozilla/5.0"
             }
         )
 
@@ -128,49 +102,6 @@ def fetch_json(url):
         print(e)
 
         return None
-
-# =========================================================
-# 解析 HKJC 官方数据
-# =========================================================
-
-def parse_hkjc_data(raw):
-
-    history = []
-
-    if not raw:
-        return history
-
-    try:
-
-        draws = raw.get("draws", [])
-
-        for row in draws:
-
-            draw = row.get("drawNumber")
-
-            date = row.get("drawDate")
-
-            nums = row.get("winningNo", "")
-
-            if not nums:
-                continue
-
-            first_num = int(
-                nums.split("+")[0]
-                .split()[0]
-            )
-
-            history.append({
-                "issue": str(draw),
-                "date": date,
-                "number": first_num
-            })
-
-    except Exception as e:
-
-        print("HKJC解析失败:", e)
-
-    return history
 
 # =========================================================
 # 解析 marksix 数据
@@ -249,20 +180,6 @@ def parse_marksix_data(raw):
 # =========================================================
 
 def fetch_real_history():
-
-    # 优先HKJC官方
-
-    raw = fetch_json(HKJC_URL)
-
-    history = parse_hkjc_data(raw)
-
-    if len(history) >= 20:
-
-        history.reverse()
-
-        return history
-
-    # 备用源
 
     raw = fetch_json(MARKSIX_URL)
 
