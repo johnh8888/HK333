@@ -4,10 +4,25 @@
 # =========================================================
 # 三彩种智能预测系统 V16 REAL API FINAL
 #
-# 已修复：
-# - 删除失效 HKJC 官方数据源
-# - 仅保留 marksix6.net
-# - 其它逻辑完全不改
+# 功能：
+# - 新澳门彩
+# - 老澳门彩
+# - 香港彩
+#
+# 核心：
+# - 动态状态机
+# - 熵检测
+# - 连续同波检测
+# - 高频反转检测
+# - 趋势惯性
+# - 单双联动
+# - 动态单双/大小
+# - 指数衰减权重
+#
+# 数据源：
+# - 香港彩
+# - 新澳门彩
+# - 老澳门彩
 #
 # Python 3.11+
 # =========================================================
@@ -17,8 +32,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import urllib.request
-from datetime import datetime
 
 # =========================================================
 # 波色映射
@@ -41,12 +56,14 @@ GREEN = {
 }
 
 # =========================================================
-# 唯一真实数据源
+# 最新真实数据源
 # =========================================================
 
-MARKSIX_URL = (
-    "https://marksix6.net/index.php?api=1"
-)
+API_URLS = {
+    "香港彩": "https://api3.marksix6.net/lottery_api.php?type=hk",
+    "新澳门彩": "https://api3.marksix6.net/lottery_api.php?type=newMacau",
+    "老澳门彩": "https://api3.marksix6.net/lottery_api.php?type=oldMacau",
+}
 
 # =========================================================
 # 工具函数
@@ -104,94 +121,96 @@ def fetch_json(url):
         return None
 
 # =========================================================
-# 解析 marksix 数据
+# 获取真实历史数据
 # =========================================================
 
-def parse_marksix_data(raw):
+def fetch_real_history(lottery_name):
+
+    url = API_URLS.get(
+        lottery_name,
+        API_URLS["香港彩"]
+    )
+
+    raw = fetch_json(url)
 
     history = []
 
     if not raw:
-        return history
+        raise Exception("无法获取真实数据")
 
     try:
 
+        rows = []
+
         if isinstance(raw, dict):
 
-            for k, v in raw.items():
+            if "data" in raw:
+                rows = raw["data"]
 
-                if not isinstance(v, dict):
-                    continue
-
-                issue = v.get("expect", k)
-
-                date = v.get("opentime", "")
-
-                code = (
-                    v.get("opencode")
-                    or v.get("openCode")
-                    or ""
-                )
-
-                if not code:
-                    continue
-
-                first = int(code.split(",")[0])
-
-                history.append({
-                    "issue": str(issue),
-                    "date": date,
-                    "number": first
-                })
+            else:
+                rows = list(raw.values())
 
         elif isinstance(raw, list):
 
-            for row in raw:
+            rows = raw
 
-                issue = row.get("expect")
+        for row in rows:
 
-                date = row.get("opentime", "")
+            if not isinstance(row, dict):
+                continue
 
-                code = (
-                    row.get("opencode")
-                    or row.get("openCode")
-                    or ""
-                )
+            issue = (
+                row.get("expect")
+                or row.get("issue")
+                or row.get("period")
+                or ""
+            )
 
-                if not code:
-                    continue
+            date = (
+                row.get("opentime")
+                or row.get("date")
+                or ""
+            )
 
-                first = int(code.split(",")[0])
+            code = (
+                row.get("opencode")
+                or row.get("openCode")
+                or row.get("number")
+                or ""
+            )
 
-                history.append({
-                    "issue": str(issue),
-                    "date": date,
-                    "number": first
-                })
+            if not code:
+                continue
+
+            nums = re.findall(
+                r"\d+",
+                str(code)
+            )
+
+            if not nums:
+                continue
+
+            first_num = int(nums[0])
+
+            if not (1 <= first_num <= 49):
+                continue
+
+            history.append({
+                "issue": str(issue),
+                "date": str(date),
+                "number": first_num
+            })
 
     except Exception as e:
 
-        print("marksix解析失败:", e)
+        print("数据解析失败:", e)
+
+    if len(history) < 10:
+        raise Exception("无法获取真实数据")
+
+    history.reverse()
 
     return history
-
-# =========================================================
-# 获取真实历史数据
-# =========================================================
-
-def fetch_real_history():
-
-    raw = fetch_json(MARKSIX_URL)
-
-    history = parse_marksix_data(raw)
-
-    if len(history) >= 20:
-
-        history.reverse()
-
-        return history
-
-    raise Exception("无法获取真实数据")
 
 # =========================================================
 # 熵计算
@@ -705,7 +724,9 @@ def run_predict(lottery_name):
     print("=" * 60)
     print()
 
-    history = fetch_real_history()
+    history = fetch_real_history(
+        lottery_name
+    )
 
     print(
         f"同步完成 "
