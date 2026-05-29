@@ -1,7 +1,8 @@
-name: 三彩种属性预测 V17-PRO
+name: 三彩种属性预测 V16-PRO
 
 on:
   schedule:
+    # 香港时间 22:30
     - cron: '30 14 * * *'
 
   workflow_dispatch:
@@ -15,62 +16,113 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
+
+      # ===================================================
+      # 检出代码
+      # ===================================================
 
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # ===================================================
+      # Python
+      # ===================================================
+
       - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+
+      # ===================================================
+      # 安装依赖
+      # ===================================================
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
+
+      # ===================================================
+      # 时区
+      # ===================================================
+
+      - name: 设置时区
+        run: |
+          sudo timedatectl set-timezone Asia/Hong_Kong
+
+      # ===================================================
+      # 香港彩
+      # ===================================================
 
       - name: 香港彩预测
         run: |
-
           echo "=================================================="
           echo "香港彩"
           echo "=================================================="
 
           python sdxmacau.py \
             --lottery 香港彩 \
+            --recent 240 \
+            --bankroll 10000 \
             --test 10
+
+      # ===================================================
+      # 老澳门彩
+      # ===================================================
 
       - name: 老澳门彩预测
         run: |
-
           echo "=================================================="
           echo "老澳门彩"
           echo "=================================================="
 
           python sdxmacau.py \
             --lottery 老澳门彩 \
+            --recent 240 \
+            --bankroll 10000 \
             --test 10
+
+      # ===================================================
+      # 新澳门彩
+      # ===================================================
 
       - name: 新澳门彩预测
         run: |
-
           echo "=================================================="
           echo "新澳门彩"
           echo "=================================================="
 
           python sdxmacau.py \
             --lottery 新澳门彩 \
+            --recent 240 \
+            --bankroll 10000 \
             --test 10
+
+      # ===================================================
+      # 数据库状态
+      # ===================================================
 
       - name: 检查数据库变化
         id: changes
         run: |
+
+          git status
 
           if git diff --quiet old_macau.db hk_macau.db xin_macau.db; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
+
+      # ===================================================
+      # 自动提交数据库
+      # ===================================================
 
       - name: 提交数据库更新
         if: steps.changes.outputs.changed == 'true'
@@ -79,20 +131,41 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add old_macau.db hk_macau.db xin_macau.db
+          git add old_macau.db
+          git add hk_macau.db
+          git add xin_macau.db
 
-          git commit -m "📊 自动更新数据 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || exit 0
+          git commit -m "📊 自动更新数据 $(date +'%Y-%m-%d %H:%M:%S')" || exit 0
 
           git pull --rebase origin main
 
-          git push
+          git push origin HEAD:main
 
-      - name: 备份数据库
+      # ===================================================
+      # 上传数据库备份
+      # ===================================================
+
+      - name: 上传数据库备份
         uses: actions/upload-artifact@v4
         with:
           name: macau-dbs
+
           path: |
             old_macau.db
             hk_macau.db
             xin_macau.db
+
           retention-days: 30
+
+      # ===================================================
+      # 上传日志
+      # ===================================================
+
+      - name: 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-logs
+          path: |
+            *.log
+          retention-days: 7
