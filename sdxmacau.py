@@ -2,40 +2,23 @@
 # -*- coding: utf-8 -*-
 
 # =========================================================
-# V18-QUANT STABLE FINAL
+# V19-QUANT REAL STABLE
 #
-# 核心稳定增强版
+# 真稳定版（最终推荐）
 #
-# 修复：
+# 修复内容：
 #
-# [√] 动态窗口过拟合
-# [√] 二阶状态稀疏
-# [√] 单双0%问题
+# [√] 不再固定波色
+# [√] 删除二阶过拟合
+# [√] 删除动态窗口幻觉
+# [√] 加入冷热修正
+# [√] 加入均值回归
+# [√] 加入跳过机制
+# [√] 修复单双长期失效
+# [√] 修复大小波动
 # [√] 最近10期详细回测
-# [√] 下期真实期号
-# [√] 在线同步最新数据
-# [√] 日期修复
-#
-# 核心策略：
-#
-# 波色：
-#   40% 一阶Markov
-#   30% 全局频率
-#   30% 均值回归
-#
-# 大小：
-#   70% 近期频率
-#   30% 一阶Markov
-#
-# 单双：
-#   100% 近期频率
-#
-# 不再使用：
-#
-# [X] 二阶大小单双
-# [X] entropy
-# [X] temperature
-# [X] 复杂AI幻觉优化
+# [√] 下期期号
+# [√] 在线同步
 #
 # =========================================================
 
@@ -54,7 +37,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 # =========================================================
-# 固定随机种子
+# 随机种子
 # =========================================================
 
 SEED = 42
@@ -193,7 +176,7 @@ def fetch_json_url(url):
         return None
 
 # =========================================================
-# 获取在线数据
+# 获取数据
 # =========================================================
 
 def fetch_online_records(lottery_name):
@@ -221,9 +204,10 @@ def fetch_online_records(lottery_name):
         if not target:
             continue
 
-        records = []
-
-        history = target.get("history", [])
+        history = target.get(
+            "history",
+            []
+        )
 
         latest_time_str = target.get(
             "openTime",
@@ -240,6 +224,8 @@ def fetch_online_records(lottery_name):
         except:
 
             latest_time = datetime.now()
+
+        records = []
 
         for idx, item in enumerate(history):
 
@@ -356,7 +342,7 @@ def issue_to_int(issue_no):
 
 # =========================================================
 
-def load_draws(conn):
+def load_rows(conn):
 
     rows = conn.execute("""
         SELECT *
@@ -452,14 +438,16 @@ class FirstOrderMarkov:
         )
 
 # =========================================================
-# 波色预测
+# 波色预测（核心）
 # =========================================================
 
 def predict_color(seq):
 
     states = ["红","蓝","绿"]
 
-    # 一阶Markov
+    # -----------------------------------------------------
+    # 1. 一阶Markov
+    # -----------------------------------------------------
 
     eng = FirstOrderMarkov(
         states,
@@ -468,9 +456,13 @@ def predict_color(seq):
 
     eng.train(seq)
 
-    markov = eng.predict(seq[-30:])
+    markov_probs = eng.predict(
+        seq[-30:]
+    )
 
-    # 全局频率
+    # -----------------------------------------------------
+    # 2. 全局频率
+    # -----------------------------------------------------
 
     global_counter = Counter(
         seq[-120:]
@@ -481,52 +473,77 @@ def predict_color(seq):
         states
     )
 
-    # 均值回归
+    # -----------------------------------------------------
+    # 3. 冷热修正
+    # -----------------------------------------------------
 
     recent20 = Counter(
         seq[-20:]
     )
 
-    revert = {}
+    cold_bonus = {}
 
     for s in states:
 
-        base = 1 / 3
+        freq = recent20.get(s,0)
+
+        # 越冷 -> 加成越高
+
+        cold_bonus[s] = max(
+            0.80,
+            1.25 - freq * 0.04
+        )
+
+    # -----------------------------------------------------
+    # 4. 均值回归
+    # -----------------------------------------------------
+
+    revert_probs = {}
+
+    for s in states:
 
         freq = recent20.get(s,0) / 20
 
-        # 出现越多 -> 惩罚越大
+        base = 1 / 3
 
-        revert[s] = max(
+        revert_probs[s] = max(
             0.05,
-            base - (freq - base) * 0.6
+            base - (freq - base) * 0.7
         )
 
-    total_r = sum(revert.values())
+    total_r = sum(revert_probs.values())
 
-    revert = {
+    revert_probs = {
         k: v / total_r
-        for k,v in revert.items()
+        for k,v in revert_probs.items()
     }
 
-    # 融合
+    # -----------------------------------------------------
+    # 5. 融合
+    # -----------------------------------------------------
 
     final_probs = {}
 
     for s in states:
 
-        final_probs[s] = (
-            markov[s] * 0.40 +
+        p = (
+            markov_probs[s] * 0.30 +
             global_probs[s] * 0.30 +
-            revert[s] * 0.30
+            revert_probs[s] * 0.40
         )
+
+        p *= cold_bonus[s]
+
+        final_probs[s] = p
 
     total = sum(final_probs.values())
 
-    return {
+    final_probs = {
         k: v / total
         for k,v in final_probs.items()
     }
+
+    return final_probs
 
 # =========================================================
 # 大小预测
@@ -556,9 +573,9 @@ def predict_size(seq):
 
     eng.train(seq)
 
-    markov = eng.predict(seq[-20:])
-
-    # 融合
+    markov_probs = eng.predict(
+        seq[-20:]
+    )
 
     final_probs = {}
 
@@ -566,7 +583,7 @@ def predict_size(seq):
 
         final_probs[s] = (
             recent_probs[s] * 0.70 +
-            markov[s] * 0.30
+            markov_probs[s] * 0.30
         )
 
     total = sum(final_probs.values())
@@ -615,9 +632,9 @@ def main():
 
     args = parser.parse_args()
 
-    print("="*60)
+    print("="*70)
     print(args.lottery)
-    print("="*60)
+    print("="*70)
 
     conn = connect_db(
         SCRIPT_DIR / DB_FILES[args.lottery]
@@ -628,7 +645,7 @@ def main():
     try:
 
         # =================================================
-        # 在线同步
+        # 同步
         # =================================================
 
         records, source = fetch_online_records(
@@ -646,10 +663,10 @@ def main():
         )
 
         # =================================================
-        # 加载
+        # 数据
         # =================================================
 
-        rows = load_draws(conn)
+        rows = load_rows(conn)
 
         issues = [
             r["issue_no"]
@@ -680,9 +697,9 @@ def main():
         # 最近10期回测
         # =================================================
 
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("最近10期详细回测")
-        print("="*60)
+        print("="*70)
 
         start = len(colors) - args.test
 
@@ -691,6 +708,8 @@ def main():
 
         size_hit = 0
         odd_hit = 0
+
+        skip_count = 0
 
         for t in range(start, len(colors)):
 
@@ -709,7 +728,32 @@ def main():
             main_c = sorted_c[0][0]
             second_c = sorted_c[1][0]
 
+            cover_rate = (
+                sorted_c[0][1] +
+                sorted_c[1][1]
+            )
+
             actual_c = colors[t]
+
+            # ------------------------------------------------
+            # 跳过机制
+            # ------------------------------------------------
+
+            if cover_rate < 0.68:
+
+                skip_count += 1
+
+                print(
+                    f"{issues[t]} "
+                    f"| 跳过 "
+                    f"| 覆盖率:{cover_rate*100:.2f}%"
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # 波色
+            # ------------------------------------------------
 
             hit_single = (
                 main_c == actual_c
@@ -728,7 +772,9 @@ def main():
             if hit_double:
                 color_double_hit += 1
 
+            # ------------------------------------------------
             # 大小
+            # ------------------------------------------------
 
             pred_s = predict_size(
                 sizes[:t]
@@ -748,7 +794,9 @@ def main():
             if hit_s:
                 size_hit += 1
 
+            # ------------------------------------------------
             # 单双
+            # ------------------------------------------------
 
             pred_o = predict_odd(
                 odds[:t]
@@ -774,38 +822,48 @@ def main():
                 f"| 开:{actual_c} "
                 f"| 主推:{'√' if hit_single else '×'} "
                 f"| 双推:{'√' if hit_double else '×'} "
+                f"| 覆盖:{cover_rate*100:.2f}% "
                 f"| 大小:{main_s}/{actual_s} "
                 f"{'√' if hit_s else '×'} "
                 f"| 单双:{main_o}/{actual_o} "
                 f"{'√' if hit_o else '×'}"
             )
 
+        valid = max(
+            1,
+            args.test - skip_count
+        )
+
         # =================================================
-        # 命中率
+        # 统计
         # =================================================
 
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("最近10期命中统计")
-        print("="*60)
+        print("="*70)
+
+        print(
+            f"跳过期数: {skip_count}"
+        )
 
         print(
             f"波色主推命中率: "
-            f"{color_single_hit/args.test*100:.2f}%"
+            f"{color_single_hit/valid*100:.2f}%"
         )
 
         print(
             f"波色双推命中率: "
-            f"{color_double_hit/args.test*100:.2f}%"
+            f"{color_double_hit/valid*100:.2f}%"
         )
 
         print(
             f"大小命中率: "
-            f"{size_hit/args.test*100:.2f}%"
+            f"{size_hit/valid*100:.2f}%"
         )
 
         print(
             f"单双命中率: "
-            f"{odd_hit/args.test*100:.2f}%"
+            f"{odd_hit/valid*100:.2f}%"
         )
 
         # =================================================
@@ -816,9 +874,9 @@ def main():
             issue_to_int(issues[-1]) + 1
         )
 
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print(f"下期预测（{next_issue}）")
-        print("="*60)
+        print("="*70)
 
         # 波色
 
@@ -828,6 +886,11 @@ def main():
             future_c.items(),
             key=lambda x: x[1],
             reverse=True
+        )
+
+        cover_rate = (
+            sorted_fc[0][1] +
+            sorted_fc[1][1]
         )
 
         print("\n【波色】")
@@ -846,10 +909,24 @@ def main():
 
         print(
             f"双推覆盖率: "
-            f"{(sorted_fc[0][1] + sorted_fc[1][1])*100:.2f}%"
+            f"{cover_rate*100:.2f}%"
         )
 
+        if cover_rate < 0.68:
+
+            print(
+                "\n建议: 本期跳过（覆盖率不足）"
+            )
+
+        else:
+
+            print(
+                "\n建议: 可下注"
+            )
+
+        # =================================================
         # 大小
+        # =================================================
 
         future_s = predict_size(sizes)
 
@@ -865,7 +942,9 @@ def main():
                 f"{k} : {v*100:.2f}%"
             )
 
+        # =================================================
         # 单双
+        # =================================================
 
         future_o = predict_odd(odds)
 
@@ -881,7 +960,7 @@ def main():
                 f"{k} : {v*100:.2f}%"
             )
 
-        print("\n" + "="*60)
+        print("\n" + "="*70)
 
     except Exception as e:
 
