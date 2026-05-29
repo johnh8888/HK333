@@ -1,10 +1,10 @@
-name: 三彩种属性预测
+name: 三彩种属性预测（投票版）
 
 on:
   schedule:
-    # 北京时间每天 22:30（UTC 14:30）运行
+    # 北京时间每天 22:30 运行（UTC 14:30）
     - cron: '30 14 * * *'
-  workflow_dispatch:   # 允许手动触发
+  workflow_dispatch:        # 支持手动触发
 
 permissions:
   contents: write
@@ -12,7 +12,7 @@ permissions:
 jobs:
   predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: 检出代码
@@ -29,27 +29,27 @@ jobs:
       - name: 安装依赖
         run: pip install numpy
 
-      - name: 运行预测引擎（三个彩种）
+      - name: 运行预测引擎（三个彩种 - 投票版）
         run: |
           echo "========================================"
           echo "🚀 开始运行 新澳门彩 预测"
           echo "========================================"
-          python sdxmacau.py --lottery 新澳门彩 --recent 220 --test 100
+          python sdxmacau_vote.py --lottery 新澳门彩
           
           echo "========================================"
           echo "🚀 开始运行 老澳门彩 预测"
           echo "========================================"
-          python sdxmacau.py --lottery 老澳门彩 --recent 220 --test 100
+          python sdxmacau_vote.py --lottery 老澳门彩
           
           echo "========================================"
           echo "🚀 开始运行 香港彩 预测"
           echo "========================================"
-          python sdxmacau.py --lottery 香港彩 --recent 220 --test 100
+          python sdxmacau_vote.py --lottery 香港彩
 
       - name: 检查数据库是否有更新
         id: changes
         run: |
-          if git diff --quiet old_macau.db hk_macau.db xin_macau.db 2>/dev/null; then
+          if git diff --quiet *.db 2>/dev/null; then
             echo "changed=false" >> $GITHUB_OUTPUT
             echo "📌 数据库无变化"
           else
@@ -63,9 +63,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          git add old_macau.db hk_macau.db xin_macau.db
+          git add *.db
           
-          git commit -m "📊 自动更新三彩种数据库 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')"
+          git commit -m "📊 自动更新三彩种数据库 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M:%S')"
           
           git pull --rebase
           git push
@@ -75,11 +75,9 @@ jobs:
         with:
           name: macau-dbs-${{ github.run_id }}
           path: |
-            old_macau.db
-            hk_macau.db
-            xin_macau.db
+            *.db
           retention-days: 30
 
       - name: 清理临时文件
         if: always()
-        run: rm -f *.pyc __pycache__/* 2>/dev/null || true
+        run: rm -rf *.pyc __pycache__ 2>/dev/null || true
