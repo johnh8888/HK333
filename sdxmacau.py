@@ -6,7 +6,6 @@ import argparse
 import random
 import sqlite3
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -27,21 +26,25 @@ def get_color(num):
 def get_big_small(num): return "大" if num >= 25 else "小"
 def get_odd_even(num):  return "单" if num % 2 == 1 else "双"
 
-# ==================== 策略生成号码 ====================
+# ==================== 策略生成 ====================
 def generate_strategy_numbers(specials, strategy):
     recent = specials[-100:]
+    appeared = set(recent)
+    
     if strategy == "hot":
-        hot = [x[0] for x in Counter(recent).most_common(20)]
+        hot = [x[0] for x in Counter(recent).most_common(25)]
         main6 = sorted(random.sample(hot, 6))
-        sp = random.choice(hot[:10])
+        sp = random.choice(hot[:12])
     elif strategy == "cold":
-        appeared = set(recent)
-        cold = [n for n in ALL_NUMBERS if n not in appeared][-25:] or ALL_NUMBERS[-25:]
-        main6 = sorted(random.sample(cold, 6))
-        sp = random.choice(cold[:12])
+        cold = [n for n in ALL_NUMBERS if n not in appeared]
+        if len(cold) < 6:
+            cold.extend(ALL_NUMBERS[-40:])
+        main6 = sorted(random.sample(cold[:35], 6))
+        sp = random.choice(cold[:20] or ALL_NUMBERS[-20:])
     else:
-        main6 = sorted(random.sample(recent[-60:] + ALL_NUMBERS[:30], 6))
-        sp = random.choice(recent[-40:])
+        main6 = sorted(random.sample(recent[-70:] + ALL_NUMBERS, 6))
+        sp = random.choice(recent[-40:] or ALL_NUMBERS)
+    
     return main6, sp
 
 # ==================== 投票预测 ====================
@@ -52,24 +55,22 @@ def vote_predict(specials, attribute_func):
     for strat in strategies:
         _, sp = generate_strategy_numbers(specials, strat)
         attr = attribute_func(sp)
-        # 热策略和平衡策略权重稍高
         votes[attr] += 1.8 if strat in ["hot", "balanced"] else 1.0
 
     total = sum(votes.values())
     main = max(votes, key=votes.get)
     prob = votes[main] / total
     
-    # 次推只在波色时返回
     if attribute_func == get_color:
         second = sorted(votes.items(), key=lambda x: x[1], reverse=True)[1][0]
         return main, second, prob
     else:
-        return main, None, prob   # 大小和单双不返回次推
+        return main, None, prob
 
 # ==================== 最近10期回测 ====================
 def show_recent_10_backtest(specials, attr_func, attr_name):
     print(f"\n📊 【最近10期 {attr_name} 预测对错记录】")
-    print("-" * 65)
+    print("-" * 72)
     if attr_name == "波色":
         print(f"{'期号':<6} {'实际':<6} {'主推':<6} {'结果':<4} {'次推':<6} {'结果':<4}")
     else:
@@ -95,7 +96,7 @@ def show_recent_10_backtest(specials, attr_func, attr_name):
         if main == actual:
             correct_main += 1
 
-    print("-" * 65)
+    print("-" * 72)
     print(f"最近10期主推准确率: {correct_main/10*100:.1f}%\n")
 
 # ==================== 主预测 ====================
@@ -107,8 +108,8 @@ def predict_lottery(lottery_name):
     rows = conn.execute("SELECT special_number FROM draws ORDER BY issue_no DESC").fetchall()
     specials = [r["special_number"] for r in rows if r["special_number"]]
 
-    if len(specials) < 80:
-        print(f"⚠️ {lottery_name} 数据不足")
+    if len(specials) < 50:
+        print(f"⚠️ {lottery_name} 数据不足（当前 {len(specials)} 期）")
         conn.close()
         return
 
@@ -116,12 +117,10 @@ def predict_lottery(lottery_name):
     print(f"🎯 【{lottery_name} - 号码集合投票预测】")
     print(f"{'='*95}")
 
-    # 最近10期回测
     show_recent_10_backtest(specials, get_color, "波色")
     show_recent_10_backtest(specials, get_big_small, "大小")
     show_recent_10_backtest(specials, get_odd_even, "单双")
 
-    # 当前期预测
     color_main, color_sec, c_prob = vote_predict(specials, get_color)
     size_main, _, s_prob = vote_predict(specials, get_big_small)
     odd_main, _, o_prob = vote_predict(specials, get_odd_even)
@@ -130,11 +129,9 @@ def predict_lottery(lottery_name):
     print(f"波色 → 主推: {color_main}波 ({c_prob:.1%})   次推: {color_sec}波")
     print(f"大小 → 主推: {size_main}     ({s_prob:.1%})")
     print(f"单双 → 主推: {odd_main}     ({o_prob:.1%})")
-    
-    print(f"\n💡 综合推荐：【{color_main} + {size_main} + {odd_main}】")
+    print(f"\n💡 综合推荐：【{color_main} + {size_main} + {odd_main}】\n")
 
     conn.close()
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -144,7 +141,6 @@ def main():
     lots = LOTTERY_CONFIG.keys() if args.lottery == "all" else [args.lottery]
     for lot in lots:
         predict_lottery(lot)
-
 
 if __name__ == "__main__":
     main()
