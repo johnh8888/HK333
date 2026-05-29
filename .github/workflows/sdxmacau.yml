@@ -1,10 +1,9 @@
-name: 三彩种属性预测（投票版）
+name: 三彩种属性预测
 
 on:
   schedule:
-    # 北京时间每天 22:30 运行（UTC 14:30）
-    - cron: '30 14 * * *'
-  workflow_dispatch:        # 支持手动触发
+    - cron: '30 14 * * *'     # 北京时间每天 22:30
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -29,22 +28,22 @@ jobs:
       - name: 安装依赖
         run: pip install numpy
 
-      - name: 运行预测引擎（三个彩种 - 投票版）
+      - name: 运行预测引擎（三个彩种）
         run: |
           echo "========================================"
           echo "🚀 开始运行 新澳门彩 预测"
           echo "========================================"
-          python sdxmacau_vote.py --lottery 新澳门彩
+          python sdxmacau.py --lottery 新澳门彩
           
           echo "========================================"
           echo "🚀 开始运行 老澳门彩 预测"
           echo "========================================"
-          python sdxmacau_vote.py --lottery 老澳门彩
+          python sdxmacau.py --lottery 老澳门彩
           
           echo "========================================"
           echo "🚀 开始运行 香港彩 预测"
           echo "========================================"
-          python sdxmacau_vote.py --lottery 香港彩
+          python sdxmacau.py --lottery 香港彩
 
       - name: 检查数据库是否有更新
         id: changes
@@ -70,7 +69,7 @@ jobs:
           git pull --rebase
           git push
 
-      - name: 备份数据库（Artifact）
+      - name: 备份数据库
         uses: actions/upload-artifact@v4
         with:
           name: macau-dbs-${{ github.run_id }}
