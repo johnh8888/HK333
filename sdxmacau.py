@@ -26,7 +26,32 @@ def get_color(num):
 def get_big_small(num): return "大" if num >= 25 else "小"
 def get_odd_even(num):  return "单" if num % 2 == 1 else "双"
 
-# ==================== 策略生成 ====================
+# ==================== 多窗口加权投票 ====================
+def multi_window_vote(specials, attribute_func):
+    windows = [3, 5, 10, 20]
+    weights = [0.35, 0.30, 0.20, 0.15]
+    votes = Counter()
+    
+    for win_size, weight in zip(windows, weights):
+        if len(specials) < win_size: continue
+        recent = specials[-win_size:]
+        for strat in ["balanced", "hot", "cold"]:
+            _, sp = generate_strategy_numbers(recent, strat)
+            attr = attribute_func(sp)
+            votes[attr] += weight * (1.8 if strat == "hot" else 1.0)
+    
+    total = sum(votes.values())
+    main = max(votes, key=votes.get)
+    prob = votes[main] / total if total > 0 else 0.333
+    
+    advantage = prob - (1/3 if attribute_func == get_color else 0.5)
+    confidence = round(min(9.5, 5.0 + advantage * 22), 1)
+    
+    if attribute_func == get_color:
+        second = sorted(votes.items(), key=lambda x: x[1], reverse=True)[1][0] if len(votes)>1 else None
+        return main, second, prob, confidence
+    return main, None, prob, confidence
+
 def generate_strategy_numbers(specials, strategy):
     recent = specials[-100:]
     appeared = set(recent)
@@ -44,37 +69,16 @@ def generate_strategy_numbers(specials, strategy):
     else:
         main6 = sorted(random.sample(recent[-70:] + ALL_NUMBERS, 6))
         sp = random.choice(recent[-40:] or ALL_NUMBERS)
-    
     return main6, sp
 
-# ==================== 投票预测 ====================
-def vote_predict(specials, attribute_func):
-    strategies = ["balanced", "hot", "cold", "momentum", "ensemble", "pattern"]
-    votes = Counter()
-    
-    for strat in strategies:
-        _, sp = generate_strategy_numbers(specials, strat)
-        attr = attribute_func(sp)
-        votes[attr] += 1.8 if strat in ["hot", "balanced"] else 1.0
-
-    total = sum(votes.values())
-    main = max(votes, key=votes.get)
-    prob = votes[main] / total
-    
-    if attribute_func == get_color:
-        second = sorted(votes.items(), key=lambda x: x[1], reverse=True)[1][0]
-        return main, second, prob
-    else:
-        return main, None, prob
-
-# ==================== 最近10期回测 ====================
-def show_recent_10_backtest(specials, attr_func, attr_name):
+# ==================== 修复后的回测（使用真实期号）================
+def show_recent_10_backtest(specials, issue_nos, attr_func, attr_name):
     print(f"\n📊 【最近10期 {attr_name} 预测对错记录】")
-    print("-" * 72)
+    print("-" * 85)
     if attr_name == "波色":
-        print(f"{'期号':<6} {'实际':<6} {'主推':<6} {'结果':<4} {'次推':<6} {'结果':<4}")
+        print(f"{'期号':<8} {'实际':<6} {'主推':<6} {'结果':<4} {'次推':<6} {'结果':<4} {'置信度':<6}")
     else:
-        print(f"{'期号':<6} {'实际':<6} {'主推':<6} {'结果':<4}")
+        print(f"{'期号':<8} {'实际':<6} {'主推':<6} {'结果':<4} {'置信度':<6}")
     
     correct_main = 0
     start = max(0, len(specials) - 10)
@@ -82,30 +86,37 @@ def show_recent_10_backtest(specials, attr_func, attr_name):
     for i in range(start, len(specials)):
         train = specials[:i]
         actual = attr_func(specials[i])
+        issue = issue_nos[i]
         
         if attr_name == "波色":
-            main, second, _ = vote_predict(train, attr_func)
+            main, second, _, conf = multi_window_vote(train, attr_func)
             main_ok = "✓" if main == actual else "✗"
             second_ok = "✓" if second == actual else "✗"
-            print(f"{i+1:<6} {actual:<6} {main:<6} {main_ok:<4} {second:<6} {second_ok:<4}")
+            print(f"{issue:<8} {actual:<6} {main:<6} {main_ok:<4} {second:<6} {second_ok:<4} {conf:<6}")
         else:
-            main, _, _ = vote_predict(train, attr_func)
+            main, _, _, conf = multi_window_vote(train, attr_func)
             main_ok = "✓" if main == actual else "✗"
-            print(f"{i+1:<6} {actual:<6} {main:<6} {main_ok:<4}")
+            print(f"{issue:<8} {actual:<6} {main:<6} {main_ok:<4} {conf:<6}")
         
         if main == actual:
             correct_main += 1
 
-    print("-" * 72)
+    print("-" * 85)
     print(f"最近10期主推准确率: {correct_main/10*100:.1f}%\n")
 
-# ==================== 主预测 ====================
 def predict_lottery(lottery_name):
     db_path = SCRIPT_DIR / LOTTERY_CONFIG[lottery_name]["db"]
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    rows = conn.execute("SELECT special_number FROM draws ORDER BY issue_no DESC").fetchall()
+    # 按期号从小到大排序（时间顺序）
+    rows = conn.execute("""
+        SELECT issue_no, special_number 
+        FROM draws 
+        ORDER BY issue_no ASC
+    """).fetchall()
+    
+    issue_nos = [r["issue_no"] for r in rows]
     specials = [r["special_number"] for r in rows if r["special_number"]]
 
     if len(specials) < 50:
@@ -113,22 +124,25 @@ def predict_lottery(lottery_name):
         conn.close()
         return
 
-    print(f"\n{'='*95}")
-    print(f"🎯 【{lottery_name} - 号码集合投票预测】")
-    print(f"{'='*95}")
+    print(f"\n{'='*105}")
+    print(f"🎯 【{lottery_name} - 多窗口加权投票预测】")
+    print(f"{'='*105}")
 
-    show_recent_10_backtest(specials, get_color, "波色")
-    show_recent_10_backtest(specials, get_big_small, "大小")
-    show_recent_10_backtest(specials, get_odd_even, "单双")
+    show_recent_10_backtest(specials, issue_nos, get_color, "波色")
+    show_recent_10_backtest(specials, issue_nos, get_big_small, "大小")
+    show_recent_10_backtest(specials, issue_nos, get_odd_even, "单双")
 
-    color_main, color_sec, c_prob = vote_predict(specials, get_color)
-    size_main, _, s_prob = vote_predict(specials, get_big_small)
-    odd_main, _, o_prob = vote_predict(specials, get_odd_even)
+    color_main, color_sec, c_prob, c_conf = multi_window_vote(specials, get_color)
+    size_main, _, s_prob, s_conf = multi_window_vote(specials, get_big_small)
+    odd_main, _, o_prob, o_conf = multi_window_vote(specials, get_odd_even)
 
-    print(f"\n🏆 【下一期最终投票预测】")
-    print(f"波色 → 主推: {color_main}波 ({c_prob:.1%})   次推: {color_sec}波")
-    print(f"大小 → 主推: {size_main}     ({s_prob:.1%})")
-    print(f"单双 → 主推: {odd_main}     ({o_prob:.1%})")
+    total_conf = round((c_conf + s_conf + o_conf) / 3, 1)
+
+    print(f"\n🏆 【下一期最终预测】")
+    print(f"波色 → 主推: {color_main}波 ({c_prob:.1%})  次推: {color_sec}波  置信度: {c_conf}/10")
+    print(f"大小 → 主推: {size_main}     ({s_prob:.1%})   置信度: {s_conf}/10")
+    print(f"单双 → 主推: {odd_main}     ({o_prob:.1%})   置信度: {o_conf}/10")
+    print(f"📊 综合置信度: {total_conf}/10")
     print(f"\n💡 综合推荐：【{color_main} + {size_main} + {odd_main}】\n")
 
     conn.close()
