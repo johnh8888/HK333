@@ -2,27 +2,15 @@
 # -*- coding: utf-8 -*-
 
 # =========================================================
-# 三彩种智能预测系统 V16 REAL API FINAL
+# 三彩种智能预测系统 V16 REAL API FINAL FIX
 #
-# 功能：
-# - 新澳门彩
-# - 老澳门彩
-# - 香港彩
-#
-# 核心：
-# - 动态状态机
-# - 熵检测
-# - 连续同波检测
-# - 高频反转检测
-# - 趋势惯性
-# - 单双联动
-# - 动态单双/大小
-# - 指数衰减权重
-#
-# 数据源：
+# 支持：
 # - 香港彩
 # - 新澳门彩
 # - 老澳门彩
+#
+# 最新稳定 API：
+# - https://api3.marksix6.net
 #
 # Python 3.11+
 # =========================================================
@@ -32,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import urllib.request
 
 # =========================================================
@@ -59,7 +46,7 @@ GREEN = {
 # 最新真实数据源
 # =========================================================
 
-API_URLS = {
+LOTTERY_URLS = {
     "香港彩": "https://api3.marksix6.net/lottery_api.php?type=hk",
     "新澳门彩": "https://api3.marksix6.net/lottery_api.php?type=newMacau",
     "老澳门彩": "https://api3.marksix6.net/lottery_api.php?type=oldMacau",
@@ -90,7 +77,7 @@ def get_odd_even(num):
     return "单" if num % 2 else "双"
 
 # =========================================================
-# HTTP请求
+# HTTP 请求
 # =========================================================
 
 def fetch_json(url):
@@ -106,19 +93,84 @@ def fetch_json(url):
 
         with urllib.request.urlopen(
             req,
-            timeout=15
+            timeout=20
         ) as resp:
 
-            data = resp.read().decode("utf-8")
+            text = resp.read().decode("utf-8")
 
-            return json.loads(data)
+            return json.loads(text)
 
     except Exception as e:
 
-        print(f"数据源失败: {url}")
+        print("请求失败:", url)
         print(e)
 
         return None
+
+# =========================================================
+# 最新 API 解析
+# =========================================================
+
+def parse_latest_api(raw, lottery_name):
+
+    history = []
+
+    if not raw:
+        return history
+
+    try:
+
+        lottery_data = raw.get("lottery_data", [])
+
+        target = None
+
+        for item in lottery_data:
+
+            if item.get("name") == lottery_name:
+                target = item
+                break
+
+        if not target:
+            return history
+
+        rows = target.get("history", [])
+
+        for row in rows:
+
+            try:
+
+                parts = row.split("期：")
+
+                if len(parts) != 2:
+                    continue
+
+                issue = parts[0].strip()
+
+                nums = [
+                    int(x.strip())
+                    for x in parts[1].split(",")
+                ]
+
+                if len(nums) < 1:
+                    continue
+
+                first_num = nums[0]
+
+                history.append({
+                    "issue": issue,
+                    "date": "",
+                    "number": first_num
+                })
+
+            except:
+                continue
+
+    except Exception as e:
+
+        print("解析失败:")
+        print(e)
+
+    return history
 
 # =========================================================
 # 获取真实历史数据
@@ -126,86 +178,19 @@ def fetch_json(url):
 
 def fetch_real_history(lottery_name):
 
-    url = API_URLS.get(
-        lottery_name,
-        API_URLS["香港彩"]
-    )
+    url = LOTTERY_URLS.get(lottery_name)
+
+    if not url:
+        raise Exception(f"未知彩种: {lottery_name}")
 
     raw = fetch_json(url)
 
-    history = []
+    history = parse_latest_api(
+        raw,
+        lottery_name
+    )
 
-    if not raw:
-        raise Exception("无法获取真实数据")
-
-    try:
-
-        rows = []
-
-        if isinstance(raw, dict):
-
-            if "data" in raw:
-                rows = raw["data"]
-
-            else:
-                rows = list(raw.values())
-
-        elif isinstance(raw, list):
-
-            rows = raw
-
-        for row in rows:
-
-            if not isinstance(row, dict):
-                continue
-
-            issue = (
-                row.get("expect")
-                or row.get("issue")
-                or row.get("period")
-                or ""
-            )
-
-            date = (
-                row.get("opentime")
-                or row.get("date")
-                or ""
-            )
-
-            code = (
-                row.get("opencode")
-                or row.get("openCode")
-                or row.get("number")
-                or ""
-            )
-
-            if not code:
-                continue
-
-            nums = re.findall(
-                r"\d+",
-                str(code)
-            )
-
-            if not nums:
-                continue
-
-            first_num = int(nums[0])
-
-            if not (1 <= first_num <= 49):
-                continue
-
-            history.append({
-                "issue": str(issue),
-                "date": str(date),
-                "number": first_num
-            })
-
-    except Exception as e:
-
-        print("数据解析失败:", e)
-
-    if len(history) < 10:
+    if len(history) < 20:
         raise Exception("无法获取真实数据")
 
     history.reverse()
@@ -673,8 +658,7 @@ def backtest(history):
         total += 1
 
         print(
-            f'{actual["issue"]} '
-            f'{actual["date"]} | '
+            f'{actual["issue"]} | '
             f'波色:{"+".join(predict)} | '
             f'开:{actual_color} | '
             f'主推:{"√" if main_hit else "×"} | '
