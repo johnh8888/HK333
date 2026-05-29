@@ -1,4 +1,4 @@
-name: 三彩种属性预测
+name: 三彩种属性预测 V17-PRO
 
 on:
   schedule:
@@ -10,7 +10,9 @@ permissions:
   contents: write
 
 jobs:
+
   predict:
+
     runs-on: ubuntu-latest
 
     timeout-minutes: 15
@@ -26,80 +28,54 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-
-      - name: 安装依赖
-        run: |
-          pip install numpy
-
-      # ===================================================
-      # 香港彩
-      # ===================================================
 
       - name: 香港彩预测
         run: |
+
           echo "=================================================="
           echo "香港彩"
           echo "=================================================="
 
           python sdxmacau.py \
             --lottery 香港彩 \
-            --recent 240 \
-            --bankroll 10000 \
             --test 10
-
-      # ===================================================
-      # 老澳门彩
-      # ===================================================
 
       - name: 老澳门彩预测
         run: |
+
           echo "=================================================="
           echo "老澳门彩"
           echo "=================================================="
 
           python sdxmacau.py \
             --lottery 老澳门彩 \
-            --recent 240 \
-            --bankroll 10000 \
             --test 10
-
-      # ===================================================
-      # 新澳门彩
-      # ===================================================
 
       - name: 新澳门彩预测
         run: |
+
           echo "=================================================="
           echo "新澳门彩"
           echo "=================================================="
 
           python sdxmacau.py \
             --lottery 新澳门彩 \
-            --recent 240 \
-            --bankroll 10000 \
             --test 10
-
-      # ===================================================
-      # 数据库检查
-      # ===================================================
 
       - name: 检查数据库变化
         id: changes
         run: |
+
           if git diff --quiet old_macau.db hk_macau.db xin_macau.db; then
             echo "changed=false" >> $GITHUB_OUTPUT
           else
             echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
-      # ===================================================
-      # 自动提交
-      # ===================================================
-
       - name: 提交数据库更新
         if: steps.changes.outputs.changed == 'true'
         run: |
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -107,13 +83,9 @@ jobs:
 
           git commit -m "📊 自动更新数据 $(TZ='Asia/Hong_Kong' date +'%Y-%m-%d %H:%M')" || exit 0
 
-          git pull --rebase
+          git pull --rebase origin main
 
           git push
-
-      # ===================================================
-      # Artifact 备份
-      # ===================================================
 
       - name: 备份数据库
         uses: actions/upload-artifact@v4
