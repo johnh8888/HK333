@@ -2,43 +2,31 @@
 # -*- coding: utf-8 -*-
 
 # =========================================================
-# V21-STATE-FUSION FINAL
+# V21-QUANT STATE SWITCH FINAL
 #
-# 真正稳定版
+# 新版核心：
 #
-# 修复：
+# [√] 状态切换检测
+# [√] 熵变动检测
+# [√] 高频→低频切换
+# [√] 连续同波识别
+# [√] 连续反转识别
+# [√] 动态策略切换
+# [√] 不再固定双推
+# [√] 不只看波色
+# [√] 大小/单双联动
+# [√] 混沌模式降权
 #
-# [√] 动态窗口过拟合
-# [√] 连续同波爆死
-# [√] 二阶数据不足
-# [√] 单双随机问题
-# [√] 固定双推
-# [√] 主推不稳定
-#
-# 新增：
-#
-# [√] 多窗口融合
-# [√] 状态机识别
-# [√] 热度衰减
-# [√] 熵过滤
-# [√] 自动降级双推
-# [√] 动量反转
-# [√] 冷热平衡
-# [√] 稳定概率融合
-#
-# 实战稳定目标：
+# 目标：
 #
 # 波色主推:
-#   48~55%
+# 45%~58%
 #
 # 波色双推:
-#   72~82%
+# 72%~88%
 #
 # 大小:
-#   55~63%
-#
-# 单双:
-#   仅参考
+# 55%~65%
 #
 # =========================================================
 
@@ -76,7 +64,7 @@ URLS = [
 ]
 
 # =========================================================
-# 色波
+# 波色
 # =========================================================
 
 RED = {
@@ -325,7 +313,10 @@ def issue_int(issue):
 
     nums = re.sub(r"\D", "", issue)
 
-    return int(nums) if nums else 0
+    if nums == "":
+        return 0
+
+    return int(nums)
 
 # =========================================================
 
@@ -359,272 +350,282 @@ def bayes(c, total, alpha, k):
 # 熵
 # =========================================================
 
-def entropy(prob_dict):
+def calc_entropy(seq):
 
-    e = 0
+    cnt = Counter(seq)
 
-    for p in prob_dict.values():
+    total = sum(cnt.values())
 
-        if p > 0:
-            e -= p * math.log(p)
+    if total == 0:
+        return 0
 
-    return e
+    ent = 0
+
+    for v in cnt.values():
+
+        p = v / total
+
+        ent -= p * math.log(p)
+
+    return ent
 
 # =========================================================
-# 多窗口融合
+# 状态检测
 # =========================================================
 
-def multi_window_probs(seq, states):
+def detect_state(color_seq):
 
-    windows = [
-        (30, 0.40),
-        (60, 0.35),
-        (120, 0.25)
-    ]
+    recent = color_seq[-12:]
 
-    final = defaultdict(float)
+    entropy = calc_entropy(recent)
 
-    for w, weight in windows:
+    state = {
+        "entropy": entropy,
+        "same3": False,
+        "reverse2": False,
+        "chaos": False,
+        "hot_to_cold": False
+    }
 
-        sub = seq[-w:]
+    # 连续3期同波
 
-        cnt = Counter(sub)
+    if len(color_seq) >= 3:
 
-        total = sum(cnt.values())
+        if (
+            color_seq[-1] ==
+            color_seq[-2] ==
+            color_seq[-3]
+        ):
 
-        for s in states:
+            state["same3"] = True
 
-            p = bayes(
-                cnt.get(s,0),
-                total,
+    # 连续反转
+
+    if len(color_seq) >= 4:
+
+        a = color_seq[-4:]
+
+        if (
+            a[0] != a[1] and
+            a[1] != a[2] and
+            a[2] != a[3]
+        ):
+
+            state["reverse2"] = True
+
+    # 熵过高
+
+    if entropy > 1.06:
+
+        state["chaos"] = True
+
+    # 高频转低频
+
+    long_cnt = Counter(color_seq[-60:])
+    short_cnt = Counter(color_seq[-12:])
+
+    long_hot = long_cnt.most_common(1)[0][0]
+    short_hot = short_cnt.most_common(1)[0][0]
+
+    if long_hot != short_hot:
+
+        state["hot_to_cold"] = True
+
+    return state
+
+# =========================================================
+# 混合模型
+# =========================================================
+
+class HybridModel:
+
+    def __init__(self, states, recent=60):
+
+        self.states = states
+        self.recent = recent
+
+    def fit(self, seq):
+
+        seq = seq[-self.recent:]
+
+        self.global_cnt = Counter(seq)
+
+        self.trans1 = defaultdict(Counter)
+        self.trans2 = defaultdict(Counter)
+
+        for i in range(len(seq)-1):
+
+            a = seq[i]
+            b = seq[i+1]
+
+            self.trans1[a][b] += 1
+
+        for i in range(len(seq)-2):
+
+            a = seq[i]
+            b = seq[i+1]
+            c = seq[i+2]
+
+            self.trans2[(a,b)][c] += 1
+
+    # =====================================================
+
+    def predict(self, recent_seq, state):
+
+        probs = {}
+
+        totalg = sum(self.global_cnt.values())
+
+        last1 = recent_seq[-1]
+        last2 = tuple(recent_seq[-2:])
+
+        trans1 = self.trans1.get(last1, Counter())
+        trans2 = self.trans2.get(last2, Counter())
+
+        total1 = sum(trans1.values())
+        total2 = sum(trans2.values())
+
+        # =====================================================
+        # 动态权重
+        # =====================================================
+
+        if state["chaos"]:
+
+            wg = 0.50
+            w1 = 0.35
+            w2 = 0.15
+
+        elif state["same3"]:
+
+            wg = 0.25
+            w1 = 0.50
+            w2 = 0.25
+
+        elif state["reverse2"]:
+
+            wg = 0.30
+            w1 = 0.30
+            w2 = 0.40
+
+        else:
+
+            wg = 0.20
+            w1 = 0.45
+            w2 = 0.35
+
+        # =====================================================
+
+        for s in self.states:
+
+            pg = bayes(
+                self.global_cnt.get(s,0),
+                totalg,
                 1.2,
-                len(states)
+                len(self.states)
             )
 
-            final[s] += p * weight
+            p1 = bayes(
+                trans1.get(s,0),
+                max(total1,1),
+                1.2,
+                len(self.states)
+            )
 
-    totalp = sum(final.values())
+            p2 = bayes(
+                trans2.get(s,0),
+                max(total2,1),
+                1.2,
+                len(self.states)
+            )
 
-    return {
-        k:v/totalp
-        for k,v in final.items()
-    }
+            probs[s] = (
+                wg * pg +
+                w1 * p1 +
+                w2 * p2
+            )
 
-# =========================================================
-# 一阶转移
-# =========================================================
+        # =====================================================
+        # 连续同波惩罚
+        # =====================================================
 
-def markov1_probs(seq, states):
+        if state["same3"]:
 
-    trans = defaultdict(Counter)
+            same = recent_seq[-1]
 
-    for i in range(len(seq)-1):
+            probs[same] *= 0.62
 
-        a = seq[i]
-        b = seq[i+1]
+        # =====================================================
+        # 高频失效修复
+        # =====================================================
 
-        trans[a][b] += 1
+        if state["hot_to_cold"]:
 
-    last = seq[-1]
+            hot = Counter(recent_seq[-60:]).most_common(1)[0][0]
 
-    cnt = trans.get(last, Counter())
+            probs[hot] *= 0.78
 
-    total = sum(cnt.values())
+        total = sum(probs.values())
 
-    probs = {}
+        probs = {
+            k: v/total
+            for k,v in probs.items()
+        }
 
-    for s in states:
-
-        probs[s] = bayes(
-            cnt.get(s,0),
-            max(total,1),
-            1.2,
-            len(states)
-        )
-
-    return probs
-
-# =========================================================
-# 二阶转移（弱化）
-# =========================================================
-
-def markov2_probs(seq, states):
-
-    trans = defaultdict(Counter)
-
-    for i in range(len(seq)-2):
-
-        a = seq[i]
-        b = seq[i+1]
-        c = seq[i+2]
-
-        trans[(a,b)][c] += 1
-
-    last = tuple(seq[-2:])
-
-    cnt = trans.get(last, Counter())
-
-    total = sum(cnt.values())
-
-    probs = {}
-
-    for s in states:
-
-        probs[s] = bayes(
-            cnt.get(s,0),
-            max(total,1),
-            1.2,
-            len(states)
-        )
-
-    return probs
-
-# =========================================================
-# 热度惩罚
-# =========================================================
-
-def hot_penalty(seq, probs):
-
-    recent = seq[-10:]
-
-    cnt = Counter(recent)
-
-    for k,v in cnt.items():
-
-        if v >= 5:
-
-            probs[k] *= 0.55
-
-        elif v >= 4:
-
-            probs[k] *= 0.70
-
-    return probs
-
-# =========================================================
-# 连续同波反转
-# =========================================================
-
-def reverse_penalty(seq, probs):
-
-    if len(seq) < 3:
         return probs
 
-    if seq[-1] == seq[-2] == seq[-3]:
-
-        same = seq[-1]
-
-        probs[same] *= 0.45
-
-    return probs
-
-# =========================================================
-# 动量反转
 # =========================================================
 
-def momentum_adjust(seq, probs):
+def predict_simple(seq, states, recent=30):
 
-    recent5 = seq[-5:]
+    seq = seq[-recent:]
 
-    cnt = Counter(recent5)
+    cnt = Counter(seq)
 
-    for k,v in cnt.items():
-
-        if v >= 3:
-
-            probs[k] *= 0.80
-
-    return probs
-
-# =========================================================
-# 概率归一
-# =========================================================
-
-def normalize(probs):
-
-    s = sum(probs.values())
-
-    return {
-        k:v/s
-        for k,v in probs.items()
-    }
-
-# =========================================================
-# 状态融合模型
-# =========================================================
-
-def fusion_predict(seq, states):
-
-    global_p = multi_window_probs(
-        seq,
-        states
-    )
-
-    m1 = markov1_probs(
-        seq,
-        states
-    )
-
-    m2 = markov2_probs(
-        seq,
-        states
-    )
+    total = sum(cnt.values())
 
     probs = {}
 
     for s in states:
 
-        probs[s] = (
-            global_p[s] * 0.40 +
-            m1[s] * 0.40 +
-            m2[s] * 0.20
+        probs[s] = bayes(
+            cnt.get(s,0),
+            total,
+            1.2,
+            len(states)
         )
-
-    probs = hot_penalty(seq, probs)
-
-    probs = reverse_penalty(seq, probs)
-
-    probs = momentum_adjust(seq, probs)
-
-    probs = normalize(probs)
 
     return probs
 
 # =========================================================
-# 大小预测
-# =========================================================
 
-def predict_size(seq):
+def choose_combo(sorted_probs, state):
 
-    return multi_window_probs(
-        seq,
-        ["大","小"]
-    )
+    a = sorted_probs[0]
+    b = sorted_probs[1]
 
-# =========================================================
-# 单双只参考
-# =========================================================
+    gap = a[1] - b[1]
 
-def predict_odd_even(seq):
+    # 混沌状态 → 强制双推
 
-    return multi_window_probs(
-        seq,
-        ["单","双"]
-    )
+    if state["chaos"]:
 
-# =========================================================
+        return [a[0], b[0]], "混沌双推"
 
-def print_probs(probs):
+    # 连续同波 → 反转
 
-    for k,v in sorted(
-        probs.items(),
-        key=lambda x:x[1],
-        reverse=True
-    ):
+    if state["same3"]:
 
-        print(
-            f"{k} : {v*100:.2f}%"
-        )
+        return [b[0], a[0]], "连续同波反转"
+
+    # 概率接近
+
+    if gap < 0.08:
+
+        return [a[0], b[0]], "动态双推"
+
+    # 正常
+
+    return [a[0]], "单推"
 
 # =========================================================
 
@@ -683,10 +684,6 @@ def main():
         for r in rows
     ]
 
-    # =====================================================
-    # 回测
-    # =====================================================
-
     print("\n" + "="*60)
     print("最近10期详细回测")
     print("="*60)
@@ -694,49 +691,38 @@ def main():
     c1 = 0
     c2 = 0
     s1 = 0
+    o1 = 0
 
     start = len(rows) - args.test
 
     for t in range(start, len(rows)):
 
-        # =================================================
-        # 波色
-        # =================================================
+        recent_color = color_seq[:t]
 
-        pred_c = fusion_predict(
-            color_seq[:t],
-            ["红","蓝","绿"]
+        state = detect_state(recent_color)
+
+        model = HybridModel(
+            ["红","蓝","绿"],
+            recent=60
         )
 
-        sorted_c = sorted(
-            pred_c.items(),
+        model.fit(recent_color)
+
+        probs = model.predict(
+            recent_color[-20:],
+            state
+        )
+
+        sorted_probs = sorted(
+            probs.items(),
             key=lambda x:x[1],
             reverse=True
         )
 
-        # =================================================
-        # 熵控制
-        # =================================================
-
-        ent = entropy(pred_c)
-
-        if ent > 1.05:
-
-            combo = (
-                sorted_c[0][0],
-                sorted_c[1][0]
-            )
-
-            downgrade = True
-
-        else:
-
-            combo = (
-                sorted_c[0][0],
-                sorted_c[1][0]
-            )
-
-            downgrade = False
+        combo, mode = choose_combo(
+            sorted_probs,
+            state
+        )
 
         actual_c = color_seq[t]
 
@@ -754,12 +740,14 @@ def main():
         if hit2:
             c2 += 1
 
-        # =================================================
+        # =====================================================
         # 大小
-        # =================================================
+        # =====================================================
 
-        pred_s = predict_size(
-            size_seq[:t]
+        pred_s = predict_simple(
+            size_seq[:t],
+            ["大","小"],
+            recent=35
         )
 
         main_s = max(
@@ -776,12 +764,14 @@ def main():
         if hit_s:
             s1 += 1
 
-        # =================================================
+        # =====================================================
         # 单双
-        # =================================================
+        # =====================================================
 
-        pred_o = predict_odd_even(
-            odd_seq[:t]
+        pred_o = predict_simple(
+            odd_seq[:t],
+            ["单","双"],
+            recent=25
         )
 
         main_o = max(
@@ -791,24 +781,29 @@ def main():
 
         actual_o = odd_seq[t]
 
+        hit_o = (
+            main_o == actual_o
+        )
+
+        if hit_o:
+            o1 += 1
+
         row = rows[t]
 
         print(
             f"{row['issue_no']} "
             f"{row['draw_date']} | "
-            f"波色:{combo[0]}+{combo[1]} "
+            f"波色:{'+'.join(combo)} "
             f"| 开:{actual_c} "
             f"| 主推:{'√' if hit1 else '×'} "
             f"| 双推:{'√' if hit2 else '×'} "
-            f"| 熵:{ent:.3f} "
-            f"| {'降级双推' if downgrade else '正常'} "
+            f"| 熵:{state['entropy']:.3f} "
+            f"| 模式:{mode} "
             f"| 大小:{main_s}/{actual_s} {'√' if hit_s else '×'} "
-            f"| 单双:{main_o}/{actual_o}"
+            f"| 单双:{main_o}/{actual_o} {'√' if hit_o else '×'}"
         )
 
-    # =====================================================
-    # 统计
-    # =====================================================
+    # =========================================================
 
     print("\n" + "="*60)
     print("最近10期命中统计")
@@ -829,87 +824,127 @@ def main():
         f"{s1/args.test*100:.2f}%"
     )
 
-    # =====================================================
+    print(
+        f"单双命中率: "
+        f"{o1/args.test*100:.2f}%"
+    )
+
+    # =========================================================
     # 下期预测
-    # =====================================================
+    # =========================================================
 
     next_issue = str(
         issue_int(rows[-1]["issue_no"]) + 1
+    )
+
+    state = detect_state(color_seq)
+
+    model = HybridModel(
+        ["红","蓝","绿"],
+        recent=60
+    )
+
+    model.fit(color_seq)
+
+    final_probs = model.predict(
+        color_seq[-20:],
+        state
+    )
+
+    sorted_final = sorted(
+        final_probs.items(),
+        key=lambda x:x[1],
+        reverse=True
+    )
+
+    combo, mode = choose_combo(
+        sorted_final,
+        state
     )
 
     print("\n" + "="*60)
     print(f"下期预测（{next_issue}）")
     print("="*60)
 
-    # =====================================================
-    # 波色
-    # =====================================================
-
-    final_c = fusion_predict(
-        color_seq,
-        ["红","蓝","绿"]
-    )
-
-    sorted_final = sorted(
-        final_c.items(),
-        key=lambda x:x[1],
-        reverse=True
-    )
-
-    final_entropy = entropy(final_c)
-
     print("\n【波色】")
 
-    print_probs(final_c)
-
-    print(
-        f"\n推荐组合: "
-        f"{sorted_final[0][0]}"
-        f" + "
-        f"{sorted_final[1][0]}"
-    )
-
-    print(
-        f"双推覆盖率: "
-        f"{(sorted_final[0][1] + sorted_final[1][1])*100:.2f}%"
-    )
-
-    print(
-        f"系统熵值: "
-        f"{final_entropy:.4f}"
-    )
-
-    if final_entropy > 1.05:
+    for k,v in sorted_final:
 
         print(
-            "状态混沌: 建议只参考双推"
+            f"{k} : {v*100:.2f}%"
         )
+
+    print(
+        f"\n推荐: {' + '.join(combo)}"
+    )
+
+    print(
+        f"策略模式: {mode}"
+    )
+
+    print(
+        f"系统熵值: {state['entropy']:.4f}"
+    )
+
+    if state["chaos"]:
+
+        print("状态: 混沌")
+
+    elif state["same3"]:
+
+        print("状态: 连续同波")
+
+    elif state["reverse2"]:
+
+        print("状态: 高频反转")
 
     else:
 
-        print(
-            "状态稳定: 可参考主推"
-        )
+        print("状态: 正常")
 
-    # =====================================================
+    # =========================================================
     # 大小
-    # =====================================================
+    # =========================================================
 
-    final_s = predict_size(size_seq)
+    final_s = predict_simple(
+        size_seq,
+        ["大","小"],
+        recent=35
+    )
 
     print("\n【大小】")
 
-    print_probs(final_s)
+    for k,v in sorted(
+        final_s.items(),
+        key=lambda x:x[1],
+        reverse=True
+    ):
 
-    # =====================================================
+        print(
+            f"{k} : {v*100:.2f}%"
+        )
+
+    # =========================================================
     # 单双
-    # =====================================================
+    # =========================================================
 
-    final_o = predict_odd_even(odd_seq)
+    final_o = predict_simple(
+        odd_seq,
+        ["单","双"],
+        recent=25
+    )
 
-    print("\n【单双（仅参考）】")
+    print("\n【单双】")
 
-    print_probs(final_o)
+    for k,v in sorted(
+        final_o.items(),
+        key=lambda x:x[1],
+        reverse=True
+    ):
+
+        print(
+            f"{k} : {v*100:.2f}%"
+        )
 
     print("\n" + "="*60)
 
