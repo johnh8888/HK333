@@ -2,24 +2,40 @@
 # -*- coding: utf-8 -*-
 
 # =========================================================
-# V18-QUANT AI ENHANCED STABLE
+# V18-QUANT STABLE FINAL
 #
-# 终极增强稳定版
+# 核心稳定增强版
 #
-# 功能：
+# 修复：
 #
-# [1] 在线同步最新数据
-# [2] SQLite 自动保存
-# [3] 波色预测
-# [4] 大小预测
-# [5] 单双预测
-# [6] 最近10期详细回测
-# [7] 动态窗口优化
-# [8] 热冷号修正
-# [9] 连续错杀反转
-# [10] 趋势增强
-# [11] 自适应权重
-# [12] WalkForward真实回测
+# [√] 动态窗口过拟合
+# [√] 二阶状态稀疏
+# [√] 单双0%问题
+# [√] 最近10期详细回测
+# [√] 下期真实期号
+# [√] 在线同步最新数据
+# [√] 日期修复
+#
+# 核心策略：
+#
+# 波色：
+#   40% 一阶Markov
+#   30% 全局频率
+#   30% 均值回归
+#
+# 大小：
+#   70% 近期频率
+#   30% 一阶Markov
+#
+# 单双：
+#   100% 近期频率
+#
+# 不再使用：
+#
+# [X] 二阶大小单双
+# [X] entropy
+# [X] temperature
+# [X] 复杂AI幻觉优化
 #
 # =========================================================
 
@@ -27,36 +43,38 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import re
 import sqlite3
 
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 from urllib.request import Request, urlopen
 
 # =========================================================
-# 随机种子
+# 固定随机种子
 # =========================================================
 
 SEED = 42
 random.seed(SEED)
 
 # =========================================================
-# 基础
+# 路径
 # =========================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 DB_FILES = {
-    "老澳门彩": "old_macau.db",
     "香港彩": "hk_macau.db",
+    "老澳门彩": "old_macau.db",
     "新澳门彩": "xin_macau.db"
 }
+
+# =========================================================
+# API
+# =========================================================
 
 THIRD_PARTY_URLS = [
     "https://marksix6.net/index.php?api=1",
@@ -126,6 +144,7 @@ def connect_db(db_path):
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+
     return conn
 
 # =========================================================
@@ -163,12 +182,12 @@ def fetch_json_url(url):
 
         with urlopen(req, timeout=20) as resp:
 
-            return json.loads(
-                resp.read().decode(
-                    "utf-8",
-                    errors="ignore"
-                )
+            text = resp.read().decode(
+                "utf-8",
+                errors="ignore"
             )
+
+            return json.loads(text)
 
     except:
         return None
@@ -206,7 +225,23 @@ def fetch_online_records(lottery_name):
 
         history = target.get("history", [])
 
-        for item in history:
+        latest_time_str = target.get(
+            "openTime",
+            ""
+        )
+
+        try:
+
+            latest_time = datetime.strptime(
+                latest_time_str,
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+        except:
+
+            latest_time = datetime.now()
+
+        for idx, item in enumerate(history):
 
             try:
 
@@ -225,10 +260,9 @@ def fetch_online_records(lottery_name):
                 if len(nums) != 7:
                     continue
 
-                draw_date = target.get(
-                    "openTime",
-                    ""
-                ).split(" ")[0]
+                draw_date = (
+                    latest_time - timedelta(days=idx)
+                ).strftime("%Y-%m-%d")
 
                 records.append(
                     DrawRecord(
@@ -251,7 +285,7 @@ def fetch_online_records(lottery_name):
 # 同步数据库
 # =========================================================
 
-def sync_from_records(conn, records, source):
+def sync_records(conn, records, source):
 
     now = datetime.now(
         timezone.utc
@@ -315,14 +349,14 @@ def issue_to_int(issue_no):
 
     nums = re.sub(r"\D", "", issue_no)
 
-    if not nums:
+    if nums == "":
         return 0
 
     return int(nums)
 
 # =========================================================
 
-def load_rows(conn):
+def load_draws(conn):
 
     rows = conn.execute("""
         SELECT *
@@ -339,129 +373,225 @@ def load_rows(conn):
     return rows
 
 # =========================================================
-# 动态窗口选择
+# 贝叶斯平滑
 # =========================================================
 
-def select_best_window(seq, states):
+def smooth_prob(counter, states, alpha=1.2):
 
-    candidates = [
-        60,
-        90,
-        120,
-        180,
-        240
-    ]
-
-    best_window = 120
-    best_score = -1
-
-    for w in candidates:
-
-        if len(seq) < w + 20:
-            continue
-
-        hit = 0
-        total = 0
-
-        for t in range(
-            len(seq)-20,
-            len(seq)
-        ):
-
-            train = seq[max(0, t-w):t]
-
-            if len(train) < 5:
-                continue
-
-            counter = Counter(train)
-
-            pred = max(
-                counter,
-                key=counter.get
-            )
-
-            if pred == seq[t]:
-                hit += 1
-
-            total += 1
-
-        if total == 0:
-            continue
-
-        score = hit / total
-
-        if score > best_score:
-
-            best_score = score
-            best_window = w
-
-    return best_window
-
-# =========================================================
-# 增强预测
-# =========================================================
-
-def enhanced_predict(seq, states, window):
-
-    recent = seq[-window:]
-
-    scores = Counter()
-
-    # =====================================================
-    # 基础频率
-    # =====================================================
-
-    for s in recent:
-        scores[s] += 1.0
-
-    # =====================================================
-    # 趋势增强
-    # =====================================================
-
-    last10 = recent[-10:]
-
-    for s in last10:
-        scores[s] += 1.5
-
-    # =====================================================
-    # 连续反转
-    # =====================================================
-
-    if len(recent) >= 3:
-
-        if recent[-1] == recent[-2]:
-
-            for s in states:
-
-                if s != recent[-1]:
-                    scores[s] += 2.0
-
-    # =====================================================
-    # 热冷修正
-    # =====================================================
-
-    freq = Counter(recent)
-
-    for s in states:
-
-        if freq[s] <= 2:
-            scores[s] += 1.8
-
-    # =====================================================
-    # 归一化
-    # =====================================================
-
-    total = sum(scores.values())
+    total = sum(counter.values())
 
     probs = {}
 
     for s in states:
 
         probs[s] = (
-            scores[s] / total
+            counter.get(s,0) + alpha
+        ) / (
+            total + alpha * len(states)
         )
 
     return probs
+
+# =========================================================
+# 一阶Markov
+# =========================================================
+
+class FirstOrderMarkov:
+
+    def __init__(
+        self,
+        states,
+        recent_periods=120,
+        decay=0.996
+    ):
+
+        self.states = states
+        self.recent_periods = recent_periods
+        self.decay = decay
+
+        self.transitions = defaultdict(Counter)
+
+    # =====================================================
+
+    def train(self, seq):
+
+        seq = seq[-self.recent_periods:]
+
+        for age, i in enumerate(
+            reversed(range(len(seq)-1))
+        ):
+
+            a = seq[i]
+            b = seq[i+1]
+
+            w = self.decay ** age
+
+            self.transitions[a][b] += w
+
+    # =====================================================
+
+    def predict(self, recent):
+
+        if not recent:
+
+            return {
+                s: 1/len(self.states)
+                for s in self.states
+            }
+
+        last = recent[-1]
+
+        trans = self.transitions.get(
+            last,
+            Counter()
+        )
+
+        return smooth_prob(
+            trans,
+            self.states
+        )
+
+# =========================================================
+# 波色预测
+# =========================================================
+
+def predict_color(seq):
+
+    states = ["红","蓝","绿"]
+
+    # 一阶Markov
+
+    eng = FirstOrderMarkov(
+        states,
+        recent_periods=120
+    )
+
+    eng.train(seq)
+
+    markov = eng.predict(seq[-30:])
+
+    # 全局频率
+
+    global_counter = Counter(
+        seq[-120:]
+    )
+
+    global_probs = smooth_prob(
+        global_counter,
+        states
+    )
+
+    # 均值回归
+
+    recent20 = Counter(
+        seq[-20:]
+    )
+
+    revert = {}
+
+    for s in states:
+
+        base = 1 / 3
+
+        freq = recent20.get(s,0) / 20
+
+        # 出现越多 -> 惩罚越大
+
+        revert[s] = max(
+            0.05,
+            base - (freq - base) * 0.6
+        )
+
+    total_r = sum(revert.values())
+
+    revert = {
+        k: v / total_r
+        for k,v in revert.items()
+    }
+
+    # 融合
+
+    final_probs = {}
+
+    for s in states:
+
+        final_probs[s] = (
+            markov[s] * 0.40 +
+            global_probs[s] * 0.30 +
+            revert[s] * 0.30
+        )
+
+    total = sum(final_probs.values())
+
+    return {
+        k: v / total
+        for k,v in final_probs.items()
+    }
+
+# =========================================================
+# 大小预测
+# =========================================================
+
+def predict_size(seq):
+
+    states = ["大","小"]
+
+    # 近期频率
+
+    recent_counter = Counter(
+        seq[-60:]
+    )
+
+    recent_probs = smooth_prob(
+        recent_counter,
+        states
+    )
+
+    # 一阶
+
+    eng = FirstOrderMarkov(
+        states,
+        recent_periods=90
+    )
+
+    eng.train(seq)
+
+    markov = eng.predict(seq[-20:])
+
+    # 融合
+
+    final_probs = {}
+
+    for s in states:
+
+        final_probs[s] = (
+            recent_probs[s] * 0.70 +
+            markov[s] * 0.30
+        )
+
+    total = sum(final_probs.values())
+
+    return {
+        k: v / total
+        for k,v in final_probs.items()
+    }
+
+# =========================================================
+# 单双预测
+# =========================================================
+
+def predict_odd(seq):
+
+    states = ["单","双"]
+
+    recent_counter = Counter(
+        seq[-80:]
+    )
+
+    return smooth_prob(
+        recent_counter,
+        states
+    )
 
 # =========================================================
 # MAIN
@@ -473,7 +603,7 @@ def main():
 
     parser.add_argument(
         "--lottery",
-        choices=["老澳门彩","香港彩","新澳门彩"],
+        choices=["香港彩","老澳门彩","新澳门彩"],
         default="香港彩"
     )
 
@@ -498,60 +628,53 @@ def main():
     try:
 
         # =================================================
-        # 同步数据
+        # 在线同步
         # =================================================
 
         records, source = fetch_online_records(
             args.lottery
         )
 
-        ins, upd = sync_from_records(
+        ins, upd = sync_records(
             conn,
             records,
             source
         )
 
-        print(f"\n同步完成 新增:{ins} 更新:{upd}")
+        print(
+            f"\n同步完成 新增:{ins} 更新:{upd}"
+        )
 
-        rows = load_rows(conn)
+        # =================================================
+        # 加载
+        # =================================================
 
-        color_seq = [
+        rows = load_draws(conn)
+
+        issues = [
+            r["issue_no"]
+            for r in rows
+        ]
+
+        dates = [
+            r["draw_date"]
+            for r in rows
+        ]
+
+        colors = [
             get_color(r["special_number"])
             for r in rows
         ]
 
-        size_seq = [
+        sizes = [
             get_big_small(r["special_number"])
             for r in rows
         ]
 
-        odd_seq = [
+        odds = [
             get_odd_even(r["special_number"])
             for r in rows
         ]
-
-        # =================================================
-        # 动态窗口
-        # =================================================
-
-        best_color_window = select_best_window(
-            color_seq,
-            ["红","蓝","绿"]
-        )
-
-        best_size_window = select_best_window(
-            size_seq,
-            ["大","小"]
-        )
-
-        best_odd_window = select_best_window(
-            odd_seq,
-            ["单","双"]
-        )
-
-        print(f"\n波色最佳窗口: {best_color_window}")
-        print(f"大小最佳窗口: {best_size_window}")
-        print(f"单双最佳窗口: {best_odd_window}")
 
         # =================================================
         # 最近10期回测
@@ -561,7 +684,7 @@ def main():
         print("最近10期详细回测")
         print("="*60)
 
-        start = len(rows) - args.test
+        start = len(colors) - args.test
 
         color_single_hit = 0
         color_double_hit = 0
@@ -569,108 +692,96 @@ def main():
         size_hit = 0
         odd_hit = 0
 
-        for t in range(start, len(rows)):
+        for t in range(start, len(colors)):
 
-            # =============================================
             # 波色
-            # =============================================
 
-            color_probs = enhanced_predict(
-                color_seq[:t],
-                ["红","蓝","绿"],
-                best_color_window
+            pred_c = predict_color(
+                colors[:t]
             )
 
-            color_sorted = sorted(
-                color_probs.items(),
+            sorted_c = sorted(
+                pred_c.items(),
                 key=lambda x: x[1],
                 reverse=True
             )
 
-            main_color = color_sorted[0][0]
-            second_color = color_sorted[1][0]
+            main_c = sorted_c[0][0]
+            second_c = sorted_c[1][0]
 
-            actual_color = color_seq[t]
+            actual_c = colors[t]
 
-            single_ok = (
-                main_color == actual_color
+            hit_single = (
+                main_c == actual_c
             )
 
-            double_ok = (
-                actual_color in [
-                    main_color,
-                    second_color
+            hit_double = (
+                actual_c in [
+                    main_c,
+                    second_c
                 ]
             )
 
-            if single_ok:
+            if hit_single:
                 color_single_hit += 1
 
-            if double_ok:
+            if hit_double:
                 color_double_hit += 1
 
-            # =============================================
             # 大小
-            # =============================================
 
-            size_probs = enhanced_predict(
-                size_seq[:t],
-                ["大","小"],
-                best_size_window
+            pred_s = predict_size(
+                sizes[:t]
             )
 
-            pred_size = max(
-                size_probs,
-                key=size_probs.get
+            main_s = max(
+                pred_s,
+                key=pred_s.get
             )
 
-            actual_size = size_seq[t]
+            actual_s = sizes[t]
 
-            size_ok = (
-                pred_size == actual_size
+            hit_s = (
+                main_s == actual_s
             )
 
-            if size_ok:
+            if hit_s:
                 size_hit += 1
 
-            # =============================================
             # 单双
-            # =============================================
 
-            odd_probs = enhanced_predict(
-                odd_seq[:t],
-                ["单","双"],
-                best_odd_window
+            pred_o = predict_odd(
+                odds[:t]
             )
 
-            pred_odd = max(
-                odd_probs,
-                key=odd_probs.get
+            main_o = max(
+                pred_o,
+                key=pred_o.get
             )
 
-            actual_odd = odd_seq[t]
+            actual_o = odds[t]
 
-            odd_ok = (
-                pred_odd == actual_odd
+            hit_o = (
+                main_o == actual_o
             )
 
-            if odd_ok:
+            if hit_o:
                 odd_hit += 1
 
-            row = rows[t]
-
             print(
-                f"{row['issue_no']} "
-                f"| 波色:{main_color}+{second_color} "
-                f"| 开:{actual_color} "
-                f"| 主推:{'√' if single_ok else '×'} "
-                f"| 双推:{'√' if double_ok else '×'} "
-                f"| 大小:{pred_size}/{actual_size} {'√' if size_ok else '×'} "
-                f"| 单双:{pred_odd}/{actual_odd} {'√' if odd_ok else '×'}"
+                f"{issues[t]} {dates[t]} | "
+                f"波色:{main_c}+{second_c} "
+                f"| 开:{actual_c} "
+                f"| 主推:{'√' if hit_single else '×'} "
+                f"| 双推:{'√' if hit_double else '×'} "
+                f"| 大小:{main_s}/{actual_s} "
+                f"{'√' if hit_s else '×'} "
+                f"| 单双:{main_o}/{actual_o} "
+                f"{'√' if hit_o else '×'}"
             )
 
         # =================================================
-        # 回测统计
+        # 命中率
         # =================================================
 
         print("\n" + "="*60)
@@ -701,35 +812,27 @@ def main():
         # 下期预测
         # =================================================
 
-        next_issue = (
-            issue_to_int(
-                rows[-1]["issue_no"]
-            ) + 1
+        next_issue = str(
+            issue_to_int(issues[-1]) + 1
         )
 
         print("\n" + "="*60)
         print(f"下期预测（{next_issue}）")
         print("="*60)
 
-        # =============================================
         # 波色
-        # =============================================
 
-        future_color = enhanced_predict(
-            color_seq,
-            ["红","蓝","绿"],
-            best_color_window
-        )
+        future_c = predict_color(colors)
 
-        color_sorted = sorted(
-            future_color.items(),
+        sorted_fc = sorted(
+            future_c.items(),
             key=lambda x: x[1],
             reverse=True
         )
 
         print("\n【波色】")
 
-        for k, v in color_sorted:
+        for k,v in sorted_fc:
 
             print(
                 f"{k} : {v*100:.2f}%"
@@ -737,28 +840,23 @@ def main():
 
         print(
             f"\n推荐组合: "
-            f"{color_sorted[0][0]} + {color_sorted[1][0]}"
+            f"{sorted_fc[0][0]} + "
+            f"{sorted_fc[1][0]}"
         )
 
         print(
             f"双推覆盖率: "
-            f"{(color_sorted[0][1]+color_sorted[1][1])*100:.2f}%"
+            f"{(sorted_fc[0][1] + sorted_fc[1][1])*100:.2f}%"
         )
 
-        # =============================================
         # 大小
-        # =============================================
 
-        future_size = enhanced_predict(
-            size_seq,
-            ["大","小"],
-            best_size_window
-        )
+        future_s = predict_size(sizes)
 
         print("\n【大小】")
 
-        for k, v in sorted(
-            future_size.items(),
+        for k,v in sorted(
+            future_s.items(),
             key=lambda x: x[1],
             reverse=True
         ):
@@ -767,20 +865,14 @@ def main():
                 f"{k} : {v*100:.2f}%"
             )
 
-        # =============================================
         # 单双
-        # =============================================
 
-        future_odd = enhanced_predict(
-            odd_seq,
-            ["单","双"],
-            best_odd_window
-        )
+        future_o = predict_odd(odds)
 
         print("\n【单双】")
 
-        for k, v in sorted(
-            future_odd.items(),
+        for k,v in sorted(
+            future_o.items(),
             key=lambda x: x[1],
             reverse=True
         ):
