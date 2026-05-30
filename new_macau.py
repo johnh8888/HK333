@@ -24,11 +24,29 @@ STRATEGY_LABELS = {
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
 # ---------- 波色 / 属性工具 ----------
-def get_color(num: int) -> str:
-    if 1 <= num <= 16: return "红"
-    elif 17 <= num <= 32: return "蓝"
-    else: return "绿"
+RED_WAVE = {
+    1,2,7,8,12,13,18,19,23,24,
+    29,30,34,35,40,45,46
+}
 
+BLUE_WAVE = {
+    3,4,9,10,14,15,20,25,26,
+    31,36,37,41,42,47,48
+}
+
+GREEN_WAVE = {
+    5,6,11,16,17,21,22,27,28,
+    32,33,38,39,43,44,49
+}
+def get_color(num: int) -> str:
+    if num in RED_WAVE:
+        return "红"
+    elif num in BLUE_WAVE:
+        return "蓝"
+    elif num in GREEN_WAVE:
+        return "绿"
+    return "未知"
+    
 def special_attributes(num: int) -> Dict[str, str]:
     odd_even = "单" if num % 2 == 1 else "双"
     big_small = "大" if num >= 25 else "小"
@@ -58,7 +76,7 @@ def predict_color_simple(specials: List[int], window: int = 3) -> Tuple[str, str
     second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
     return main_color, second_color, main_freq, second_freq
 
-def predict_color_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
+def predicjit_color_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
     if not specials: return "蓝", "绿", 0.0, 0.0
     recent = specials[-window:]
     scores = defaultdict(float)
