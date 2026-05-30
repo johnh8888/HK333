@@ -1,19 +1,13 @@
-name: Macau Analysis
+name: Macau Lottery Prediction
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"   # 每6小时运行一次
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  analyze:
+  predict:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -22,21 +16,62 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          pip install pandas numpy openpyxl matplotlib
+          python -m pip install --upgrade pip
+          pip install pandas numpy
 
-      - name: Run Analyzer
+      - name: Run Prediction
         run: |
-          python analyzer.py
+          python << 'PY'
+          import sqlite3
+          import json
+          import pandas as pd
+          import numpy as np
 
-      - name: Commit Reports
-        run: |
-          git config --global user.name github-actions
-          git config --global user.email github-actions@github.com
+          DB = "new_macau.db"
+          N_WINDOW = 20  # 滑动窗口大小
 
-          git add reports/
+          conn = sqlite3.connect(DB)
 
-          git diff --cached --quiet || git commit -m "auto analysis update"
+          # 读取历史开奖
+          df = pd.read_sql("SELECT * FROM draws ORDER BY issue_no ASC", conn)
+          df['numbers'] = df['numbers_json'].apply(json.loads)
 
-          git push
+          # 简单统计：出现次数
+          from collections import Counter, defaultdict
+
+          counter = Counter()
+          pair_counter = Counter()
+          triple_counter = Counter()
+
+          for nums in df['numbers'][-N_WINDOW:]:
+              counter.update(nums)
+              # 连号分析
+              nums_sorted = sorted(nums)
+              for i in range(len(nums_sorted)-1):
+                  if nums_sorted[i+1] - nums_sorted[i] == 1:
+                      pair_counter[(nums_sorted[i], nums_sorted[i+1])] += 1
+              for i in range(len(nums_sorted)-2):
+                  if nums_sorted[i+2] - nums_sorted[i] == 2 and nums_sorted[i+1] - nums_sorted[i] == 1:
+                      triple_counter[(nums_sorted[i], nums_sorted[i+1], nums_sorted[i+2])] += 1
+
+          # 输出 top 预测
+          top_numbers = [num for num, _ in counter.most_common(6)]
+          top_pairs = pair_counter.most_common(5)
+          top_triples = triple_counter.most_common(5)
+
+          print("=== Top Numbers ===")
+          print(top_numbers)
+          print("=== Top Pairs ===")
+          print(top_pairs)
+          print("=== Top Triples ===")
+          print(top_triples)
+
+          # 保存预测结果到 prediction_pools
+          pool_numbers_json = json.dumps(top_numbers)
+          conn.execute("INSERT INTO prediction_pools (run_id, pool_size, numbers_json, created_at) VALUES (NULL, ?, ?, datetime('now'))",
+                       (len(top_numbers), pool_numbers_json))
+          conn.commit()
+          conn.close()
+          PY
