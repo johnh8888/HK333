@@ -1,0 +1,78 @@
+name: Database Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect-db:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Inspect SQLite Database
+        run: |
+          python << 'PY'
+          import sqlite3
+          import json
+          import os
+
+          DB = "new_macau.db"
+
+          print("=" * 60)
+          print("DATABASE EXISTS:", os.path.exists(DB))
+          print("=" * 60)
+
+          conn = sqlite3.connect(DB)
+
+          tables = conn.execute("""
+              SELECT name
+              FROM sqlite_master
+              WHERE type='table'
+              ORDER BY name
+          """).fetchall()
+
+          print("\nTABLES:")
+          for t in tables:
+              print(" -", t[0])
+
+          print("\n" + "=" * 60)
+
+          for (table,) in tables:
+
+              print(f"\nTABLE: {table}")
+
+              cols = conn.execute(
+                  f"PRAGMA table_info({table})"
+              ).fetchall()
+
+              print("COLUMNS:")
+
+              for c in cols:
+                  print(
+                      f"  {c[0]} | {c[1]} | {c[2]}"
+                  )
+
+              try:
+                  rows = conn.execute(
+                      f"SELECT * FROM {table} LIMIT 3"
+                  ).fetchall()
+
+                  print("\nSAMPLE ROWS:")
+
+                  for r in rows:
+                      print(r)
+
+              except Exception as e:
+                  print("ERROR:", e)
+
+              print("-" * 60)
+
+          conn.close()
+          PY
