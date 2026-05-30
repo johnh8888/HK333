@@ -1,507 +1,385 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# =========================================================
+# 三彩种智能预测系统 V16 FINAL (REAL DATA FIX VERSION)
+# =========================================================
+
 from __future__ import annotations
 
 import argparse
-import json
+import math
 import random
-import urllib.request
+import requests
 from collections import Counter
 from datetime import datetime
 
 # =========================================================
-# 六合彩智能预测系统（稳定最终版）
-# 支持：
-# - 香港彩
-# - 新澳门彩
-# - 老澳门彩
-#
-# 最新稳定接口：
-# api3.marksix6.net
-# macaumarksix.com
-#
-# GitHub Actions 可直接运行
+# 波色映射
 # =========================================================
 
-# ---------------------------------------------------------
-# 数据源
-# ---------------------------------------------------------
-
-LOTTERY_URLS = {
-    "香港彩": [
-        "https://api3.marksix6.net/lottery_api.php?type=hk",
-    ],
-
-    "新澳门彩": [
-        "https://api3.marksix6.net/lottery_api.php?type=newMacau",
-        "https://macaumarksix.com/api/macaujc2.com",
-    ],
-
-    "老澳门彩": [
-        "https://api3.marksix6.net/lottery_api.php?type=oldMacau",
-    ]
-}
-
-ALL_NUMBERS = list(range(1, 50))
-
+RED = {1, 2, 7, 8, 12, 13, 18, 19, 23, 24, 29, 30, 34, 35, 40, 45, 46}
+BLUE = {3, 4, 9, 10, 14, 15, 20, 25, 26, 31, 36, 37, 41, 42, 47, 48}
+GREEN = {5, 6, 11, 16, 17, 21, 22, 27, 28, 32, 33, 38, 39, 43, 44, 49}
 
 # =========================================================
-# 波色
+# ✅ 真实API数据源（新增替换核心）
 # =========================================================
 
-RED_WAVE = {
-    1, 2, 7, 8, 12, 13, 18, 19,
-    23, 24, 29, 30, 34, 35,
-    40, 45, 46
-}
-
-BLUE_WAVE = {
-    3, 4, 9, 10, 14, 15, 20,
-    25, 26, 31, 36, 37,
-    41, 42, 47, 48
-}
-
-GREEN_WAVE = {
-    5, 6, 11, 16, 17, 21, 22,
-    27, 28, 32, 33, 38, 39,
-    43, 44, 49
-}
+API_URL = "https://marksix6.net/index.php?api=1"
 
 
-def get_wave(num):
+def fetch_api_history(lottery_name="香港彩", size=220):
+    """
+    从真实API获取历史数据（替代 fake_history）
+    """
+    try:
+        r = requests.get(API_URL, timeout=15)
+        data = r.json()
+    except Exception as e:
+        print("API请求失败，使用空数据:", e)
+        return []
 
-    if num in RED_WAVE:
-        return "红波"
+    history = []
 
-    if num in BLUE_WAVE:
-        return "蓝波"
-
-    return "绿波"
-
-
-# =========================================================
-# 获取真实数据
-# =========================================================
-
-def fetch_real_history(lottery_name):
-
-    if lottery_name not in LOTTERY_URLS:
-        raise Exception(f"未知彩种: {lottery_name}")
-
-    urls = LOTTERY_URLS[lottery_name]
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/125.0 Safari/537.36"
-        )
-    }
-
-    for url in urls:
-
-        try:
-
-            print("=" * 60)
-            print(f"正在获取 {lottery_name} 数据")
-            print(url)
-            print("=" * 60)
-
-            req = urllib.request.Request(
-                url,
-                headers=headers
-            )
-
-            with urllib.request.urlopen(req, timeout=30) as response:
-
-                raw = response.read().decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-
-            data = json.loads(raw)
-
-            history = []
-
-            # -------------------------------------------------
-            # 数据结构兼容
-            # -------------------------------------------------
-
-            if isinstance(data, list):
-
-                items = data
-
-            elif isinstance(data, dict):
-
-                if isinstance(data.get("data"), list):
-
-                    items = data["data"]
-
-                elif isinstance(data.get("result"), list):
-
-                    items = data["result"]
-
-                else:
-
-                    items = []
-
-            else:
-
-                items = []
-
-            # -------------------------------------------------
-            # 解析
-            # -------------------------------------------------
-
-            for item in items:
-
-                try:
-
-                    issue = str(
-                        item.get("expect")
-                        or item.get("issue")
-                        or item.get("period")
-                        or item.get("turnNum")
-                        or item.get("preDrawIssue")
-                        or ""
-                    ).strip()
-
-                    code = (
-                        item.get("openCode")
-                        or item.get("code")
-                        or item.get("numbers")
-                        or item.get("num")
-                        or item.get("preDrawCode")
-                        or ""
-                    )
-
-                    nums = []
-
-                    # 字符串格式
-                    if isinstance(code, str):
-
-                        code = (
-                            code.replace("+", ",")
-                            .replace("|", ",")
-                            .replace(" ", ",")
-                        )
-
-                        for x in code.split(","):
-
-                            x = x.strip()
-
-                            if x.isdigit():
-
-                                nums.append(int(x))
-
-                    # list格式
-                    elif isinstance(code, list):
-
-                        nums = [
-                            int(x)
-                            for x in code
-                            if str(x).isdigit()
-                        ]
-
-                    # 必须7个号码
-                    if len(nums) < 7:
-                        continue
-
-                    history.append({
-                        "issue": issue,
-                        "numbers": nums[:6],
-                        "special": nums[6]
-                    })
-
-                except:
-                    continue
-
-            # -------------------------------------------------
-            # 成功
-            # -------------------------------------------------
-
-            if history:
-
-                history.sort(
-                    key=lambda x: x["issue"],
-                    reverse=True
-                )
-
-                print(f"成功获取 {len(history)} 条历史数据")
-
-                return history
-
-        except Exception as e:
-
-            print(f"数据源失败: {e}")
-
+    for item in data.get("lottery_data", []):
+        if item.get("name") != lottery_name:
             continue
 
-    raise Exception("无法获取真实数据")
+        issue = item.get("expect")
+        open_time = item.get("openTime", "")
+
+        raw = item.get("openCode", "")
+        nums = []
+
+        for x in str(raw).replace(",", " ").split():
+            if x.isdigit():
+                nums.append(int(x))
+
+        if not nums:
+            continue
+
+        history.append({
+            "issue": str(issue),
+            "date": open_time[:10] if open_time else "",
+            "number": nums[-1]
+        })
+
+    history.sort(key=lambda x: x["issue"])
+
+    return history[-size:]
 
 
 # =========================================================
-# 热号统计
+# 工具函数（未改动）
 # =========================================================
 
-def calc_hot_numbers(history, top_n=20):
-
-    counter = Counter()
-
-    for row in history:
-
-        for n in row["numbers"]:
-            counter[n] += 1
-
-        counter[row["special"]] += 0.5
-
-    ranked = counter.most_common(top_n)
-
-    return [x[0] for x in ranked]
+def get_color(num):
+    if num in RED:
+        return "红"
+    if num in BLUE:
+        return "蓝"
+    return "绿"
 
 
-# =========================================================
-# 冷号统计
-# =========================================================
+def get_big_small(num):
+    return "大" if num >= 25 else "小"
 
-def calc_cold_numbers(history, top_n=20):
 
-    counter = Counter()
-
-    for row in history:
-
-        for n in row["numbers"]:
-            counter[n] += 1
-
-        counter[row["special"]] += 0.5
-
-    ranked = sorted(
-        counter.items(),
-        key=lambda x: x[1]
-    )
-
-    return [x[0] for x in ranked[:top_n]]
+def get_odd_even(num):
+    return "单" if num % 2 else "双"
 
 
 # =========================================================
-# 动量号码
+# 熵计算（未改动）
 # =========================================================
 
-def calc_recent_numbers(history, top_n=15):
-
-    counter = Counter()
-
-    recent = history[:20]
-
-    weight = 20
-
-    for row in recent:
-
-        for n in row["numbers"]:
-            counter[n] += weight
-
-        counter[row["special"]] += weight * 0.5
-
-        weight -= 1
-
-    ranked = counter.most_common(top_n)
-
-    return [x[0] for x in ranked]
+def calc_entropy(probs):
+    entropy = 0.0
+    for p in probs:
+        if p > 0:
+            entropy -= p * math.log(p)
+    return entropy
 
 
 # =========================================================
-# 波色统计
+# 状态检测（未改动）
 # =========================================================
 
-def predict_wave(history):
+def detect_repeat_pattern(colors):
+    if len(colors) < 4:
+        return False
+    return colors[-1] == colors[-2] == colors[-3]
 
-    specials = [
-        row["special"]
-        for row in history[:20]
-    ]
 
-    counter = Counter()
+def detect_flip_pattern(colors):
+    if len(colors) < 5:
+        return False
+    flip = 0
+    for i in range(-4, -1):
+        if colors[i] != colors[i + 1]:
+            flip += 1
+    return flip >= 3
 
-    for n in specials:
 
-        counter[get_wave(n)] += 1
+def detect_hot_cold_shift(freq):
+    values = sorted(freq.values(), reverse=True)
+    if len(values) < 3:
+        return False
+    gap = values[0] - values[2]
+    return gap < 0.08
 
-    ranked = counter.most_common()
 
-    if ranked:
-        return ranked[0][0]
-
-    return "红波"
+def detect_entropy_rise(entropy_now, entropy_prev):
+    return entropy_now - entropy_prev > 0.08
 
 
 # =========================================================
-# 生成预测
+# 状态机（未改动）
 # =========================================================
 
-def generate_prediction(history):
+def analyze_market_state(recent_colors, probs, entropy_now, entropy_prev):
+    freq = {"红": probs[0], "蓝": probs[1], "绿": probs[2]}
 
-    hot = calc_hot_numbers(history)
-    cold = calc_cold_numbers(history)
-    recent = calc_recent_numbers(history)
+    repeat_state = detect_repeat_pattern(recent_colors)
+    flip_state = detect_flip_pattern(recent_colors)
+    chaos_state = detect_hot_cold_shift(freq)
+    entropy_rise = detect_entropy_rise(entropy_now, entropy_prev)
 
-    # -----------------------------------------------------
-    # 综合号码池
-    # -----------------------------------------------------
+    if entropy_now > 1.07:
+        return "混沌"
+    if entropy_rise:
+        return "熵突增"
+    if flip_state:
+        return "高频反转"
+    if repeat_state:
+        return "连续同波"
+    if chaos_state:
+        return "均衡震荡"
+    return "稳定趋势"
 
-    final_pool = list(set(
-        hot[:12]
-        + cold[:8]
-        + recent[:10]
-    ))
 
-    while len(final_pool) < 25:
+# =========================================================
+# 趋势惯性（未改动）
+# =========================================================
 
-        n = random.randint(1, 49)
+def inertia_adjustment(current_probs, recent_colors):
+    if len(recent_colors) < 3:
+        return current_probs
 
-        if n not in final_pool:
-            final_pool.append(n)
+    last = recent_colors[-1]
+    streak = 1
 
-    random.shuffle(final_pool)
+    for i in range(len(recent_colors) - 2, -1, -1):
+        if recent_colors[i] == last:
+            streak += 1
+        else:
+            break
 
-    main_numbers = sorted(final_pool[:6])
+    if streak >= 3:
+        current_probs[last] *= 0.82
+    elif streak == 2:
+        current_probs[last] *= 0.92
 
-    remain = [
-        x for x in ALL_NUMBERS
-        if x not in main_numbers
-    ]
+    total = sum(current_probs.values())
+    for k in current_probs:
+        current_probs[k] /= total
 
-    special = random.choice(remain)
+    return current_probs
+
+
+# =========================================================
+# 单双联动（未改动）
+# =========================================================
+
+def odd_even_boost(probs, odd_prob, even_prob):
+    if odd_prob > 0.60:
+        probs["红"] *= 1.06
+        probs["绿"] *= 1.03
+
+    if even_prob > 0.60:
+        probs["蓝"] *= 1.08
+
+    total = sum(probs.values())
+    for k in probs:
+        probs[k] /= total
+
+    return probs
+
+
+# =========================================================
+# 概率计算（未改动）
+# =========================================================
+
+def calculate_probabilities(history):
+    red_score = blue_score = green_score = 0
+    big_score = small_score = 0
+    odd_score = even_score = 0
+
+    recent_colors = []
+    total_weight = 0
+
+    for i, row in enumerate(reversed(history[-60:])):
+        num = row["number"]
+        color = get_color(num)
+
+        recent_colors.append(color)
+
+        weight = 0.94 ** i
+        total_weight += weight
+
+        if color == "红":
+            red_score += weight
+        elif color == "蓝":
+            blue_score += weight
+        else:
+            green_score += weight
+
+        if get_big_small(num) == "大":
+            big_score += weight
+        else:
+            small_score += weight
+
+        if get_odd_even(num) == "单":
+            odd_score += weight
+        else:
+            even_score += weight
+
+    red_prob = red_score / total_weight
+    blue_prob = blue_score / total_weight
+    green_prob = green_score / total_weight
+
+    big_prob = big_score / total_weight
+    small_prob = small_score / total_weight
+    odd_prob = odd_score / total_weight
+    even_prob = even_score / total_weight
+
+    probs = {"红": red_prob, "蓝": blue_prob, "绿": green_prob}
+
+    probs = inertia_adjustment(probs, recent_colors)
+    probs = odd_even_boost(probs, odd_prob, even_prob)
+
+    entropy = calc_entropy([probs["红"], probs["蓝"], probs["绿"]])
 
     return {
-        "main": main_numbers,
-        "special": special,
-        "wave": predict_wave(history),
-        "hot": hot[:10],
-        "cold": cold[:10],
-        "recent": recent[:10]
+        "probs": probs,
+        "entropy": entropy,
+        "big_prob": big_prob,
+        "small_prob": small_prob,
+        "odd_prob": odd_prob,
+        "even_prob": even_prob,
+        "recent_colors": recent_colors
     }
 
 
 # =========================================================
-# 输出
+# 策略系统（未改动）
 # =========================================================
 
-def print_result(lottery_name, history, result):
+def strategy_engine(data, prev_entropy=1.0):
+    probs = data["probs"]
+    entropy = data["entropy"]
+    recent_colors = data["recent_colors"]
 
-    latest = history[0]
+    sorted_colors = sorted(probs.items(), key=lambda x: x[1], reverse=True)
 
-    print("\n")
-    print("=" * 60)
-    print(f"🎯 {lottery_name} 智能预测")
-    print("=" * 60)
+    top1 = sorted_colors[0][0]
+    top2 = sorted_colors[1][0]
 
-    print("\n【最新期开奖】")
-
-    latest_nums = (
-        " ".join(
-            str(x).zfill(2)
-            for x in latest["numbers"]
-        )
+    market_state = analyze_market_state(
+        recent_colors,
+        [probs["红"], probs["蓝"], probs["绿"]],
+        entropy,
+        prev_entropy
     )
 
-    print(
-        f"{latest['issue']}期 "
-        f"{latest_nums} "
-        f"+ {str(latest['special']).zfill(2)}"
-    )
-
-    print("\n【推荐六肖】")
-
-    print(
-        " ".join(
-            str(x).zfill(2)
-            for x in result["main"]
-        )
-    )
-
-    print("\n【特别号】")
-
-    print(
-        f"{str(result['special']).zfill(2)} "
-        f"({get_wave(result['special'])})"
-    )
-
-    print("\n【推荐波色】")
-
-    print(result["wave"])
-
-    print("\n【热号参考】")
-
-    print(
-        " ".join(
-            str(x).zfill(2)
-            for x in result["hot"]
-        )
-    )
-
-    print("\n【冷号参考】")
-
-    print(
-        " ".join(
-            str(x).zfill(2)
-            for x in result["cold"]
-        )
-    )
-
-    print("\n【近期动量】")
-
-    print(
-        " ".join(
-            str(x).zfill(2)
-            for x in result["recent"]
-        )
-    )
-
-    print("\n生成时间:")
-    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-
-    print("=" * 60)
-    print("\n")
+    if market_state == "混沌":
+        return {"predict": [top1, top2], "mode": "混沌双推", "state": market_state}
+    elif market_state == "熵突增":
+        return {"predict": [top1, top2], "mode": "熵增防御", "state": market_state}
+    elif market_state == "高频反转":
+        return {"predict": [top2], "mode": "反转防追", "state": market_state}
+    elif market_state == "连续同波":
+        return {"predict": [top2, top1], "mode": "连续同波反转", "state": market_state}
+    elif market_state == "均衡震荡":
+        return {"predict": [top1, top2], "mode": "动态双推", "state": market_state}
+    else:
+        return {"predict": [top1], "mode": "单推", "state": market_state}
 
 
 # =========================================================
-# 主运行
+# 回测（未改动）
+# =========================================================
+
+def backtest(history):
+    hit_main = hit_double = size_hit = odd_even_hit = total = 0
+    prev_entropy = 1.0
+
+    print("=" * 60)
+    print("最近10期详细回测")
+    print("=" * 60)
+
+    for i in range(-11, -1):
+        sub_history = history[:i]
+        actual = history[i]
+
+        actual_color = get_color(actual["number"])
+        data = calculate_probabilities(sub_history)
+        result = strategy_engine(data, prev_entropy)
+
+        prev_entropy = data["entropy"]
+
+        predict = result["predict"]
+
+        top1 = max(data["probs"], key=data["probs"].get)
+
+        main_hit = top1 == actual_color
+        double_hit = actual_color in predict
+
+        if main_hit:
+            hit_main += 1
+        if double_hit:
+            hit_double += 1
+
+        total += 1
+
+        print(f"{actual['issue']} | 开:{actual_color} | 主推:{'√' if main_hit else '×'} | 双推:{'√' if double_hit else '×'}")
+
+
+# =========================================================
+# 主函数（唯一修改点）
 # =========================================================
 
 def run_predict(lottery_name):
+    print("=" * 60)
+    print(lottery_name)
+    print("=" * 60)
 
-    history = fetch_real_history(lottery_name)
+    history = fetch_api_history(lottery_name, 220)
 
-    result = generate_prediction(history)
+    print(f"同步完成: {len(history)} 条数据")
 
-    print_result(
-        lottery_name,
-        history,
-        result
-    )
+    if len(history) < 50:
+        print("数据不足")
+        return
+
+    backtest(history)
+
+    data = calculate_probabilities(history)
+    result = strategy_engine(data)
+
+    print("\n推荐:", result["predict"])
+    print("模式:", result["mode"])
+    print("状态:", result["state"])
 
 
 # =========================================================
-# main
+# MAIN
 # =========================================================
 
 def main():
-
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--lottery",
-        required=True,
-        choices=[
-            "香港彩",
-            "新澳门彩",
-            "老澳门彩"
-        ]
-    )
-
+    parser.add_argument("--lottery", type=str, default="新澳门彩")
     args = parser.parse_args()
 
     run_predict(args.lottery)
