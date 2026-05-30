@@ -1,78 +1,130 @@
 #!/usr/bin/env python3
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 
 import sqlite3
 import json
 import pandas as pd
-from collections import Counter
+import numpy as np
+from collections import Counter, defaultdict
 
-# ==========================
-# 配置
-# ==========================
+from sklearn.linear_model import LogisticRegression
+
 DB = "new_macau.db"
-N_WINDOW = 20  # 滑动窗口大小
+N_WINDOW = 20
 
-# ==========================
-# 连接数据库
-# ==========================
 conn = sqlite3.connect(DB)
 
-# ==========================
-# 读取历史开奖
-# ==========================
-df = pd.read_sql("SELECT * FROM draws ORDER BY issue_no ASC", conn)
-df['numbers'] = df['numbers_json'].apply(json.loads)
+df = pd.read_sql(
+    "SELECT * FROM draws ORDER BY issue_no ASC",
+    conn
+)
+
+df["numbers"] = df["numbers_json"].apply(json.loads)
 
 # ==========================
-# 统计出现次数和连号
+# 特征准备
 # ==========================
+all_nums = list(range(1, 50))
+
 counter = Counter()
-pair_counter = Counter()
-triple_counter = Counter()
+last_seen = {}
+transition = defaultdict(Counter)
 
-for nums in df['numbers'][-N_WINDOW:]:
-    counter.update(nums)
-    
-    nums_sorted = sorted(nums)
-    
-    # 连号对
-    for i in range(len(nums_sorted)-1):
-        if nums_sorted[i+1] - nums_sorted[i] == 1:
-            pair_counter[(nums_sorted[i], nums_sorted[i+1])] += 1
-    
-    # 连号三连号
-    for i in range(len(nums_sorted)-2):
-        if nums_sorted[i+2] - nums_sorted[i] == 2 and nums_sorted[i+1] - nums_sorted[i] == 1:
-            triple_counter[(nums_sorted[i], nums_sorted[i+1], nums_sorted[i+2])] += 1
+X = []
+y = []
 
 # ==========================
-# 输出 top 预测
+# 构造训练数据（简化版）
 # ==========================
-top_numbers = [num for num, _ in counter.most_common(6)]
-top_pairs = pair_counter.most_common(5)
-top_triples = triple_counter.most_common(5)
+for i in range(1, len(df)):
+    prev = df["numbers"].iloc[i - 1]
+    curr = df["numbers"].iloc[i]
 
-print("="*50)
-print("=== Top Numbers ===")
-print(top_numbers)
-print("=== Top Pairs ===")
-print(top_pairs)
-print("=== Top Triples ===")
-print(top_triples)
-print("="*50)
+    prev_set = set(prev)
 
-# ==========================
-# 可选：保存预测结果到数据库
-# 先注释掉，避免 NOT NULL 报错
-# ==========================
-# pool_numbers_json = json.dumps(top_numbers)
-# conn.execute(
-#     "INSERT INTO prediction_pools (run_id, pool_size, numbers_json, created_at) VALUES (NULL, ?, ?, datetime('now'))",
-#     (len(top_numbers), pool_numbers_json)
-# )
-# conn.commit()
+    for n in all_nums:
+        feature = [
+            n in prev_set,                    # 是否在上一期出现
+            counter[n],                      # 历史频率
+            i - last_seen.get(n, 999),       # 遗漏值
+        ]
+
+        label = 1 if n in curr else 0
+
+        X.append(feature)
+        y.append(label)
+
+    counter.update(curr)
+    for n in curr:
+        last_seen[n] = i
 
 # ==========================
-# 关闭数据库
+# 训练模型
 # ==========================
+model = LogisticRegression(max_iter=1000)
+model.fit(X, y)
+
+# ==========================
+# 预测下一期
+# ==========================
+latest = df["numbers"].iloc[-1]
+latest_set = set(latest)
+
+scores = []
+
+for n in all_nums:
+    feature = [
+        n in latest_set,
+        counter[n],
+        len(df) - last_seen.get(n, 999)
+    ]
+
+    prob = model.predict_proba([feature])[0][1]
+    scores.append((n, prob))
+
+scores.sort(key=lambda x: x[1], reverse=True)
+
+top6 = [n for n, _ in scores[:6]]
+top10 = [n for n, _ in scores[:10]]
+
+# ==========================
+# 冷热 & 趋势
+# ==========================
+hot = [n for n, _ in counter.most_common(6)]
+cold = [n for n in all_nums if counter[n] == 0][:6]
+
+trend_counter = Counter()
+for nums in df["numbers"].tail(10):
+    trend_counter.update(nums)
+
+trend = [n for n, _ in trend_counter.most_common(6)]
+
+# ==========================
+# 马尔可夫（简化）
+# ==========================
+markov = Counter()
+for a, targets in transition.items():
+    for b, c in targets.items():
+        markov[b] += c
+
+markov_top = [n for n, _ in markov.most_common(6)]
+
+# ==========================
+# 输出
+# ==========================
+result = {
+    "top6": top6,
+    "top10": top10,
+    "hot": hot,
+    "cold": cold,
+    "trend": trend,
+    "markov": markov_top,
+    "confidence": round(float(scores[0][1]), 4)
+}
+
+with open("prediction.json", "w", encoding="utf-8") as f:
+    json.dump(result, f, indent=2, ensure_ascii=False)
+
+print(json.dumps(result, indent=2, ensure_ascii=False))
+
 conn.close()
