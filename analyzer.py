@@ -4,14 +4,17 @@
 import sqlite3
 import json
 import pandas as pd
-import numpy as np
-from collections import Counter, defaultdict
+from collections import Counter
 
-from sklearn.linear_model import LogisticRegression
-
+# ==========================
+# 配置
+# ==========================
 DB = "new_macau.db"
 N_WINDOW = 20
 
+# ==========================
+# 连接数据库
+# ==========================
 conn = sqlite3.connect(DB)
 
 df = pd.read_sql(
@@ -22,109 +25,63 @@ df = pd.read_sql(
 df["numbers"] = df["numbers_json"].apply(json.loads)
 
 # ==========================
-# 特征准备
+# 统计
 # ==========================
-all_nums = list(range(1, 50))
-
 counter = Counter()
-last_seen = {}
-transition = defaultdict(Counter)
+pair_counter = Counter()
+triple_counter = Counter()
 
-X = []
-y = []
+odd = 0
+even = 0
+small = 0
+large = 0
 
-# ==========================
-# 构造训练数据（简化版）
-# ==========================
-for i in range(1, len(df)):
-    prev = df["numbers"].iloc[i - 1]
-    curr = df["numbers"].iloc[i]
+for nums in df["numbers"].tail(N_WINDOW):
+    counter.update(nums)
 
-    prev_set = set(prev)
+    for n in nums:
+        if n % 2 == 0:
+            even += 1
+        else:
+            odd += 1
 
-    for n in all_nums:
-        feature = [
-            n in prev_set,                    # 是否在上一期出现
-            counter[n],                      # 历史频率
-            i - last_seen.get(n, 999),       # 遗漏值
-        ]
+        if n <= 24:
+            small += 1
+        else:
+            large += 1
 
-        label = 1 if n in curr else 0
+    nums = sorted(nums)
 
-        X.append(feature)
-        y.append(label)
+    # 连号
+    for i in range(len(nums) - 1):
+        if nums[i+1] - nums[i] == 1:
+            pair_counter[(nums[i], nums[i+1])] += 1
 
-    counter.update(curr)
-    for n in curr:
-        last_seen[n] = i
+    # 三连号
+    for i in range(len(nums) - 2):
+        if nums[i+1] - nums[i] == 1 and nums[i+2] - nums[i] == 2:
+            triple_counter[(nums[i], nums[i+1], nums[i+2])] += 1
 
-# ==========================
-# 训练模型
-# ==========================
-model = LogisticRegression(max_iter=1000)
-model.fit(X, y)
 
-# ==========================
-# 预测下一期
-# ==========================
-latest = df["numbers"].iloc[-1]
-latest_set = set(latest)
+top_numbers = [n for n, _ in counter.most_common(6)]
+top_pairs = pair_counter.most_common(5)
+top_triples = triple_counter.most_common(5)
 
-scores = []
-
-for n in all_nums:
-    feature = [
-        n in latest_set,
-        counter[n],
-        len(df) - last_seen.get(n, 999)
-    ]
-
-    prob = model.predict_proba([feature])[0][1]
-    scores.append((n, prob))
-
-scores.sort(key=lambda x: x[1], reverse=True)
-
-top6 = [n for n, _ in scores[:6]]
-top10 = [n for n, _ in scores[:10]]
-
-# ==========================
-# 冷热 & 趋势
-# ==========================
-hot = [n for n, _ in counter.most_common(6)]
-cold = [n for n in all_nums if counter[n] == 0][:6]
-
-trend_counter = Counter()
-for nums in df["numbers"].tail(10):
-    trend_counter.update(nums)
-
-trend = [n for n, _ in trend_counter.most_common(6)]
-
-# ==========================
-# 马尔可夫（简化）
-# ==========================
-markov = Counter()
-for a, targets in transition.items():
-    for b, c in targets.items():
-        markov[b] += c
-
-markov_top = [n for n, _ in markov.most_common(6)]
-
-# ==========================
-# 输出
-# ==========================
 result = {
-    "top6": top6,
-    "top10": top10,
-    "hot": hot,
-    "cold": cold,
-    "trend": trend,
-    "markov": markov_top,
-    "confidence": round(float(scores[0][1]), 4)
+    "top6": top_numbers,
+    "top10": [n for n, _ in counter.most_common(10)],
+    "top20": [n for n, _ in counter.most_common(20)],
+    "pairs": [list(k) + [v] for k, v in top_pairs],
+    "triples": [list(k) + [v] for k, v in top_triples],
+    "odd_even": f"{odd}:{even}",
+    "small_large": f"{small}:{large}"
 }
+
+print("=" * 60)
+print(json.dumps(result, indent=2, ensure_ascii=False))
+print("=" * 60)
 
 with open("prediction.json", "w", encoding="utf-8") as f:
     json.dump(result, f, indent=2, ensure_ascii=False)
-
-print(json.dumps(result, indent=2, ensure_ascii=False))
 
 conn.close()
