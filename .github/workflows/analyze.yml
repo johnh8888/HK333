@@ -1,4 +1,4 @@
-name: Macau Prediction
+name: 澳门彩票预测系统
 
 on:
   workflow_dispatch:
@@ -8,81 +8,43 @@ on:
 
 jobs:
   predict:
+    name: 数据分析与预测
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: 📥 下载仓库
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 🐍 配置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Dependencies
+      - name: 📦 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy
 
-      - name: Verify Database
+      - name: 🗄️ 检查数据库
         run: |
           ls -lah
           if [ ! -f "new_macau.db" ]; then
-            echo "new_macau.db not found"
+            echo "数据库不存在"
             exit 1
           fi
 
-      - name: Run Analyzer
+      - name: 🔍 运行分析器
         run: |
           python analyzer.py > result.txt
 
-      - name: Generate Prediction JSON
+      - name: 🎯 生成预测结果
         run: |
-          python << 'PY'
-          import sqlite3
-          import json
-          import pandas as pd
-          from collections import Counter
+          python predict.py
 
-          conn = sqlite3.connect("new_macau.db")
-
-          df = pd.read_sql(
-              "SELECT * FROM draws ORDER BY issue_no ASC",
-              conn
-          )
-
-          df["numbers"] = df["numbers_json"].apply(json.loads)
-
-          counter = Counter()
-
-          for nums in df["numbers"].tail(20):
-              counter.update(nums)
-
-          top20 = [n for n, _ in counter.most_common(20)]
-
-          result = {
-              "top6": top20[:6],
-              "top10": top20[:10],
-              "top14": top20[:14],
-              "top20": top20[:20]
-          }
-
-          with open("prediction.json", "w") as f:
-              json.dump(
-                  result,
-                  f,
-                  indent=2,
-                  ensure_ascii=False
-              )
-
-          print(json.dumps(result, indent=2))
-          conn.close()
-          PY
-
-      - name: Upload Results
+      - name: 📤 上传预测文件
         uses: actions/upload-artifact@v4
         with:
-          name: prediction-results
+          name: 澳门预测结果
           path: |
             result.txt
             prediction.json
