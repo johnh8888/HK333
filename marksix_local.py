@@ -23,11 +23,30 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
-# ---------- 波色 / 属性工具 ----------
+# ---------- 正确的波色集合 ----------
+RED_WAVE = {
+    1,2,7,8,12,13,18,19,23,24,
+    29,30,34,35,40,45,46
+}
+
+BLUE_WAVE = {
+    3,4,9,10,14,15,20,25,26,
+    31,36,37,41,42,47,48
+}
+
+GREEN_WAVE = {
+    5,6,11,16,17,21,22,27,28,
+    32,33,38,39,43,44,49
+}
+
 def get_color(num: int) -> str:
-    if 1 <= num <= 16: return "红"
-    elif 17 <= num <= 32: return "蓝"
-    else: return "绿"
+    if num in RED_WAVE:
+        return "红"
+    elif num in BLUE_WAVE:
+        return "蓝"
+    elif num in GREEN_WAVE:
+        return "绿"
+    return "未知"
 
 def special_attributes(num: int) -> Dict[str, str]:
     odd_even = "单" if num % 2 == 1 else "双"
@@ -46,7 +65,7 @@ def special_attributes(num: int) -> Dict[str, str]:
     return {"单双": odd_even, "大小": big_small, "合单双": total_odd_even,
             "合大小": total_big_small, "尾大小": tail_big_small, "色波": color, "五行": element}
 
-# ---------- 波色预测 ----------
+# ---------- 波色预测（已增强） ----------
 def predict_color_simple(specials: List[int], window: int = 3) -> Tuple[str, str, float, float]:
     if not specials: return "蓝", "绿", 0.0, 0.0
     recent = specials[-window:]
@@ -59,22 +78,66 @@ def predict_color_simple(specials: List[int], window: int = 3) -> Tuple[str, str
     return main_color, second_color, main_freq, second_freq
 
 def predict_color_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
-    if not specials: return "蓝", "绿", 0.0, 0.0
-    recent = specials[-window:]
-    scores = defaultdict(float)
-    total_weight = 0
-    for i, num in enumerate(reversed(recent)):
-        weight = window - i
-        scores[get_color(num)] += weight
-        total_weight += weight
-    if total_weight == 0:
+    if len(specials) < 5:
         return "蓝", "绿", 0.0, 0.0
-    sorted_colors = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
-    main_color = sorted_colors[0][0]
-    main_score = sorted_colors[0][1] / total_weight
-    second_color = sorted_colors[1][0] if len(sorted_colors) > 1 else "绿"
-    second_score = sorted_colors[1][1] / total_weight if len(sorted_colors) > 1 else 0.0
-    return main_color, second_color, main_score, second_score
+
+    recent = specials[-window:]
+    colors = [get_color(n) for n in recent]
+
+    # 加权频率得分
+    score = {"红": 0.0, "蓝": 0.0, "绿": 0.0}
+    total_weight = 0.0
+    for i, c in enumerate(reversed(colors)):
+        w = window - i
+        score[c] += w
+        total_weight += w
+    if total_weight > 0:
+        for c in score:
+            score[c] /= total_weight
+
+    # 遗漏奖励
+    omit = {}
+    for c in ["红", "蓝", "绿"]:
+        miss = 0
+        for n in reversed(specials):
+            if get_color(n) == c:
+                break
+            miss += 1
+        omit[c] = miss
+    max_omit = max(omit.values()) or 1
+    for c in score:
+        score[c] += 0.20 * (omit[c] / max_omit)
+
+    # 转移概率（基于上一期颜色）
+    if len(colors) >= 2:
+        current = colors[-1]
+        trans = {"红": 0, "蓝": 0, "绿": 0}
+        total_trans = 0
+        for i in range(len(colors) - 1):
+            if colors[i] == current:
+                nxt = colors[i + 1]
+                trans[nxt] += 1
+                total_trans += 1
+        if total_trans > 0:
+            for c in score:
+                score[c] += 0.40 * (trans[c] / total_trans)
+
+    # 连号惩罚
+    streak_color = colors[-1]
+    streak = 1
+    for i in range(len(colors) - 2, -1, -1):
+        if colors[i] == streak_color:
+            streak += 1
+        else:
+            break
+    if streak >= 3:
+        score[streak_color] *= 0.85
+
+    # 排序
+    ranked = sorted(score.items(), key=lambda x: x[1], reverse=True)
+    main_color = ranked[0][0]
+    second_color = ranked[1][0]
+    return main_color, second_color, ranked[0][1], ranked[1][1]
 
 def predict_color(specials: List[int], window: int = 10, method: str = "weighted") -> Tuple[str, str, float, float]:
     if method == "simple":
@@ -416,7 +479,6 @@ def review_issue(conn, issue_no):
     runs = conn.execute("SELECT id FROM prediction_runs WHERE issue_no=? AND status='PENDING'", (issue_no,)).fetchall()
     count = 0
 
-    # 辅助函数：从 numbers_json 读取池子号码
     def get_pool(conn, run_id, size):
         row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id=? AND pool_size=?", (run_id, size)).fetchone()
         return json.loads(row["numbers_json"]) if row else []
