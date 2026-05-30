@@ -65,34 +65,119 @@ def special_attributes(num: int) -> Dict[str, str]:
             "合大小": total_big_small, "尾大小": tail_big_small, "色波": color, "五行": element}
 
 # ---------- 波色预测 ----------
-def predict_color_simple(specials: List[int], window: int = 3) -> Tuple[str, str, float, float]:
-    if not specials: return "蓝", "绿", 0.0, 0.0
-    recent = specials[-window:]
-    counter = Counter(get_color(n) for n in recent)
-    sorted_colors = sorted(counter.items(), key=lambda x: (-x[1], x[0]))
-    main_color = sorted_colors[0][0]
-    main_freq = sorted_colors[0][1] / len(recent)
-    second_color = sorted_colors[1][0] if len(sorted_colors) > 1 else "绿"
-    second_freq = sorted_colors[1][1] / len(recent) if len(sorted_colors) > 1 else 0.0
-    return main_color, second_color, main_freq, second_freq
+def predict_color_weighted(
+    specials: List[int],
+    window: int = 20
+) -> Tuple[str, str, float, float]:
 
-def predicjit_color_weighted(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
-    if not specials: return "蓝", "绿", 0.0, 0.0
+    if len(specials) < 5:
+        return "红", "蓝", 0.0, 0.0
+
     recent = specials[-window:]
-    scores = defaultdict(float)
-    total_weight = 0
-    for i, num in enumerate(reversed(recent)):
-        weight = window - i
-        scores[get_color(num)] += weight
-        total_weight += weight
-    if total_weight == 0:
-        return "蓝", "绿", 0.0, 0.0
-    sorted_colors = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
-    main_color = sorted_colors[0][0]
-    main_score = sorted_colors[0][1] / total_weight
-    second_color = sorted_colors[1][0] if len(sorted_colors) > 1 else "绿"
-    second_score = sorted_colors[1][1] / total_weight if len(sorted_colors) > 1 else 0.0
-    return main_color, second_color, main_score, second_score
+    colors = [get_color(n) for n in recent]
+
+    score = {
+        "红": 0.0,
+        "蓝": 0.0,
+        "绿": 0.0
+    }
+
+    total_weight = 0.0
+
+    for i, c in enumerate(reversed(colors)):
+        w = window - i
+        score[c] += w
+        total_weight += w
+
+    if total_weight > 0:
+        for c in score:
+            score[c] /= total_weight
+
+    omit = {}
+
+    for c in ["红", "蓝", "绿"]:
+        miss = 0
+
+        for n in reversed(specials):
+            if get_color(n) == c:
+                break
+            miss += 1
+
+        omit[c] = miss
+
+    max_omit = max(omit.values()) or 1
+
+    for c in score:
+        score[c] += 0.20 * (omit[c] / max_omit)
+
+    if len(colors) >= 2:
+
+        current = colors[-1]
+
+        trans = {
+            "红": 0,
+            "蓝": 0,
+            "绿": 0
+        }
+
+        total = 0
+
+        for i in range(len(colors) - 1):
+            if colors[i] == current:
+                nxt = colors[i + 1]
+                trans[nxt] += 1
+                total += 1
+
+        if total > 0:
+            for c in score:
+                score[c] += 0.40 * (trans[c] / total)
+
+    streak_color = colors[-1]
+    streak = 1
+
+    for i in range(len(colors) - 2, -1, -1):
+        if colors[i] == streak_color:
+            streak += 1
+        else:
+            break
+
+    if streak >= 3:
+        score[streak_color] *= 0.85
+
+    ranked = sorted(
+        score.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    main_color = ranked[0][0]
+    second_color = ranked[1][0]
+
+    return (
+        main_color,
+        second_color,
+        ranked[0][1],
+        ranked[1][1]
+    )
+
+def predict_color_simple(specials: List[int], window: int = 10) -> Tuple[str, str, float, float]:
+    if len(specials) < 5:
+        return "红", "蓝", 0.0, 0.0
+
+    recent = specials[-window:]
+    colors = [get_color(n) for n in recent]
+    freq = Counter(colors)
+    # 按频率降序排序
+    ranked = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    total = sum(freq.values())
+
+    if len(ranked) >= 2:
+        main_color = ranked[0][0]
+        second_color = ranked[1][0]
+        return main_color, second_color, ranked[0][1]/total, ranked[1][1]/total
+    # 所有期数都是一个颜色
+    main_color = ranked[0][0]
+    return main_color, main_color, 1.0, 1.0
 
 def predict_color(specials: List[int], window: int = 10, method: str = "weighted") -> Tuple[str, str, float, float]:
     if method == "simple":
@@ -433,7 +518,6 @@ def review_issue(conn, issue_no):
         run_id = run["id"]
         mains = [r["number"] for r in conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='MAIN' ORDER BY rank", (run_id,)).fetchall()]
         special = next((r["number"] for r in conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='SPECIAL'", (run_id,)).fetchall()), None)
-        # 修正：从 numbers_json 列读取奖池号码
         pool10_row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id=? AND pool_size=10", (run_id,)).fetchone()
         pool10 = json.loads(pool10_row[0]) if pool10_row else mains
         pool14_row = conn.execute("SELECT numbers_json FROM prediction_pools WHERE run_id=? AND pool_size=14", (run_id,)).fetchone()
@@ -513,6 +597,7 @@ def print_dashboard(conn, color_window=10, color_method="weighted"):
             special_row = conn.execute("SELECT number FROM prediction_picks WHERE run_id=? AND pick_type='SPECIAL'", (r["id"],)).fetchone()
             special = str(special_row["number"]).zfill(2) if special_row else "--"
             label = STRATEGY_LABELS.get(r["strategy"], r["strategy"])
+            # 修复全角空格导致的格式化问题，使用普通空格，并固定宽度（中文占两个字符，简单处理）
             print(f"  {label:　<8s}: {' '.join(mains)} + {special}")
             if special_row:
                 attrs = special_attributes(special_row["number"])
