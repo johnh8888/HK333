@@ -1,77 +1,74 @@
-name: Macau Lottery Prediction
+name: Macau Prediction
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
+
+schedule:
+- cron: ‘0 */6 * * *’
 
 jobs:
-  predict:
-    runs-on: ubuntu-latest
+predict:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas numpy
-
-      - name: Run Prediction
-        run: |
-          python << 'PY'
-          import sqlite3
-          import json
-          import pandas as pd
-          import numpy as np
-
-          DB = "new_macau.db"
-          N_WINDOW = 20  # 滑动窗口大小
-
-          conn = sqlite3.connect(DB)
-
-          # 读取历史开奖
-          df = pd.read_sql("SELECT * FROM draws ORDER BY issue_no ASC", conn)
-          df['numbers'] = df['numbers_json'].apply(json.loads)
-
-          # 简单统计：出现次数
-          from collections import Counter, defaultdict
-
-          counter = Counter()
-          pair_counter = Counter()
-          triple_counter = Counter()
-
-          for nums in df['numbers'][-N_WINDOW:]:
-              counter.update(nums)
-              # 连号分析
-              nums_sorted = sorted(nums)
-              for i in range(len(nums_sorted)-1):
-                  if nums_sorted[i+1] - nums_sorted[i] == 1:
-                      pair_counter[(nums_sorted[i], nums_sorted[i+1])] += 1
-              for i in range(len(nums_sorted)-2):
-                  if nums_sorted[i+2] - nums_sorted[i] == 2 and nums_sorted[i+1] - nums_sorted[i] == 1:
-                      triple_counter[(nums_sorted[i], nums_sorted[i+1], nums_sorted[i+2])] += 1
-
-          # 输出 top 预测
-          top_numbers = [num for num, _ in counter.most_common(6)]
-          top_pairs = pair_counter.most_common(5)
-          top_triples = triple_counter.most_common(5)
-
-          print("=== Top Numbers ===")
-          print(top_numbers)
-          print("=== Top Pairs ===")
-          print(top_pairs)
-          print("=== Top Triples ===")
-          print(top_triples)
-
-          # 保存预测结果到 prediction_pools
-          pool_numbers_json = json.dumps(top_numbers)
-          conn.execute("INSERT INTO prediction_pools (run_id, pool_size, numbers_json, created_at) VALUES (NULL, ?, ?, datetime('now'))",
-                       (len(top_numbers), pool_numbers_json))
-          conn.commit()
-          conn.close()
-          PY
+steps:
+- name: Checkout
+  uses: actions/checkout@v4
+- name: Setup Python
+  uses: actions/setup-python@v5
+  with:
+    python-version: "3.11"
+- name: Install Packages
+  run: |
+    pip install pandas numpy
+- name: Check Database
+  run: |
+    ls -lh
+    test -f new_macau.db
+- name: Run Prediction
+  run: |
+    python analyzer.py | tee result.txt
+- name: Save Prediction JSON
+  run: |
+    python << 'PY'
+    import json
+    import sqlite3
+    import pandas as pd
+    from collections import Counter
+    DB = "new_macau.db"
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql(
+        "SELECT * FROM draws ORDER BY issue_no ASC",
+        conn
+    )
+    df["numbers"] = df["numbers_json"].apply(json.loads)
+    counter = Counter()
+    for nums in df["numbers"].tail(20):
+        counter.update(nums)
+    top20 = [n for n, _ in counter.most_common(20)]
+    output = {
+        "top6": top20[:6],
+        "top10": top20[:10],
+        "top14": top20[:14],
+        "top20": top20[:20]
+    }
+    with open(
+        "prediction.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            output,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+    print(json.dumps(output, indent=2))
+    conn.close()
+    PY
+- name: Upload Result
+  uses: actions/upload-artifact@v4
+  with:
+    name: prediction-result
+    path: |
+      result.txt
+      prediction.json
