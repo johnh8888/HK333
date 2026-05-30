@@ -1,0 +1,42 @@
+name: Macau Analysis
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 每6小时运行一次
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy openpyxl matplotlib
+
+      - name: Run Analyzer
+        run: |
+          python analyzer.py
+
+      - name: Commit Reports
+        run: |
+          git config --global user.name github-actions
+          git config --global user.email github-actions@github.com
+
+          git add reports/
+
+          git diff --cached --quiet || git commit -m "auto analysis update"
+
+          git push
