@@ -1,74 +1,88 @@
 name: Macau Prediction
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
-schedule:
-- cron: ‘0 */6 * * *’
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
-predict:
-runs-on: ubuntu-latest
+  predict:
+    runs-on: ubuntu-latest
 
-steps:
-- name: Checkout
-  uses: actions/checkout@v4
-- name: Setup Python
-  uses: actions/setup-python@v5
-  with:
-    python-version: "3.11"
-- name: Install Packages
-  run: |
-    pip install pandas numpy
-- name: Check Database
-  run: |
-    ls -lh
-    test -f new_macau.db
-- name: Run Prediction
-  run: |
-    python analyzer.py | tee result.txt
-- name: Save Prediction JSON
-  run: |
-    python << 'PY'
-    import json
-    import sqlite3
-    import pandas as pd
-    from collections import Counter
-    DB = "new_macau.db"
-    conn = sqlite3.connect(DB)
-    df = pd.read_sql(
-        "SELECT * FROM draws ORDER BY issue_no ASC",
-        conn
-    )
-    df["numbers"] = df["numbers_json"].apply(json.loads)
-    counter = Counter()
-    for nums in df["numbers"].tail(20):
-        counter.update(nums)
-    top20 = [n for n, _ in counter.most_common(20)]
-    output = {
-        "top6": top20[:6],
-        "top10": top20[:10],
-        "top14": top20[:14],
-        "top20": top20[:20]
-    }
-    with open(
-        "prediction.json",
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            output,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-    print(json.dumps(output, indent=2))
-    conn.close()
-    PY
-- name: Upload Result
-  uses: actions/upload-artifact@v4
-  with:
-    name: prediction-result
-    path: |
-      result.txt
-      prediction.json
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Verify Database
+        run: |
+          ls -lah
+          if [ ! -f "new_macau.db" ]; then
+            echo "new_macau.db not found"
+            exit 1
+          fi
+
+      - name: Run Analyzer
+        run: |
+          python analyzer.py > result.txt
+
+      - name: Generate Prediction JSON
+        run: |
+          python << 'PY'
+          import sqlite3
+          import json
+          import pandas as pd
+          from collections import Counter
+
+          conn = sqlite3.connect("new_macau.db")
+
+          df = pd.read_sql(
+              "SELECT * FROM draws ORDER BY issue_no ASC",
+              conn
+          )
+
+          df["numbers"] = df["numbers_json"].apply(json.loads)
+
+          counter = Counter()
+
+          for nums in df["numbers"].tail(20):
+              counter.update(nums)
+
+          top20 = [n for n, _ in counter.most_common(20)]
+
+          result = {
+              "top6": top20[:6],
+              "top10": top20[:10],
+              "top14": top20[:14],
+              "top20": top20[:20]
+          }
+
+          with open("prediction.json", "w") as f:
+              json.dump(
+                  result,
+                  f,
+                  indent=2,
+                  ensure_ascii=False
+              )
+
+          print(json.dumps(result, indent=2))
+          conn.close()
+          PY
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: prediction-results
+          path: |
+            result.txt
+            prediction.json
